@@ -12,3 +12,5 @@
 
 # Build and cache directories
 build/
+
+.gradle/
