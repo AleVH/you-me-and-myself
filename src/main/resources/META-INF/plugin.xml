@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<idea-plugin>
+    <id>com.youmeandmyself.ai</id>
+    <name>YouMeAndMyself Assistant</name>
+    <version>0.1.0</version> <!-- NEW: required -->
+    <vendor email="dev@example.com">YouMeAndMyself</vendor>
+    <description>Generic multi-provider AI scaffold with connectivity test.</description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Registers the YMM Chat tool window -->
+        <toolWindow id="YMM Chat"
+                    factoryClass="com.youmeandmyself.ai.chat.ChatToolWindowFactory"
+                    anchor="right"/>
+
+        <!-- Settings page -->
+        <projectConfigurable instance="com.youmeandmyself.ai.settings.AiSettingsConfigurable"
+                             displayName="YMM Assistant"
+                             id="com.youmeandmyself.ai.settings"
+                             parentId="tools"/>
+
+        <!-- Temporary: show the new settings UI alongside the old one -->
+        <projectConfigurable instance="com.youmeandmyself.ai.settings.PluginSettingsConfigurable"
+                             displayName="YMM Assistant (New)"
+                             id="com.youmeandmyself.ai.settings.new"
+                             parentId="tools"/>
+
+        <!-- notification group for visible toasts while debugging -->
+        <notificationGroup id="AI Plugin" displayType="BALLOON" isLogByDefault="true"/>
+    </extensions>
+
+    <actions>
+
+        <group id="com.youmeandmyself.ai.toolsGroup"
+               text="AI"
+               popup="true"
+               description="AI tools">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <action id="com.youmeandmyself.ai.actions.TestAiProvidersAction"
+                    class="com.youmeandmyself.ai.actions.TestAiProvidersAction"
+                    text="Test AI Providers"
+                    description="Ping all configured AI providers"/>
+        </group>
+
+        <action id="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"
+                class="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"
+                text="Send Test Prompt to OpenAI"
+                description="Sends a simple prompt to OpenAI and shows the reply">
+            <add-to-group group-id="com.youmeandmyself.ai.toolsGroup"
+                      anchor="last"
+                      action-id="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"/>
+        </action>
+
+        <action id="com.youmeandmyself.ai.actions.SendTestPromptToGeminiAction"
+                class="com.youmeandmyself.ai.actions.SendTestPromptToGeminiAction"
+                text="Send Test Prompt to Gemini"
+                description="Sends a simple prompt to Gemini and shows the reply">
+            <add-to-group group-id="com.youmeandmyself.ai.toolsGroup" anchor="last"/>
+        </action>
+
+        <!-- Add the "Open YMM Chat" action -->
+        <action id="com.youmeandmyself.ai.actions.OpenChatToolWindow"
+                class="com.youmeandmyself.ai.actions.OpenChatToolWindowAction"
+                text="Open YMM Chat">
+            <add-to-group group-id="com.youmeandmyself.ai.toolsGroup" anchor="last"/>
+            <keyboard-shortcut first-keystroke="ctrl alt Y" keymap="$default"/>
+            <keyboard-shortcut first-keystroke="meta alt Y" keymap="Mac OS X"/>
+        </action>
+
+    </actions>
+</idea-plugin>

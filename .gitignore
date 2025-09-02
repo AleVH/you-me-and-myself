@@ -1,0 +1,14 @@
+# Default ignored files
+/shelf/
+/workspace.xml
+
+# JetBrains IDEs
+.idea/
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/scopes/
+.idea/libraries/
+.idea/modules/
+
+# Build and cache directories
+build/
