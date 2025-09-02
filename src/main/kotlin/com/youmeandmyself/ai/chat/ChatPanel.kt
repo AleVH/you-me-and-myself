@@ -19,6 +19,16 @@ import javax.swing.text.StyledDocument
 import com.youmeandmyself.ai.settings.PluginSettingsState
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.vfs.VirtualFile
+// Context Orchestrator imports
+import com.youmeandmyself.context.orchestrator.ContextOrchestrator
+import com.youmeandmyself.context.orchestrator.ContextRequest
+import com.youmeandmyself.context.orchestrator.DetectorRegistry
+import com.youmeandmyself.context.orchestrator.ContextBundle
+import com.youmeandmyself.context.orchestrator.detectors.FrameworkDetector
+import com.youmeandmyself.context.orchestrator.detectors.LanguageDetector
+import com.youmeandmyself.context.orchestrator.detectors.ProjectStructureDetector
+import com.youmeandmyself.context.orchestrator.detectors.RelevantFilesDetector
+import com.intellij.openapi.diagnostic.Logger
 
 /**
  * A minimal chat UI:
@@ -132,11 +142,38 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
             }
 
             try {
-                val reply = provider.chat(finalPrompt)
+                // 1) Build the detector registry (baseline four)
+                val registry = DetectorRegistry(
+                    listOf(
+                        LanguageDetector(),
+                        FrameworkDetector(),
+                        ProjectStructureDetector(),
+                        RelevantFilesDetector()
+                    )
+                )
+
+                // 2) Run the orchestrator with a tight budget (tune later)
+                val orchestrator = ContextOrchestrator(registry, Logger.getInstance(ChatPanel::class.java))
+                val request = ContextRequest(
+                    project = project,
+                    maxMillis = 1400L // keep the UI snappy; raise if needed
+                )
+                val (bundle, metrics) = orchestrator.gather(request, scope)
+
+                // 3) (Optional) surface a one-liner in transcript for visibility
+                appendBlock("[Context ready in ${metrics.totalMillis} ms]")
+
+                // 4) Prepend a compact context note to your existing finalPrompt
+                val contextNote = formatContextNote(bundle)
+                val effectivePrompt = "$contextNote\n\n$finalPrompt"
+
+                // 5) Ask the provider with the augmented prompt
+                val reply = provider.chat(effectivePrompt)
                 appendAssistant(reply)
             } catch (t: Throwable) {
                 appendAssistant("Error: ${t.message}", isError = true)
             }
+
         }
     }
 
@@ -201,6 +238,30 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
         providerSelector.addActionListener {
             s.selectedProvider = providerSelector.selectedItem as String
         }
+    }
+
+    /**
+     * Formats a compact context note from a ContextBundle for the model.
+     * Keep it short to avoid prompt bloat; we only surface the most useful bits.
+     */
+    private fun formatContextNote(bundle: ContextBundle): String {
+        val lang = bundle.language?.languageId ?: "unknown"
+        val frameworks = bundle.frameworks.joinToString(", ") { f ->
+            if (f.version.isNullOrBlank()) f.name else "${f.name} ${f.version}"
+        }.ifBlank { "none" }
+        val build = bundle.projectStructure?.buildSystem ?: "unknown"
+        val modules = bundle.projectStructure?.modules?.joinToString(", ")?.ifBlank { null }
+        val files = bundle.relevantFiles?.let { it.filePaths.take(5) }?.joinToString("\n- ")?.let {
+            if (it.isNotBlank()) "\nTop files:\n- $it" else ""
+        } ?: ""
+
+        val modulesLine = modules?.let { "\nModules: $it" } ?: ""
+        return """
+        [Context]
+        Language: $lang
+        Frameworks: $frameworks
+        Build: $build$modulesLine$files
+        """.trim()
     }
 
 }
