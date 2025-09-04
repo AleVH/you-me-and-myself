@@ -60,13 +60,39 @@ class RelevantFilesDetector : Detector {
 
         return listOf(
             ContextSignal.RelevantFiles(
-                filePaths = matches.take(25).sorted(), // cap to keep payload small
+                candidates = matches
+                    .take(25)
+                    .sorted()
+                    .map { path ->
+                        ContextSignal.RelevantCandidate(
+                            path = path,
+                            reason = "filename match",   // transparent rationale
+                            score = 60,                  // reasonable default for heuristic matches
+                            estChars = estimateCharsOrNull(path) // ok to return null if unknown
+                        )
+                    },
                 confidence = conf,
                 source = name
             )
         )
+
     }
 
     private fun Project.baseDir(): VirtualFile? =
         this.baseDir ?: this.projectFile?.parent
+
+    // Place this as a private function in the same file.
+    // If you don't have Project/VFS handy here, you can just return null.
+    private fun estimateCharsOrNull(path: String): Int? {
+        return try {
+            val vfs = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+            val vf = vfs.findFileByPath(path) ?: return null
+            val fdm = com.intellij.openapi.fileEditor.FileDocumentManager.getInstance()
+            val doc = fdm.getDocument(vf)
+            doc?.textLength ?: vf.length.toInt()
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
 }

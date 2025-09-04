@@ -56,8 +56,11 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
     // Explicit provider selector: "mock", "openai", "gemini", "deepseek"
     private val providerSelector = JComboBox<String>()
 
-    // Purpose: opt-in attach of the active editor file contents
-    private val attachCurrentFile = JCheckBox("Attach current file")
+    // Purpose: opt-in attach context
+    private val attachContext = JCheckBox("Attach context").apply {
+        // Swing/IntelliJ tooltips use this setter; reliable across IDE versions
+        setToolTipText("Include IDE-derived context (language, frameworks, project structure, related files)")
+    }
 
     private val scope = CoroutineScope(Dispatchers.IO)
 
@@ -77,7 +80,7 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
 
             // RIGHT: send button
             val right = JPanel(BorderLayout()).apply {
-                add(attachCurrentFile, BorderLayout.NORTH)
+                add(attachContext, BorderLayout.NORTH)
                 add(send, BorderLayout.SOUTH)
             }
             add(right, BorderLayout.EAST)
@@ -93,44 +96,21 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
 
     }
 
+    // File: src/main/kotlin/com/youmeandmyself/ai/chat/ChatPanel.kt — full replacement of doSend()
+
+    // File: src/main/kotlin/com/youmeandmyself/ai/chat/ChatPanel.kt — full replacement of doSend()
+
     private fun doSend() {
-        val prompt = input.text?.trim().orEmpty()
-        if (prompt.isBlank()) return
+        // 0) Read user input and render it on the transcript
+        val userInput = input.text?.trim().orEmpty()
+        if (userInput.isBlank()) return
         input.text = ""
-        appendUser(prompt)
-        // Build finalPrompt with optional attached file content
-        var attachedNote: String? = null
-        val finalPrompt = if (attachCurrentFile.isSelected) {
-            val editor = FileEditorManager.getInstance(project).selectedTextEditor
-            val vf: VirtualFile? = editor?.virtualFile
-            val path = vf?.path
-            val content = editor?.document?.text
+        appendUser(userInput)
 
-            if (!path.isNullOrBlank() && !content.isNullOrBlank()) {
-                attachedNote = "[Attached: $path (${content.length} chars)]"
-                """
-        You are given the current file from the project for context.
-        FILE: $path
-        CONTENT:
-        ```
-        $content
-        ```
+        // 1) Decide if we should run the orchestrator (smart + explicit toggle)
+        val needContext = attachContext.isSelected || isContextLikelyUseful(userInput)
 
-        User question:
-        $prompt
-        """.trimIndent()
-            } else {
-                prompt
-            }
-        } else {
-            prompt
-        }
-
-        // If we attached something, show the one-line note in the transcript
-        if (attachedNote != null) {
-            appendBlock(attachedNote)
-        }
-
+        // 2) Call provider
         scope.launch {
             val provider = ProviderRegistry.selectedProvider(project)
             if (provider == null) {
@@ -142,39 +122,80 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
             }
 
             try {
-                // 1) Build the detector registry (baseline four)
-                val registry = DetectorRegistry(
-                    listOf(
-                        LanguageDetector(),
-                        FrameworkDetector(),
-                        ProjectStructureDetector(),
-                        RelevantFilesDetector()
+                val effectivePrompt: String
+
+                if (needContext) {
+                    // Run detectors only when beneficial or explicitly requested
+                    val registry = DetectorRegistry(
+                        listOf(
+                            LanguageDetector(),
+                            FrameworkDetector(),
+                            ProjectStructureDetector(),
+                            RelevantFilesDetector()
+                        )
                     )
-                )
+                    val orchestrator = ContextOrchestrator(registry, Logger.getInstance(ChatPanel::class.java))
+                    val request = ContextRequest(project = project, maxMillis = 1400L)
+                    val (bundle, metrics) = orchestrator.gather(request, scope)
 
-                // 2) Run the orchestrator with a tight budget (tune later)
-                val orchestrator = ContextOrchestrator(registry, Logger.getInstance(ChatPanel::class.java))
-                val request = ContextRequest(
-                    project = project,
-                    maxMillis = 1400L // keep the UI snappy; raise if needed
-                )
-                val (bundle, metrics) = orchestrator.gather(request, scope)
+                    appendBlock("[Context ready in ${metrics.totalMillis} ms]")
 
-                // 3) (Optional) surface a one-liner in transcript for visibility
-                appendBlock("[Context ready in ${metrics.totalMillis} ms]")
+                    val contextNote = formatContextNote(bundle)
+                    effectivePrompt = """
+                    $contextNote
 
-                // 4) Prepend a compact context note to your existing finalPrompt
-                val contextNote = formatContextNote(bundle)
-                val effectivePrompt = "$contextNote\n\n$finalPrompt"
+                    $userInput
+                """.trimIndent()
+                } else {
+                    // No context → send plain
+                    effectivePrompt = userInput
+                }
 
-                // 5) Ask the provider with the augmented prompt
                 val reply = provider.chat(effectivePrompt)
                 appendAssistant(reply)
+
             } catch (t: Throwable) {
                 appendAssistant("Error: ${t.message}", isError = true)
             }
-
         }
+    }
+
+    // Heuristic: return true when the prompt likely benefits from project context.
+    private fun isContextLikelyUseful(text: String): Boolean {
+        val t = text.lowercase()
+
+        // Obvious code markers or fenced blocks
+        if ("```" in t) return true
+
+        // Error/exception keywords
+        val errorHints = listOf(
+            "error", "exception", "traceback", "stack trace", "unresolved reference",
+            "undefined", "cannot find symbol", "no such method", "classnotfound"
+        )
+        if (errorHints.any { it in t }) return true
+
+        // File path / extension hints
+        val extHints = listOf(
+            ".kt", ".kts", ".java", ".js", ".ts", ".tsx", ".py", ".php", ".rb",
+            ".go", ".rs", ".cpp", ".c", ".h", ".cs", ".xml", ".json", ".gradle",
+            ".yml", ".yaml"
+        )
+        if (extHints.any { it in t }) return true
+        if (Regex("""[\\/].+\.(\w{1,6})""").containsMatchIn(t)) return true
+
+        // Code-y keywords
+        val codeHints = listOf(
+            "import ", "package ", "class ", "interface ", "fun ", "def ",
+            "require(", "include(", "from ", "new ", "extends ", "implements "
+        )
+        if (codeHints.any { it in t }) return true
+
+        // Length heuristic: short greetings rarely need context
+        val words = t.split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (words.size <= 3 && setOf("hi", "hello", "hey", "yo").any { it == t || t.startsWith(it) }) return false
+
+        // Default: no context
+        return false
     }
 
     private fun appendUser(text: String) {
@@ -251,17 +272,20 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
         }.ifBlank { "none" }
         val build = bundle.projectStructure?.buildSystem ?: "unknown"
         val modules = bundle.projectStructure?.modules?.joinToString(", ")?.ifBlank { null }
-        val files = bundle.relevantFiles?.let { it.filePaths.take(5) }?.joinToString("\n- ")?.let {
-            if (it.isNotBlank()) "\nTop files:\n- $it" else ""
-        } ?: ""
+
+        val filesLine = if (bundle.files.isNotEmpty()) {
+            val preview = bundle.files.take(5).joinToString("\n- ") { it.path }
+            val truncNote = if (bundle.truncatedCount > 0) " (truncated: ${bundle.truncatedCount})" else ""
+            "\nFiles: ${bundle.files.size}$truncNote (~${bundle.totalChars} chars)\n- $preview"
+        } else ""
 
         val modulesLine = modules?.let { "\nModules: $it" } ?: ""
         return """
         [Context]
         Language: $lang
         Frameworks: $frameworks
-        Build: $build$modulesLine$files
-        """.trim()
+        Build: $build$modulesLine$filesLine
+    """.trimIndent()
     }
 
 }

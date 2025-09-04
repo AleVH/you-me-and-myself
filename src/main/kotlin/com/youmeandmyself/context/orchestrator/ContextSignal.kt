@@ -29,9 +29,23 @@ sealed interface ContextSignal {
         override val source: String
     ) : ContextSignal
 
+    /**
+     * Files the detectors deem relevant. Each candidate carries a path plus a reason and a score
+     * so MergePolicy can rank deterministically.
+     *
+     * - score: higher = more relevant (detector-defined scale).
+     * - estChars: best-effort char count to inform caps/truncation (null = unknown).
+     */
     data class RelevantFiles(
-        val filePaths: List<String>,
+        val candidates: List<RelevantCandidate>,
         override val confidence: Confidence,
         override val source: String
     ) : ContextSignal
+
+    data class RelevantCandidate(
+        val path: String,
+        val reason: String,
+        val score: Int,
+        val estChars: Int? = null
+    )
 }
