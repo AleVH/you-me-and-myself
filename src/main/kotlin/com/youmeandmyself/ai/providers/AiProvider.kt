@@ -4,8 +4,6 @@
 // path: src/main/kotlin/com/youmeandmyself/ai/providers/AiProvider.kt — Provider interface
 package com.youmeandmyself.ai.providers
 
-import kotlinx.coroutines.CancellationException
-
 /**
  * Core contract every AI provider must implement.
  * Implementations should be side-effect free and throw exceptions with useful messages on failure.

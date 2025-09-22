@@ -12,13 +12,18 @@ import kotlinx.coroutines.launch
 import java.awt.BorderLayout
 import java.awt.Color
 import java.awt.Font
+import java.nio.charset.Charset
 import javax.swing.*
 import javax.swing.text.SimpleAttributeSet
 import javax.swing.text.StyleConstants
 import javax.swing.text.StyledDocument
 import com.youmeandmyself.ai.settings.PluginSettingsState
 import com.intellij.openapi.fileEditor.FileEditorManager
+import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.project.DumbService
+import com.intellij.openapi.application.ReadAction
 // Context Orchestrator imports
 import com.youmeandmyself.context.orchestrator.ContextOrchestrator
 import com.youmeandmyself.context.orchestrator.ContextRequest
@@ -28,7 +33,7 @@ import com.youmeandmyself.context.orchestrator.detectors.FrameworkDetector
 import com.youmeandmyself.context.orchestrator.detectors.LanguageDetector
 import com.youmeandmyself.context.orchestrator.detectors.ProjectStructureDetector
 import com.youmeandmyself.context.orchestrator.detectors.RelevantFilesDetector
-import com.intellij.openapi.diagnostic.Logger
+
 
 /**
  * A minimal chat UI:
@@ -96,10 +101,6 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
 
     }
 
-    // File: src/main/kotlin/com/youmeandmyself/ai/chat/ChatPanel.kt — full replacement of doSend()
-
-    // File: src/main/kotlin/com/youmeandmyself/ai/chat/ChatPanel.kt — full replacement of doSend()
-
     private fun doSend() {
         // 0) Read user input and render it on the transcript
         val userInput = input.text?.trim().orEmpty()
@@ -107,8 +108,25 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
         input.text = ""
         appendUser(userInput)
 
+        // Compute the current editor file early (used in the decision and later for content injection)
+        val editorFile = FileEditorManager.getInstance(project).selectedFiles.firstOrNull()
+
+        // Consider it “code” if the open file looks like source code (cheap/ext-only)
+        val isEditorCodeFile = editorFile?.extension?.lowercase() in setOf(
+            "kt","kts","java","js","jsx","ts","tsx","py","php","rb","go","rs","c","cpp","h","cs","xml","json","yml","yaml"
+        )
+
+        // Generic analysis verbs we consider when a code file is open (kept tight for economy)
+        val t = userInput.lowercase()
+        val isGenericExplain = listOf("what does this do", "explain", "analyze", "describe")
+            .any { it in t }
+
         // 1) Decide if we should run the orchestrator (smart + explicit toggle)
-        val needContext = attachContext.isSelected || isContextLikelyUseful(userInput)
+        val needContext = (attachContext.isSelected
+                || isContextLikelyUseful(userInput)
+                || refersToCurrentFile(userInput))
+                || (isEditorCodeFile && isGenericExplain) // generic code question with a code file open → ON
+
 
         // 2) Call provider
         scope.launch {
@@ -124,7 +142,19 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
             try {
                 val effectivePrompt: String
 
+                // Always compute the current editor file (used for content injection)
+//                val editorFile = FileEditorManager.getInstance(project).selectedFiles.firstOrNull() // delete once test passed
+
                 if (needContext) {
+                    if (DumbService.isDumb(project)) {
+                        appendAssistant(
+                            "This question requires project context, but the IDE is currently indexing files. " +
+                                    "Please wait until indexing finishes and then ask your question again.",
+                            isError = true
+                        )
+                        return@launch
+                    }
+
                     // Run detectors only when beneficial or explicitly requested
                     val registry = DetectorRegistry(
                         listOf(
@@ -136,16 +166,46 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
                     )
                     val orchestrator = ContextOrchestrator(registry, Logger.getInstance(ChatPanel::class.java))
                     val request = ContextRequest(project = project, maxMillis = 1400L)
+
+                    // If IDE indexing, let the user know, so he doesn't freak out
+                    if (DumbService.isDumb(project)) {
+                        appendBlock("[Context skipped: project indexing in progress]")
+                        val reply = provider.chat(userInput)
+                        appendAssistant(reply)
+                        return@launch
+                    }
+
                     val (bundle, metrics) = orchestrator.gather(request, scope)
 
                     appendBlock("[Context ready in ${metrics.totalMillis} ms]")
 
                     val contextNote = formatContextNote(bundle)
+
+                    // Decide if we should include the current editor file's content:
+                    // - If user explicitly refers to "this file", include it (economical cap).
+                    // - Otherwise, keep current behavior (context note only).
+                    val includeCurrentFileContent = editorFile != null && refersToCurrentFile(userInput)
+
+                    val fileBlock = if (includeCurrentFileContent) {
+                        val text = readFileTextCapped(editorFile!!)
+                        if (text != null && text.isNotBlank()) {
+                            val lang = fenceLangFor(editorFile)
+                            val path = editorFile.path.substringAfterLast('/')
+                            """
+                            [File: $path]
+                            ```$lang
+                            ${text.trim()}
+                            ```
+                            """.trimIndent()
+                        } else ""
+                    } else ""
+
                     effectivePrompt = """
                     $contextNote
+                    $fileBlock
 
                     $userInput
-                """.trimIndent()
+                    """.trimIndent()
                 } else {
                     // No context → send plain
                     effectivePrompt = userInput
@@ -287,5 +347,97 @@ class ChatPanel(private val project: com.intellij.openapi.project.Project) {
         Build: $build$modulesLine$filesLine
     """.trimIndent()
     }
+
+    // NEW: detect deictic phrasing that clearly refers to the active file
+    private fun refersToCurrentFile(text: String): Boolean {
+        val t = text.lowercase()
+        return listOf(
+            "this file", "explain this file", "walk me through this file",
+            "what does this file do", "analyze this file"
+        ).any { it in t }
+    }
+
+    // NEW: read editor file content with a safe cap (reuse MergePolicy scale: 50k chars)
+//    private fun readFileTextCapped(vf: VirtualFile, maxChars: Int = 50_000): String? {
+//        return try {
+//            val doc = FileDocumentManager.getInstance().getDocument(vf)
+//            val text = doc?.text ?: String(vf.inputStream.readAllBytes())
+//            text.take(maxChars)
+//        } catch (_: Throwable) {
+//            null
+//        }
+//    }
+
+    // Read editor file content with a safe cap, under a ReadAction to satisfy PSI/VFS threading rules
+//    private fun readFileTextCapped(vf: VirtualFile, maxChars: Int = 50_000): String? {
+//        return try {
+//            ReadAction.compute<String?, Throwable> {
+//                val fdm = FileDocumentManager.getInstance()
+//                val doc = fdm.getDocument(vf)
+//
+//                // Prefer the editor document if present (unsaved changes, correct encoding)
+//                if (doc != null) {
+//                    val seq = doc.charsSequence
+//                    val end = minOf(seq.length, maxChars)
+//                    seq.subSequence(0, end).toString()
+//                } else {
+//                    if (!vf.isValid) return@compute null
+//                    // Fall back to VFS content (cap to maxChars)
+//                    vf.inputStream.use { input ->
+//                        val bytes = input.readNBytes(maxChars + 1) // read a bit extra, then cap
+//                        val len = bytes.size.coerceAtMost(maxChars)
+//                        String(bytes, 0, len) // rely on platform default; adjust if you track charset
+//                    }
+//                }
+//            }
+//        } catch (_: Throwable) {
+//            null
+//        }
+//    }
+
+    // Read editor file content with a safe cap, under ReadAction (fixes read-access errors).
+    private fun readFileTextCapped(vf: VirtualFile, maxChars: Int = 50_000): String? {
+        return try {
+            ReadAction.compute<String?, Throwable> {
+                val fdm = FileDocumentManager.getInstance()
+                val doc = fdm.getDocument(vf)
+
+                if (doc != null) {
+                    // Prefer the live editor document (includes unsaved edits).
+                    val seq = doc.charsSequence
+                    val end = minOf(seq.length, maxChars)
+                    seq.subSequence(0, end).toString()
+                } else {
+                    if (!vf.isValid) return@compute null
+                    // Fall back to VFS bytes; decode with the file's charset and cap.
+                    val cs: Charset = vf.charset
+                    vf.inputStream.use { input ->
+                        // read just a bit more than needed, then cap
+                        val bytes = input.readNBytes(maxChars + 1)
+                        val len = bytes.size.coerceAtMost(maxChars)
+                        String(bytes, 0, len, cs)
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    // Optional: derive a reasonable fence language from file type name
+    private fun fenceLangFor(vf: VirtualFile): String {
+        val n = vf.fileType.name.lowercase()
+        return when {
+            n.contains("kotlin") -> "kotlin"
+            n.contains("java") -> "java"
+            n.contains("typescript") -> "ts"
+            n.contains("javascript") -> "js"
+            n.contains("json") -> "json"
+            n.contains("xml") -> "xml"
+            n.contains("yaml") || n.contains("yml") -> "yaml"
+            else -> "" // no language hint
+        }
+    }
+
 
 }

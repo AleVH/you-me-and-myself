@@ -5,8 +5,8 @@
 
 plugins {
     // Kotlin (unchanged)
-    kotlin("jvm") version "1.9.24"
-    kotlin("plugin.serialization") version "1.9.24"
+    kotlin("jvm") version "2.2.0"
+    kotlin("plugin.serialization") version "2.2.0"
     // IntelliJ Platform Gradle Plugin 2.x (latest)
     id("org.jetbrains.intellij.platform") version "2.9.0"
 }
@@ -27,10 +27,18 @@ dependencies {
     // Kotlinx JSON (match Ktor 2.3.x with 1.6.x)
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 
-    // IntelliJ Platform target (matches your previous baseline: IC 2024.3 / 243)
+    // IntelliJ Platform target (parameterized)
     intellijPlatform {
-        create("IC", "2024.3")
-        bundledPlugins("com.intellij.java", "com.intellij.gradle")
+        val type    = providers.gradleProperty("platformType").orElse("IC")
+        val version = providers.gradleProperty("platformVersion").orElse("2024.3")
+
+        create(type, version)
+
+        // Only IntelliJ IDEA bundles these; PhpStorm/WebStorm do not.
+        when (type.get()) {
+            "IC", "IU" -> bundledPlugins("com.intellij.java", "com.intellij.gradle")
+            else       -> { /* no IDEA-only plugins when running on PhpStorm, etc. */ }
+        }
     }
 }
 
