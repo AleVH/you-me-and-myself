@@ -54,10 +54,16 @@ class ContextOrchestrator(
         } ?: emptyList()
 
         val bundle = MergePolicy.merge(signals)
+        // Pull counters from the merge result via a tiny helper.
+        // We don't have direct access here, so add a small API on MergePolicy to expose them.
+
         val metrics = OrchestratorMetrics(
             totalMillis = System.currentTimeMillis() - start,
             detectorMillis = detectorTimes.toMap(),
-            errors = errors.toMap()
+            errors = errors.toMap(),
+            filesRawAttached = MergePolicy.lastFilesRawAttached,
+            filesSummarizedAttached = MergePolicy.lastFilesSummarizedAttached,
+            staleSynopsesUsed = MergePolicy.lastStaleSynopsesUsed
         )
         return bundle to metrics
     }

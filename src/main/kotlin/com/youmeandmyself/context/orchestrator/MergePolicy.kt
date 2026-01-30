@@ -1,6 +1,11 @@
 // (project-root)/src/main/kotlin/com/youmeandmyself/context/orchestrator/MergePolicy.kt
 package com.youmeandmyself.context.orchestrator
 
+import com.intellij.openapi.project.ProjectManager
+import com.youmeandmyself.ai.settings.PluginSettingsState
+import com.youmeandmyself.dev.Dev
+import com.intellij.openapi.diagnostic.Logger
+
 /**
  * MergePolicy
  *
@@ -26,10 +31,19 @@ package com.youmeandmyself.context.orchestrator
  */
 object MergePolicy {
 
+    @Volatile internal var lastFilesRawAttached: Int = 0
+    @Volatile internal var lastFilesSummarizedAttached: Int = 0
+    @Volatile internal var lastStaleSynopsesUsed: Int = 0
+
+    private val log = Logger.getInstance(MergePolicy::class.java)
+
     /**
      * Entry point: merge the list of signals into a ContextBundle.
      */
     fun merge(signals: List<ContextSignal>): ContextBundle {
+
+        Dev.info(log, "merge.enter", "signals" to signals.size)
+
         var lang: ContextSignal.Language? = null
         val frameworks = linkedMapOf<String, ContextSignal.Framework>()
         var structure: ContextSignal.ProjectStructure? = null
@@ -59,6 +73,10 @@ object MergePolicy {
             filesSignal = filesSignal
         )
 
+        lastFilesRawAttached = result.filesRawAttached
+        lastFilesSummarizedAttached = result.filesSummarizedAttached
+        lastStaleSynopsesUsed = result.staleSynopsesUsed
+
         // Return the merged bundle with transparency fields filled in.
         return ContextBundle(
             language = lang,
@@ -69,7 +87,10 @@ object MergePolicy {
             totalChars = result.totalChars,
             truncatedCount = result.truncatedCount,
             rawSignals = signals
-        )
+        ).also {
+            // Note: counters are pulled by ContextOrchestrator when building metrics.
+            // (No change to ContextBundle fields.)
+        }
     }
 
     /**
@@ -82,16 +103,6 @@ object MergePolicy {
     // ---------------------------------------------------------------------------------------------
     // Policy configuration (constants for now; wire to Settings later)
     // ---------------------------------------------------------------------------------------------
-
-    /** Max number of files to include in the final bundle. */
-    private const val MAX_FILES_TOTAL = 16
-
-    /** Max allowed characters per file (used for budgeting/truncation flag). */
-    private const val MAX_CHARS_PER_FILE = 50_000
-
-    /** Max total characters across all files (sum of per-file budgets). */
-    private const val MAX_CHARS_TOTAL = 500_000
-
     /** Denylisted directory substrings (normalized with forward slashes). */
     private val DENY_DIRS = listOf(
         "/.git/", "/.idea/", "/node_modules/", "/vendor/",
@@ -128,7 +139,10 @@ object MergePolicy {
     private data class BuildResult(
         val finalFiles: List<ContextFile>,
         val totalChars: Int,
-        val truncatedCount: Int
+        val truncatedCount: Int,
+        val filesRawAttached: Int,
+        val filesSummarizedAttached: Int,
+        val staleSynopsesUsed: Int
     )
 
     /**
@@ -138,7 +152,13 @@ object MergePolicy {
         langId: String?,
         filesSignal: ContextSignal.RelevantFiles?
     ): BuildResult {
-        if (filesSignal == null) return BuildResult(emptyList(), 0, 0)
+
+        Dev.info(log, "merge.files.start",
+            "hasFilesSignal" to (filesSignal != null),
+            "candidates" to (filesSignal?.candidates?.size ?: 0),
+            "lang" to langId)
+
+        if (filesSignal == null) return BuildResult(emptyList(), 0, 0, 0, 0, 0)
 
         // 1) Deduplicate by path (keep the highest-score candidate).
         val dedup = filesSignal.candidates
@@ -155,33 +175,118 @@ object MergePolicy {
                 .thenBy { it.path }
         )
 
-        // 4) Enforce caps and compute truncation flags.
+        // 4) Enforce caps and compute truncation/summaries.
+        //    We decide RAW vs SUMMARY per candidate based on per-file cap.
         val out = mutableListOf<ContextFile>()
         var total = 0
         var truncated = 0
+        // metrics: counters for transparency; wire into OrchestratorMetrics later.
+        var filesRawAttached = 0
+        var filesSummarizedAttached = 0
+        var staleSynopsesUsed = 0
+
+        // SummaryStore lives at project level; we resolve it lazily when needed
+        val summaryStore = ProjectManager.getInstance()
+            .openProjects.firstOrNull()
+            ?.getService(SummaryStore::class.java)
+
+        // NEW: read M4 caps/toggles from settings (fallback instance if service not found)
+        val settings = ProjectManager.getInstance()
+            .openProjects.firstOrNull()
+            ?.getService(PluginSettingsState::class.java)
+            ?: PluginSettingsState()
+
 
         for (cand in ordered) {
-            if (out.size >= MAX_FILES_TOTAL) break
+            if (out.size >= settings.maxFilesTotal) break
 
-            val est = cand.estChars ?: 0
-            val allowedForFile = minOf(est, MAX_CHARS_PER_FILE)
-            val wouldBe = total + allowedForFile
-            if (wouldBe > MAX_CHARS_TOTAL) break
+            val estRaw = cand.estChars ?: 0
+            val rawWouldTruncate = estRaw > settings.maxCharsPerFile
 
-            val isTrunc = est > MAX_CHARS_PER_FILE
-            if (isTrunc) truncated++
+            // Decide representation
+            val useSummary = settings.enableSummaries && rawWouldTruncate && summaryStore != null
 
-            out += ContextFile(
-                path = cand.path,
-                languageId = langId,              // per-file language can be added later if detectors supply it
-                kind = ContextKind.RAW,           // SUMMARY is reserved for M4 (summaries/indexer)
-                reason = cand.reason,             // transparency: why this file is here
-                charCount = allowedForFile,       // budget for this file (PromptBuilder will slice to this)
-                truncated = isTrunc               // flag for transcript note
-            )
+            Dev.info(log, "merge.files.pick",
+                "path" to cand.path,
+                "estRaw" to estRaw,
+                "rawCap" to settings.maxCharsPerFile,
+                "enableSummaries" to settings.enableSummaries,
+                "store" to (summaryStore != null),
+                "useSummary" to useSummary)
+
+            val cf: ContextFile = if (!useSummary) {
+                val allowedForFile = minOf(estRaw, settings.maxCharsPerFile)
+                if (estRaw > settings.maxCharsPerFile) truncated++
+                ContextFile(
+                    path = cand.path,
+                    languageId = langId,
+                    kind = ContextKind.RAW,
+                    reason = cand.reason,
+                    charCount = allowedForFile,
+                    truncated = estRaw > settings.maxCharsPerFile
+                )
+            } else {
+
+                Dev.info(log, "merge.summary.start", "path" to cand.path, "lang" to langId, "reason" to cand.reason)
+
+
+                // Ask SummaryStore for header + optional synopsis
+                val (header, headerChars) = summaryStore.ensureHeaderSample(
+                    path = cand.path,
+                    languageId = langId,
+                    maxChars = settings.headerSampleMaxChars
+                )
+                val (synopsis, isStale) = summaryStore.getOrEnqueueSynopsis(
+                    path = cand.path,
+                    languageId = langId,
+                    currentContentHash = null, // TODO: pass a hash when you have it
+                    maxTokens = settings.synopsisMaxTokens,
+                    autoGenerate = settings.generateSynopsesAutomatically
+                )
+
+                Dev.info(log, "merge.synopsis.req", "path" to cand.path, "stale" to isStale)
+
+                val budgeted = (headerChars) + (synopsis?.length ?: 0)
+
+                ContextFile(
+                    path = cand.path,
+                    languageId = langId,
+                    kind = ContextKind.SUMMARY,
+                    reason = cand.reason,
+                    charCount = budgeted,
+                    truncated = false,
+                    headerSample = header,
+                    modelSynopsis = synopsis,
+                    isStale = isStale,
+                    source = "summary-cache"
+                )
+            }
+
+            // Respect global cap using the actual representation size
+            val wouldBe = total + cf.charCount
+            if (wouldBe > settings.maxCharsTotal) break
+
+            // metrics: increment counters by representation
+            when (cf.kind) {
+                ContextKind.RAW -> filesRawAttached++
+                ContextKind.SUMMARY -> {
+                    filesSummarizedAttached++
+                    if (cf.isStale) staleSynopsesUsed++
+                }
+            }
+
+            out += cf
             total = wouldBe
         }
 
-        return BuildResult(out, total, truncated)
+        // TODO: add filesRawAttached, filesSummarizedAttached, staleSynopsesUsed to OrchestratorMetrics once the data class includes these fields.
+        return BuildResult(
+            out,
+            total,
+            truncated,
+            filesRawAttached,
+            filesSummarizedAttached,
+            staleSynopsesUsed
+        )
     }
 }

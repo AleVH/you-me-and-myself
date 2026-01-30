@@ -14,7 +14,8 @@ plugins {
 repositories {
     mavenCentral()
     // Required by 2.x plugin
-    intellijPlatform { defaultRepositories() }
+//    intellijPlatform { defaultRepositories() }
+    intellijPlatform.defaultRepositories()
 }
 
 dependencies {
@@ -30,13 +31,13 @@ dependencies {
     // IntelliJ Platform target (parameterized)
     intellijPlatform {
         val type    = providers.gradleProperty("platformType").orElse("IC")
-        val version = providers.gradleProperty("platformVersion").orElse("2024.3")
+        val version = providers.gradleProperty("platformVersion").orElse("2024.3.2")
 
         create(type, version)
 
         // Only IntelliJ IDEA bundles these; PhpStorm/WebStorm do not.
         when (type.get()) {
-            "IC", "IU" -> bundledPlugins("com.intellij.java", "com.intellij.gradle")
+            "IC", "IU" -> bundledPlugins("com.intellij.java") //, "com.intellij.gradle")
             else       -> { /* no IDEA-only plugins when running on PhpStorm, etc. */ }
         }
     }
@@ -62,5 +63,23 @@ intellijPlatform {
 
 tasks {
     // Default runIde; let the plugin/IDE pick the right runtime (no JBR overrides)
-    runIde { }
+    runIde {
+        // Disable Gradle plugin in the sandbox no matter what
+        jvmArgs("-Didea.plugins.disabled=com.intellij.gradle", "-Dymm.devMode=true")
+
+        // (Optional) print sandbox for log inspection
+        doFirst {
+            val sandbox = layout.buildDirectory.dir("idea-sandbox").get().asFile.absolutePath
+            println("Sandbox dir: $sandbox")
+
+            // Clear plugin profiles before each run
+            val configFile = File(sandbox, "config/options/youmeandmyself-ai-profiles.xml")
+            if (configFile.exists()) {
+                configFile.delete()
+                println("DELETED persistent profiles: ${configFile.absolutePath}")
+            } else {
+                println("No profiles file found at: ${configFile.absolutePath}")
+            }
+        }
+    }
 }

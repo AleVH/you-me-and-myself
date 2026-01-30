@@ -1,14 +1,10 @@
-// ==========================
-// File: src/main/kotlin/com/youmeandmyself/ai/providers/ProviderRegistry.kt
-// ==========================
-// path: src/main/kotlin/com/youmeandmyself/ai/providers/ProviderRegistry.kt — Provider registry exposing configured providers
 package com.youmeandmyself.ai.providers
 
-import com.youmeandmyself.ai.settings.PluginSettingsState
 import com.intellij.openapi.project.Project
-import com.youmeandmyself.ai.providers.deepseek.DeepSeekProvider
-import com.youmeandmyself.ai.providers.gemini.GeminiProvider
-import com.youmeandmyself.ai.providers.openai.OpenAIProvider
+import com.youmeandmyself.ai.settings.AiProfilesState
+import com.youmeandmyself.ai.settings.AiProfile
+import com.youmeandmyself.ai.providers.generic.GenericLlmProvider
+import com.youmeandmyself.dev.Dev
 
 /**
  * Registry that exposes only the providers enabled/configured in settings.
@@ -16,95 +12,72 @@ import com.youmeandmyself.ai.providers.openai.OpenAIProvider
  */
 object ProviderRegistry {
 
-    /**
-     * NEW: Returns *all* known providers (including those not configured).
-     * Used by the "AI Providers Test" status view to show a complete picture.
-     * - If an API key/base URL is missing, the provider itself should surface
-     *   a clear status (e.g., "not configured (no API key)" or a 401).
-     */
-    fun allProviders(project: Project): List<AiProvider> {
-        val s = PluginSettingsState.getInstance(project)
+    fun selectedChatProvider(project: Project): AiProvider? {
+        val ps = AiProfilesState.getInstance(project)
+        val eligible = ps.profiles
+            .filter { it.roles.chat && isValidProfile(it) }
+            .sortedByDescending { it.id } // Newest first (UUIDs are time-based)
 
-        val list = mutableListOf<AiProvider>()
+        if (eligible.isEmpty()) return null
 
-        // Keep Mock first so the UI always shows a quick "ok (simulated)" line.
-        list += MockProvider
-
-        // Note: We pass empty strings if keys are missing so providers can report
-        // a precise status instead of being omitted from the list.
-        list += OpenAIProvider(s.openAiApiKey?.trim().orEmpty(), s.openAiBaseUrl, s.openAiModel)
-        list += GeminiProvider(s.geminiApiKey?.trim().orEmpty(), s.geminiBaseUrl)
-        list += DeepSeekProvider(s.deepSeekApiKey?.trim().orEmpty(), s.deepSeekBaseUrl)
-
-        return list
-    }
-
-    /**
-     * EXISTING: Returns only the providers that are configured/enabled.
-     * Left unchanged for any existing call sites that rely on "active only".
-     */
-    fun activeProviders(project: Project): List<AiProvider> {
-        val s = PluginSettingsState.getInstance(project)
-        val list = mutableListOf<AiProvider>()
-        list += MockProvider
-        val openAiKey = s.openAiApiKey?.trim()
-        if (!openAiKey.isNullOrBlank()) list += OpenAIProvider(openAiKey, s.openAiBaseUrl, s.openAiModel)
-
-        val geminiKey = s.geminiApiKey?.trim()
-        if (!geminiKey.isNullOrBlank()) list += GeminiProvider(geminiKey, s.geminiBaseUrl)
-
-        val deepSeekKey = s.deepSeekApiKey?.trim()
-        if (!deepSeekKey.isNullOrBlank()) list += DeepSeekProvider(deepSeekKey, s.deepSeekBaseUrl)
-        return list
-    }
-
-    // Purpose: snapshot mutable settings before checks/usage to avoid smart-cast errors
-    fun openAiProvider(project: Project): OpenAIProvider? {
-        val s = PluginSettingsState.getInstance(project)
-
-        // Snapshot the fields once
-        val key: String? = s.openAiApiKey?.trim()
-        val base: String? = s.openAiBaseUrl
-        val model = s.openAiModel
-
-        // Guard and return using the snapshot (no double reads)
-        if (key.isNullOrBlank()) return null
-        return OpenAIProvider(key, base, model)
-    }
-
-    /**
-     * Returns only the provider explicitly selected in settings — or null if
-     * either nothing is selected or the chosen provider isn’t configured.
-     *
-     * Valid ids (case-insensitive): "openai", "gemini", "deepseek", "mock"
-     */
-    fun selectedProvider(project: Project): AiProvider? {
-        val s = PluginSettingsState.getInstance(project)
-
-        when (s.selectedProvider?.lowercase()) {
-            "openai" -> {
-                // Reuse existing guard logic (returns null if not configured)
-                return openAiProvider(project)
-            }
-            "gemini" -> {
-                val key = s.geminiApiKey?.trim()
-                if (!key.isNullOrBlank()) {
-                    return GeminiProvider(key, s.geminiBaseUrl)
-                }
-            }
-            "deepseek" -> {
-                val key = s.deepSeekApiKey?.trim()
-                if (!key.isNullOrBlank()) {
-                    return DeepSeekProvider(key, s.deepSeekBaseUrl)
-                }
-            }
-            "mock" -> {
-                return MockProvider
-            }
+        // Use explicit selection if set
+        val chosenId = ps.selectedChatProfileId
+        if (chosenId != null) {
+            return eligible.find { it.id == chosenId }?.let { providerFromProfile(it, project) }
         }
 
-        // Either nothing selected or the selected provider isn’t configured.
-        return null
+        // Auto-selection logic: newest profile that has chat role
+        val chosen = eligible.firstOrNull()
+        Dev.info(Dev.logger(ProviderRegistry::class.java), "chat.autoSelect",
+            "chosen" to chosen?.label, "eligible" to eligible.size)
+        return chosen?.let { providerFromProfile(it, project) }
     }
 
+    fun selectedSummaryProvider(project: Project): AiProvider? {
+        val ps = AiProfilesState.getInstance(project)
+        val eligible = ps.profiles
+            .filter { it.roles.summary && isValidProfile(it) }
+            .sortedByDescending { it.id } // Newest first
+
+        if (eligible.isEmpty()) return null
+
+        // Use explicit selection if set
+        val chosenId = ps.selectedSummaryProfileId
+        if (chosenId != null) {
+            return eligible.find { it.id == chosenId }?.let { providerFromProfile(it, project) }
+        }
+
+        // Auto-selection logic: newest profile that has summary role
+        val chosen = eligible.firstOrNull()
+        Dev.info(Dev.logger(ProviderRegistry::class.java), "summary.autoSelect",
+            "chosen" to chosen?.label, "eligible" to eligible.size)
+        return chosen?.let { providerFromProfile(it, project) }
+    }
+
+    /**
+     * Create a provider instance from a profile.
+     * 
+     * @param profile The AI profile with configuration
+     * @param project The IntelliJ project (needed for storage, etc.)
+     */
+    private fun providerFromProfile(profile: AiProfile, project: Project): AiProvider {
+        // NOTE: For now, we pass through profile.apiKey (plaintext in state).
+        // In phase 2, swap to PasswordSafe via a Secrets helper.
+        return GenericLlmProvider(
+            id = (profile.providerId.ifBlank { "generic" }).lowercase(),
+            displayName = profile.label.ifBlank { profile.providerId.ifBlank { "Generic LLM" } },
+            baseUrl = profile.baseUrl,
+            apiKey = profile.apiKey,
+            model = profile.model,
+            protocol = profile.protocol!!, // ensured by migration in loadState
+            custom = profile.custom,
+            project = project
+        )
+    }
+
+    private fun isValidProfile(profile: AiProfile): Boolean {
+        return profile.apiKey.isNotBlank() &&
+                profile.baseUrl.isNotBlank() &&
+                profile.model?.isNotBlank() == true
+    }
 }

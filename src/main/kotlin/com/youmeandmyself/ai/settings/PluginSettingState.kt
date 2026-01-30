@@ -13,39 +13,46 @@ import com.intellij.openapi.project.Project
  * Persistent settings for API keys and optional base URLs.
  * Declared as project-level so each IntelliJ project can keep its own keys.
  */
-@State(name = "YmmAssistantSettings", storages = [Storage("ymm-assistant.xml")])
+//@State(name = "YmmAssistantSettings", storages = [Storage("ymm-assistant.xml")])
 @Service(Service.Level.PROJECT)
 class PluginSettingsState : PersistentStateComponent<PluginSettingsState> {
-    var openAiApiKey: String? = null
-    var openAiBaseUrl: String? = null
-    var openAiModel: String? = null
+    // Add within your @State-backed data class or persistent bean:
+    var enableSummaries: Boolean = true
 
-    var geminiApiKey: String? = null
-    var geminiBaseUrl: String? = null
-    var deepSeekApiKey: String? = null
-    var deepSeekBaseUrl: String? = null
+    // Move caps here so they’re configurable (previously constants in MergePolicy)
+    var maxFilesTotal: Int = 16
+    var maxCharsPerFile: Int = 2_000 //50_000
+    var maxCharsTotal: Int = 500_000
 
-    // Allowed values: "openai", "gemini", "deepseek", "mock"
-    // Purpose: remember the user's explicit provider choice for ChatPanel and elsewhere.
-    var selectedProvider: String? = null
+    // Summary policy
+    var headerSampleMaxChars: Int = 2_000
+
+    // Synopsis (LLM) policy
+    var generateSynopsesAutomatically: Boolean = true
+    var synopsisMaxTokens: Int = 700
+
+    // Which providers are permitted for each role (empty = all active are allowed)
+    var chatEnabledProviders: MutableSet<String> = mutableSetOf()
+    var summaryEnabledProviders: MutableSet<String> = mutableSetOf()
+
+    // TODO(UX): Expose the above in Settings UI (PluginSettingsConfigurable).
+    // Keep off by default if you prefer, but they should be editable later.
+    fun isChatAllowed(id: String): Boolean =
+        chatEnabledProviders.isEmpty() || chatEnabledProviders.contains(id)
+
+    fun isSummaryAllowed(id: String): Boolean =
+        summaryEnabledProviders.isEmpty() || summaryEnabledProviders.contains(id)
 
     override fun getState(): PluginSettingsState = this
     override fun loadState(state: PluginSettingsState) {
-        this.openAiApiKey = state.openAiApiKey
-        this.openAiBaseUrl = state.openAiBaseUrl
-        this.openAiModel = state.openAiModel
-
-        this.geminiApiKey = state.geminiApiKey
-        this.geminiBaseUrl = state.geminiBaseUrl
-        this.deepSeekApiKey = state.deepSeekApiKey
-        this.deepSeekBaseUrl = state.deepSeekBaseUrl
-
-        // Keep the selected provider in sync when settings are loaded
-        this.selectedProvider = state.selectedProvider
+        this.chatEnabledProviders = state.chatEnabledProviders
+        this.summaryEnabledProviders = state.summaryEnabledProviders
     }
 
     companion object {
         fun getInstance(project: Project): PluginSettingsState =
             project.getService(PluginSettingsState::class.java)
     }
+
+
 }

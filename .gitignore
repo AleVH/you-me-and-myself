@@ -15,3 +15,14 @@ build/
 
 .gradle/
 .DS_Store
+
+# IntelliJ Platform Gradle plugin artifacts
+.intellijPlatform/
+# Plugin local storage (runtime data)
+.youmeandmyself/
+# Misc local files
+IDLE
+
+# Local / working documentation (not versioned)
+docs/
+

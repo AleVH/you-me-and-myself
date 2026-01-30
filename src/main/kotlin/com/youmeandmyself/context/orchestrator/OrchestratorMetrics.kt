@@ -7,5 +7,10 @@ package com.youmeandmyself.context.orchestrator
 data class OrchestratorMetrics(
     val totalMillis: Long,
     val detectorMillis: Map<String, Long>,
-    val errors: Map<String, String>
+    val errors: Map<String, String>,
+
+    // counters (kept optional to preserve all existing call sites)
+    val filesRawAttached: Int = 0,
+    val filesSummarizedAttached: Int = 0,
+    val staleSynopsesUsed: Int = 0
 )
