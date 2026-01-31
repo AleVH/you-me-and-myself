@@ -95,8 +95,8 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
             // Handle messages coming from JS
             jsQuery.addHandler { message ->
                 Dev.info(log, "browser.handler_called", "message" to message)
-                when (message) {
-                    "READY" -> {
+                when {
+                    message == "READY" -> {
                         Dev.info(log, "browser.ready", "dom_ready" to true)
 
                         // DOM is ready - set up message handling
@@ -104,6 +104,13 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
 
                         // Signal to ChatPanel that we're ready
                         onReadyCallback?.invoke(true)
+                        null
+                    }
+                    message.startsWith("COPY:") -> {
+                        // Fallback clipboard handler when JS clipboard API is blocked
+                        // JCEF may restrict navigator.clipboard in some configurations
+                        val code = message.removePrefix("COPY:")
+                        copyToClipboard(code)
                         null
                     }
                     else -> {
@@ -247,13 +254,18 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
                         console.warn("[YMM] highlight.js not loaded - syntax highlighting disabled");
                     }
                     
-                    // Step 3: Install custom fence renderer for language labels
+                    // Step 3: Install custom fence renderer for language labels and copy button
                     if (window.md && window.md.renderer) {
+                        // Track code blocks for copy functionality
+                        // Each code block gets a unique ID so the copy button knows which code to copy
+                        var codeBlockCounter = 0;
+                        
                         window.md.renderer.rules.fence = function(tokens, idx, options, env, self) {
                             var token = tokens[idx];
                             var rawCode = token.content || "";
                             var rawLang = (token.info || "").trim().toLowerCase();
                             var langLabel = rawLang ? rawLang.toUpperCase() : "CODE";
+                            var blockId = "code-block-" + (codeBlockCounter++);
                             
                             // Use markdown-it's highlight function (set up in Step 1)
                             var highlightedCode = "";
@@ -263,13 +275,77 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
                                 highlightedCode = escapeHtml(rawCode);
                             }
                             
-                            return '<div class="code-block">' +
+                            // Store raw code in a data attribute for copy functionality
+                            // We base64 encode to avoid escaping issues with quotes and special chars
+                            var encodedCode = btoa(unescape(encodeURIComponent(rawCode)));
+                            
+                            return '<div class="code-block" id="' + blockId + '" data-code="' + encodedCode + '">' +
+                                   '<div class="code-block-header">' +
                                    '<span class="lang-label">' + langLabel + '</span>' +
+                                   '<button class="copy-btn" onclick="copyCodeBlock(\'' + blockId + '\')" title="Copy code">' +
+                                   '<span class="copy-icon">⧉</span><span class="copy-text">Copy</span>' +
+                                   '</button>' +
+                                   '</div>' +
                                    '<pre><code class="hljs ' + rawLang + '">' + highlightedCode + '</code></pre>' +
                                    '</div>';
                         };
-                        console.log("[YMM] Custom fence renderer installed");
+                        console.log("[YMM] Custom fence renderer installed with copy button");
                     }
+                    
+                    /**
+                     * Copy code from a code block to clipboard.
+                     * 
+                     * Called when user clicks the Copy button on a code block.
+                     * Shows visual feedback (button text changes to "Copied!").
+                     * 
+                     * @param blockId - The ID of the code-block div containing the code
+                     */
+                    window.copyCodeBlock = function(blockId) {
+                        var block = document.getElementById(blockId);
+                        if (!block) {
+                            console.error("[YMM] Code block not found:", blockId);
+                            return;
+                        }
+                        
+                        // Get raw code from data attribute (base64 encoded)
+                        var encodedCode = block.getAttribute("data-code");
+                        if (!encodedCode) {
+                            console.error("[YMM] No code data found for block:", blockId);
+                            return;
+                        }
+                        
+                        // Decode the code
+                        var rawCode;
+                        try {
+                            rawCode = decodeURIComponent(escape(atob(encodedCode)));
+                        } catch (e) {
+                            console.error("[YMM] Failed to decode code:", e);
+                            return;
+                        }
+                        
+                        // Copy to clipboard
+                        navigator.clipboard.writeText(rawCode).then(function() {
+                            // Show feedback
+                            var btn = block.querySelector(".copy-btn");
+                            if (btn) {
+                                var originalText = btn.innerHTML;
+                                btn.innerHTML = '<span class="copy-icon">✓</span><span class="copy-text">Copied!</span>';
+                                btn.classList.add("copied");
+                                
+                                // Reset after 2 seconds
+                                setTimeout(function() {
+                                    btn.innerHTML = originalText;
+                                    btn.classList.remove("copied");
+                                }, 2000);
+                            }
+                            console.log("[YMM] Code copied to clipboard");
+                        }).catch(function(err) {
+                            console.error("[YMM] Clipboard write failed:", err);
+                            // Fallback: try using Kotlin bridge if clipboard API fails
+                            // (JCEF may restrict clipboard in some configurations)
+                            window.sendToKotlin("COPY:" + rawCode);
+                        });
+                    };
                     
                     // Step 4: Set up chat functions
                     
@@ -525,6 +601,23 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
         Dev.info(log, "chat.js", "event" to event, "details" to details)
     }
 
+    /**
+     * Copy text to system clipboard.
+     *
+     * Used as a fallback when the JS clipboard API is blocked in JCEF.
+     * The JS code sends a "COPY:..." message which is handled here.
+     */
+    private fun copyToClipboard(text: String) {
+        try {
+            val clipboard = java.awt.Toolkit.getDefaultToolkit().systemClipboard
+            val selection = java.awt.datatransfer.StringSelection(text)
+            clipboard.setContents(selection, selection)
+            Dev.info(log, "browser.clipboard", "copied_chars" to text.length)
+        } catch (e: Exception) {
+            Dev.error(log, "browser.clipboard", e, "failed" to true)
+        }
+    }
+
     // -------------------------------------------------------------------------
     // CSS Styles
     // -------------------------------------------------------------------------
@@ -678,50 +771,63 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
               margin: 0.5rem 0;
           }
           
+          /* Code block header (contains language label and copy button) */
+          .code-block-header {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              background: #333;
+              border: 1px solid #444;
+              border-bottom: none;
+              border-radius: 0.5rem 0.5rem 0 0;
+              padding: 0.25rem 0.5rem;
+          }
+          
           /* Language label */
           .lang-label {
-              position: absolute;
-              top: 0;
-              right: 0;
-              background: #444;
-              color: #ccc;
-              font-size: 0.65rem;
+              color: #aaa;
+              font-size: 0.7rem;
               font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-              border-radius: 0 0.5rem 0 0.25rem;
-              padding: 0.2rem 0.5rem;
               text-transform: uppercase;
               letter-spacing: 0.05em;
           }
           
-          /* Ensure code block pre accounts for label */
-          .code-block pre {
-              padding-top: 1.5rem;
-              margin: 0;
-          }
-          
-          /* Copy button (for future use) */
+          /* Copy button */
           .copy-btn {
-              position: absolute;
-              top: 6px;
-              right: 60px;
-              background-color: #333;
-              color: #ccc;
-              border: none;
+              display: flex;
+              align-items: center;
+              gap: 0.3rem;
+              background-color: transparent;
+              color: #888;
+              border: 1px solid #555;
               border-radius: 4px;
-              padding: 3px 6px;
-              font-size: 0.75rem;
+              padding: 0.2rem 0.5rem;
+              font-size: 0.7rem;
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
               cursor: pointer;
-              opacity: 0;
-              transition: opacity 0.2s, background-color 0.2s;
-          }
-          
-          .code-block:hover .copy-btn {
-              opacity: 0.7;
+              transition: all 0.2s ease;
           }
           
           .copy-btn:hover {
-              opacity: 1 !important;
+              color: #fff;
+              border-color: #777;
               background-color: #444;
+          }
+          
+          .copy-btn.copied {
+              color: #4ade80;
+              border-color: #4ade80;
+          }
+          
+          .copy-icon {
+              font-size: 0.8rem;
+          }
+          
+          /* Adjust pre when inside code-block (header present) */
+          .code-block pre {
+              margin: 0;
+              border-radius: 0 0 0.5rem 0.5rem;
+              border-top: none;
           }
         </style>
         """.trimIndent()
