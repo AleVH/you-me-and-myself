@@ -14,6 +14,12 @@ import javax.swing.JComponent
  *
  * Falls back gracefully if browser initialization fails - the caller
  * (ChatPanel) handles switching to SwingChatService.
+ *
+ * ## Thinking Indicator
+ *
+ * Call showThinking() when sending a request to the AI provider.
+ * The indicator is automatically hidden when addAssistantMessage() is called,
+ * but you should call hideThinking() explicitly if the request fails or is cancelled.
  */
 class BrowserChatService(private val project: Project) : ChatUIService {
     private val chatState = ChatState()
@@ -72,8 +78,22 @@ class BrowserChatService(private val project: Project) : ChatUIService {
 
         chatState.addMessage(message)
         browserComponent.scrollToBottom()
+
+        // Note: hideThinking() is called automatically by the JS addMessage function
+        // when role="assistant", so we don't need to call it here explicitly.
     }
 
+    /**
+     * Displays a system notification to the user (not an AI response).
+     *
+     * Called by ChatPanel for:
+     * - Context gathering status ("Context ready in 450ms")
+     * - Correction flow hints ("Type /correct to fix")
+     * - Error states that aren't from the AI provider
+     *
+     * Rendered with assistant styling but semantically different -
+     * these are plugin messages, not model output.
+     */
     override fun addSystemMessage(content: String, type: SystemMessageType) {
         val message = SystemMessage(
             id = ChatState.generateId(),
@@ -97,5 +117,36 @@ class BrowserChatService(private val project: Project) : ChatUIService {
 
     override fun dispose() {
         browserComponent.dispose()
+    }
+
+    // -------------------------------------------------------------------------
+    // Thinking Indicator
+    // -------------------------------------------------------------------------
+
+    /**
+     * Shows a "Thinking..." indicator in the chat.
+     *
+     * Call this immediately after sending a request to the AI provider.
+     * The indicator gives the user feedback that their request is being processed.
+     *
+     * The indicator is automatically hidden when addAssistantMessage() is called
+     * (handled in the JavaScript side). If the request fails or is cancelled,
+     * call hideThinking() explicitly.
+     */
+    fun showThinking() {
+        browserComponent.showThinking()
+    }
+
+    /**
+     * Hides the "Thinking..." indicator.
+     *
+     * Normally called automatically when the assistant message arrives.
+     * Call this explicitly if:
+     * - The request fails/throws an exception
+     * - The user cancels the request
+     * - Any other case where no assistant message will be added
+     */
+    fun hideThinking() {
+        browserComponent.hideThinking()
     }
 }

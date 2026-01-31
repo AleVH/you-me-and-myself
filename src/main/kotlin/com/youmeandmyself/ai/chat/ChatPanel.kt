@@ -452,6 +452,9 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                     "effectivePromptPreview" to Dev.preview(effectivePrompt, 500)
                 )
 
+                // Show thinking indicator while waiting for AI response
+                (chatService as? BrowserChatService)?.showThinking()
+
                 // Call provider - returns ParsedResponse
                 val result = provider.chat(effectivePrompt)
 
@@ -538,6 +541,8 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                 )
 
             } catch (t: Throwable) {
+                // Hide thinking indicator on error (it won't auto-hide since no assistant message is added before the error)
+                (chatService as? BrowserChatService)?.hideThinking()
                 chatService.addAssistantMessage("Error: ${t.message}", null, true)
             }
         }

@@ -4,7 +4,6 @@ import com.intellij.openapi.project.Project
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.ui.jcef.executeJavaScript
-import com.youmeandmyself.ai.chat.service.ChatMessage
 import com.youmeandmyself.ai.chat.service.ChatState
 import com.youmeandmyself.ai.chat.service.UserMessage
 import com.youmeandmyself.ai.chat.service.AssistantMessage
@@ -32,6 +31,40 @@ import kotlin.math.min
  * - Performance with long conversations
  * - Avoiding race conditions with async JS execution
  * - Maintaining correct message order
+ *
+ * ## Current Limitation: No Message Chunking
+ *
+ * Messages are rendered as a whole (no chunking) because splitting markdown
+ * mid-content breaks rendering - especially code blocks. If a code fence
+ * is split between chunks, markdown-it can't parse either chunk correctly.
+ *
+ * ## Future Enhancement: True Streaming Rendering
+ *
+ * To implement real-time streaming (showing text as it arrives from the API):
+ *
+ * 1. **Provider Changes**: GenericLlmProvider needs to support streaming responses
+ *    using Server-Sent Events (SSE) or chunked transfer encoding. Most LLM APIs
+ *    support this (OpenAI: stream=true, Gemini: streamGenerateContent).
+ *
+ * 2. **Accumulator Pattern**: Create a StreamingAssembler that:
+ *    - Buffers incoming chunks
+ *    - Detects safe render points (complete paragraphs, closed code blocks)
+ *    - Only triggers render when content is "markdown-safe"
+ *    - Tracks open fences (```) to avoid splitting code blocks
+ *
+ * 3. **Incremental DOM Updates**: Instead of replacing innerHTML, append to
+ *    an existing message element. This requires:
+ *    - Tracking the "current streaming message" element ID
+ *    - A JS function like `appendToMessage(id, newContent)` or `updateMessage(id, fullContent)`
+ *    - Re-running markdown render on the accumulated content (not just the delta)
+ *
+ * 4. **Cursor/Typing Indicator**: Show a blinking cursor at the end of the
+ *    streaming message to indicate more content is coming.
+ *
+ * 5. **Error Recovery**: If streaming fails mid-message, gracefully finalize
+ *    whatever content was received rather than showing nothing.
+ *
+ * For now, we show a "Thinking..." indicator while waiting for the complete response.
  */
 class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
     private val log = Dev.logger(ChatBrowserComponent::class.java)
@@ -118,6 +151,22 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
         browser.loadHTML(htmlContent)
     }
 
+    /**
+     * Builds the complete HTML for the chat interface.
+     *
+     * Structure:
+     * 1. Base styles (CSS for chat bubbles, code blocks, etc.)
+     * 2. highlight.js library + theme CSS
+     * 3. markdown-it library
+     * 4. Single unified initialization script that:
+     *    - Initializes markdown-it with highlight.js integration
+     *    - Installs custom fence renderer for language labels
+     *    - Sets up chat message functions (addMessage, showThinking, etc.)
+     *    - Signals readiness to Kotlin
+     *
+     * All initialization happens in one DOMContentLoaded handler to ensure
+     * correct ordering of dependencies.
+     */
     private fun buildEnhancedChatHTML(): String {
         return """
         <!DOCTYPE html>
@@ -131,121 +180,202 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
         <body>
             <div id="chatContainer" class="chat-container"></div>
 
-            ${buildFenceRendererScript()}
-
             <script>
-            let isInitialized = false;
-            
-            // Create the bridge function for JS → Kotlin communication
-            window.sendToKotlin = function(message) {
-                ${jsQuery.inject("message")}
-            };
-            
-            document.addEventListener("DOMContentLoaded", () => {
-                console.log("[YMM] DOMContentLoaded fired");
-                window.sendToKotlin('READY');
-                window.YMM_READY = true;
-                console.log("[YMM] YMM_READY=true");
-                initializeChat();
-            });
-
-            function initializeChat() {
-                if (isInitialized) return;
-                isInitialized = true;
+            /**
+             * Unified initialization script.
+             * 
+             * All setup happens here in the correct order to ensure
+             * dependencies are available when needed.
+             */
+            (function() {
+                let isInitialized = false;
                 
-                // Ensure markdown-it instance exists
-                if (!window.md) {
-                    console.error("[YMM] markdown-it not initialized");
-                    window.md = { render: (text) => text };
-                }
-
-                // Initialize highlight.js
-                if (window.hljs) {
-                    hljs.configure({ ignoreUnescapedHTML: true });
-                }
-
-                // Expose addMessage globally so Kotlin can call it
-                window.addMessage = function(role, text, timestamp, isComplete) {
-                    const chatContainer = document.getElementById("chatContainer");
-                    if (!chatContainer) {
-                        console.error("[YMM] chatContainer not found");
+                // Create the bridge function for JS → Kotlin communication
+                window.sendToKotlin = function(message) {
+                    ${jsQuery.inject("message")}
+                };
+                
+                document.addEventListener("DOMContentLoaded", function() {
+                    console.log("[YMM] DOMContentLoaded fired");
+                    
+                    if (isInitialized) {
+                        console.log("[YMM] Already initialized, skipping");
                         return;
                     }
-
-                    const msg = document.createElement("div");
-                    msg.classList.add("message");
-                    if (role === "user") {
-                        msg.classList.add("user");
-                    } else {
-                        msg.classList.add("assistant");
-                    }
-
-                    // Use markdown rendering for assistant messages
-                    const content = role === "assistant" ? renderMarkdown(text) : escapeHtml(text);
-                    msg.innerHTML = content;
-
-                    // Apply syntax highlighting
-                    if (window.hljs) {
-                        setTimeout(() => {
-                            msg.querySelectorAll('pre code').forEach((block) => {
-                                try {
-                                    window.hljs.highlightElement(block);
-                                } catch (e) {
-                                    console.warn("[YMM] highlight failed", e);
+                    isInitialized = true;
+                    
+                    // Step 1: Initialize markdown-it with highlight.js integration
+                    if (typeof window.markdownit !== "undefined") {
+                        window.md = window.markdownit({
+                            html: false,
+                            linkify: true,
+                            breaks: true,
+                            highlight: function(str, lang) {
+                                // Use highlight.js if available and language is supported
+                                if (lang && window.hljs && window.hljs.getLanguage(lang)) {
+                                    try {
+                                        return window.hljs.highlight(str, { language: lang }).value;
+                                    } catch (e) {
+                                        console.warn("[YMM] highlight failed for", lang, e);
+                                    }
                                 }
-                            });
-                        }, 0);
+                                // Auto-detect language if no specific language given
+                                if (window.hljs) {
+                                    try {
+                                        return window.hljs.highlightAuto(str).value;
+                                    } catch (e) {
+                                        console.warn("[YMM] highlightAuto failed", e);
+                                    }
+                                }
+                                // Fallback: escape HTML
+                                return str.replace(/&/g, "&amp;")
+                                          .replace(/</g, "&lt;")
+                                          .replace(/>/g, "&gt;");
+                            }
+                        });
+                        console.log("[YMM] markdown-it initialized with highlight support");
+                    } else {
+                        console.error("[YMM] markdown-it library not loaded!");
+                        window.md = { render: function(text) { return escapeHtml(text); } };
                     }
+                    
+                    // Step 2: Configure highlight.js
+                    if (window.hljs) {
+                        window.hljs.configure({ ignoreUnescapedHTML: true });
+                        console.log("[YMM] highlight.js configured");
+                    } else {
+                        console.warn("[YMM] highlight.js not loaded - syntax highlighting disabled");
+                    }
+                    
+                    // Step 3: Install custom fence renderer for language labels
+                    if (window.md && window.md.renderer) {
+                        window.md.renderer.rules.fence = function(tokens, idx, options, env, self) {
+                            var token = tokens[idx];
+                            var rawCode = token.content || "";
+                            var rawLang = (token.info || "").trim().toLowerCase();
+                            var langLabel = rawLang ? rawLang.toUpperCase() : "CODE";
+                            
+                            // Use markdown-it's highlight function (set up in Step 1)
+                            var highlightedCode = "";
+                            if (options.highlight) {
+                                highlightedCode = options.highlight(rawCode, rawLang) || escapeHtml(rawCode);
+                            } else {
+                                highlightedCode = escapeHtml(rawCode);
+                            }
+                            
+                            return '<div class="code-block">' +
+                                   '<span class="lang-label">' + langLabel + '</span>' +
+                                   '<pre><code class="hljs ' + rawLang + '">' + highlightedCode + '</code></pre>' +
+                                   '</div>';
+                        };
+                        console.log("[YMM] Custom fence renderer installed");
+                    }
+                    
+                    // Step 4: Set up chat functions
+                    
+                    /**
+                     * Add a message to the chat container.
+                     * 
+                     * @param role - "user" or "assistant"
+                     * @param text - Message content (markdown for assistant, plain for user)
+                     * @param timestamp - Display timestamp (e.g., "14:30")
+                     */
+                    window.addMessage = function(role, text, timestamp) {
+                        // Hide thinking indicator when assistant message arrives
+                        if (role === "assistant") {
+                            hideThinking();
+                        }
+                        
+                        var chatContainer = document.getElementById("chatContainer");
+                        if (!chatContainer) {
+                            console.error("[YMM] chatContainer not found");
+                            return;
+                        }
 
-                    const tsDiv = document.createElement("div");
-                    tsDiv.className = "timestamp";
-                    tsDiv.textContent = timestamp || "";
-                    msg.appendChild(tsDiv);
+                        var msg = document.createElement("div");
+                        msg.classList.add("message");
+                        msg.classList.add(role === "user" ? "user" : "assistant");
 
-                    chatContainer.appendChild(msg);
-                    chatContainer.scrollTop = chatContainer.scrollHeight;
-                };
+                        // Render markdown for assistant, escape HTML for user
+                        var content;
+                        if (role === "assistant" && window.md) {
+                            content = window.md.render(text || "");
+                        } else {
+                            content = escapeHtml(text || "");
+                        }
+                        msg.innerHTML = content;
 
-                window.showThinking = function() {
-                    const chatContainer = document.getElementById("chatContainer");
-                    if (!document.getElementById("thinking")) {
-                        const bubble = document.createElement("div");
+                        // Add timestamp
+                        var tsDiv = document.createElement("div");
+                        tsDiv.className = "timestamp";
+                        tsDiv.textContent = timestamp || "";
+                        msg.appendChild(tsDiv);
+
+                        chatContainer.appendChild(msg);
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    };
+
+                    /**
+                     * Show "Thinking..." indicator while waiting for AI response.
+                     * 
+                     * Called by Kotlin when a request is sent to the provider.
+                     * Automatically hidden when addMessage is called with role="assistant".
+                     */
+                    window.showThinking = function() {
+                        var chatContainer = document.getElementById("chatContainer");
+                        if (!chatContainer) return;
+                        
+                        // Don't add duplicate
+                        if (document.getElementById("thinking")) return;
+                        
+                        var bubble = document.createElement("div");
                         bubble.id = "thinking";
-                        bubble.textContent = "Thinking…";
-                        bubble.className = "message assistant";
+                        bubble.className = "message assistant thinking";
+                        bubble.innerHTML = '<span class="thinking-dots">Thinking<span>.</span><span>.</span><span>.</span></span>';
                         chatContainer.appendChild(bubble);
                         chatContainer.scrollTop = chatContainer.scrollHeight;
-                    }
-                };
+                    };
 
-                window.hideThinking = function() {
-                    const t = document.getElementById("thinking");
-                    if (t) t.remove();
-                };
+                    /**
+                     * Hide the "Thinking..." indicator.
+                     * 
+                     * Called automatically when assistant message arrives,
+                     * or explicitly if request fails/is cancelled.
+                     */
+                    window.hideThinking = function() {
+                        var t = document.getElementById("thinking");
+                        if (t) t.remove();
+                    };
+                    
+                    /**
+                     * Clear all messages from the chat container.
+                     * Called when chat state is reset.
+                     */
+                    window.clearChat = function() {
+                        var chatContainer = document.getElementById("chatContainer");
+                        if (chatContainer) {
+                            chatContainer.innerHTML = '';
+                        }
+                    };
+                    
+                    // Step 5: Signal readiness to Kotlin
+                    window.YMM_READY = true;
+                    window.sendToKotlin('READY');
+                    console.log("[YMM] Initialization complete, YMM_READY=true");
+                });
                 
-                // Clear chat container (used when chat is reset)
-                window.clearChat = function() {
-                    const chatContainer = document.getElementById("chatContainer");
-                    if (chatContainer) {
-                        chatContainer.innerHTML = '';
-                    }
-                };
-            }
-
-            function renderMarkdown(text) {
-                try {
-                    return window.md ? window.md.render(text || "") : escapeHtml(text);
-                } catch (e) {
-                    console.error("Markdown render error", e);
-                    return escapeHtml(text);
+                /**
+                 * Escape HTML special characters to prevent XSS.
+                 */
+                function escapeHtml(text) {
+                    var div = document.createElement('div');
+                    div.textContent = text || '';
+                    return div.innerHTML;
                 }
-            }
-
-            function escapeHtml(text) {
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
+                
+                // Make escapeHtml available globally for the fence renderer
+                window.escapeHtml = escapeHtml;
+            })();
             </script>
         </body>
         </html>
@@ -257,11 +387,9 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
     /**
      * Sets up incremental message rendering.
      *
-     * Instead of clearing and re-rendering all messages on every change,
-     * this tracks how many messages have been rendered and only appends
-     * new ones. This solves:
-     * - Performance issues with long chats
-     * - Race conditions causing message order scrambling
+     * Listens to ChatState.messages flow and renders only new messages.
+     * Messages are rendered whole (not chunked) to ensure markdown
+     * integrity - especially for code blocks with fences.
      */
     private fun setupIncrementalMessageHandling() {
         if (messageHandlingSetup) {
@@ -293,12 +421,11 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
                         "total" to totalMessages
                     )
 
-                    newMessages.forEachIndexed { index, message ->
-                        val globalIndex = renderedMessageCount + index
+                    newMessages.forEach { message ->
                         when (message) {
-                            is UserMessage -> renderMessageChunked(message.content, role = "user", index = globalIndex)
-                            is AssistantMessage -> renderMessageChunked(message.content, role = "assistant", index = globalIndex)
-                            is SystemMessage -> renderMessageChunked(message.content, role = "assistant", index = globalIndex)
+                            is UserMessage -> renderMessage(message.content, role = "user")
+                            is AssistantMessage -> renderMessage(message.content, role = "assistant")
+                            is SystemMessage -> renderMessage(message.content, role = "assistant")
                         }
                     }
 
@@ -310,54 +437,63 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
     }
 
     /**
-     * Renders a single message, chunking large content to avoid JS issues.
+     * Renders a complete message to the chat.
+     *
+     * No chunking - the entire message is sent at once to ensure
+     * markdown parsing works correctly (especially for code blocks).
+     *
+     * @param content The message content (markdown for assistant messages)
+     * @param role Either "user" or "assistant"
      */
-    private fun renderMessageChunked(content: String, role: String, index: Int) {
-        val maxChunkSize = 2000
-        val chunks = if (content.length > maxChunkSize) content.chunked(maxChunkSize) else listOf(content)
-
-        Dev.info(
-            log, "browser.chunking",
-            "message_index" to index,
-            "total_chunks" to chunks.size,
-            "original_length" to content.length
+    private fun renderMessage(content: String, role: String) {
+        Dev.info(log, "browser.render_message",
+            "role" to role,
+            "content_length" to content.length
         )
 
-        chunks.forEachIndexed { chunkIndex, chunk ->
-            val isFinalChunk = chunkIndex == chunks.size - 1
-            val jsFunction = buildSafeJSFunction(chunk, role, isFinalChunk)
-            executeWhenReady(jsFunction)
-        }
-    }
-
-    private fun buildSafeJSFunction(
-        content: String,
-        role: String,
-        isFinalChunk: Boolean = true
-    ): String {
         val escapedContent = escapeJS(content)
         val safeRole = if (role == "user") "user" else "assistant"
-
         val formattedTimestamp = kotlinx.datetime.Clock.System.now()
             .toLocalDateTime(kotlinx.datetime.TimeZone.currentSystemDefault())
             .let { "%02d:%02d".format(it.hour, it.minute) }
 
-        return """
-        try {
-            addMessage('$safeRole', '$escapedContent', '$formattedTimestamp', $isFinalChunk);
-        } catch (error) {
-            console.error('[YMM] Chunk failed:', error);
-            const chatContainer = document.getElementById('chatContainer');
-            if (chatContainer) {
-                const fallbackDiv = document.createElement('div');
-                fallbackDiv.className = 'message ' + ('$safeRole');
-                fallbackDiv.textContent = '${escapeJS(content.take(500))}' + (${content.length} > 500 ? '...' : '');
-                chatContainer.appendChild(fallbackDiv);
+        val jsFunction = """
+            try {
+                addMessage('$safeRole', '$escapedContent', '$formattedTimestamp');
+            } catch (error) {
+                console.error('[YMM] renderMessage failed:', error);
             }
-        }
-    """.trimIndent()
+        """.trimIndent()
+
+        executeWhenReady(jsFunction)
     }
 
+    /**
+     * Shows the "Thinking..." indicator.
+     *
+     * Call this when sending a request to the AI provider.
+     * The indicator is automatically hidden when the assistant
+     * message arrives (handled in JS addMessage function).
+     */
+    fun showThinking() {
+        Dev.info(log, "browser.show_thinking", "triggered" to true)
+        executeWhenReady("window.showThinking();")
+    }
+
+    /**
+     * Hides the "Thinking..." indicator.
+     *
+     * Normally called automatically when assistant message arrives.
+     * Call this explicitly if the request fails or is cancelled.
+     */
+    fun hideThinking() {
+        Dev.info(log, "browser.hide_thinking", "triggered" to true)
+        executeWhenReady("window.hideThinking();")
+    }
+
+    /**
+     * Escapes a string for safe embedding in JavaScript single-quoted strings.
+     */
     private fun escapeJS(text: String): String {
         return text.replace("\\", "\\\\")
             .replace("'", "\\'")
@@ -366,6 +502,9 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
             .replace("\r", "\\r")
     }
 
+    /**
+     * Scrolls the chat container to show the latest message.
+     */
     fun scrollToBottom() {
         executeWhenReady("window.scrollTo(0, document.body.scrollHeight);")
     }
@@ -387,11 +526,29 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
     }
 
     // -------------------------------------------------------------------------
-    // Styles and resources
+    // CSS Styles
     // -------------------------------------------------------------------------
 
+    /**
+     * Base CSS styles for the chat interface.
+     *
+     * Includes styling for:
+     * - Chat container layout
+     * - User and assistant message bubbles
+     * - Code blocks with language labels
+     * - Inline code
+     * - Timestamps
+     * - Thinking indicator animation
+     */
     private fun buildBaseStyles(): String = """
         <style>
+          /* Reset and base */
+          html, body {
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+          }
+          
           body {
               background-color: #1e1e1e;
               color: #ddd;
@@ -399,11 +556,8 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
               margin: 0;
               padding: 0;
           }
-          html, body {
-            height: 100%;
-            margin: 0;
-            overflow: hidden;
-          }
+          
+          /* Chat container */
           .chat-container {
             display: flex;
             flex-direction: column;
@@ -414,6 +568,8 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
             scrollbar-width: thin;
             scrollbar-color: #555 #2a2a2a;
           }
+          
+          /* Message bubbles */
           .message {
               max-width: 85%;
               margin: 0.4rem 0;
@@ -427,41 +583,127 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
               align-self: flex-start;
               animation: fadeIn 0.2s ease-in;
           }
+          
           .message.user {
               background-color: #0a84ff;
               color: #fff;
               border: 1px solid #0a84ff;
               align-self: flex-end;
           }
+          
+          .message.assistant {
+              background-color: #2a2a2a;
+              color: #ddd;
+              border-radius: 0.75rem;
+              padding: 1rem 1.25rem;
+              line-height: 1.5;
+              margin-top: 0.5rem;
+          }
+
+          .message.assistant > *:first-child {
+              margin-top: 0;
+          }
+          
+          /* Thinking indicator */
+          .message.thinking {
+              color: #888;
+              font-style: italic;
+          }
+          
+          .thinking-dots span {
+              animation: blink 1.4s infinite both;
+          }
+          
+          .thinking-dots span:nth-child(2) {
+              animation-delay: 0.2s;
+          }
+          
+          .thinking-dots span:nth-child(3) {
+              animation-delay: 0.4s;
+          }
+          
+          @keyframes blink {
+              0%, 80%, 100% { opacity: 0; }
+              40% { opacity: 1; }
+          }
+          
+          /* Fade in animation */
           @keyframes fadeIn {
               from { opacity: 0; transform: translateY(5px); }
               to { opacity: 1; transform: translateY(0); }
           }
+          
+          /* Timestamp */
           .timestamp {
               font-size: 0.7rem;
               color: #999;
               margin-top: 0.3rem;
               text-align: right;
           }
+          
+          /* Code styling */
           pre, code {
               font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-              border-radius: 0.5rem;
           }
-          pre {
-              background: #1b1b1b;
-              border: 1px solid #333;
-              padding: 0.75rem;
-              overflow-x: auto;
-              position: relative;
-          }
+          
+          /* Inline code */
           code {
               background: #151515;
               padding: 0.15rem 0.3rem;
+              border-radius: 0.25rem;
+              font-size: 0.9em;
           }
+          
+          /* Code blocks */
+          pre {
+              background: #1b1b1b;
+              border: 1px solid #333;
+              border-radius: 0.5rem;
+              padding: 0.75rem;
+              overflow-x: auto;
+              margin: 0.5rem 0;
+          }
+          
+          /* Reset code inside pre (don't double-style) */
+          pre code {
+              background: transparent;
+              padding: 0;
+              border-radius: 0;
+              font-size: inherit;
+          }
+          
+          /* Code block container with language label */
+          .code-block {
+              position: relative;
+              margin: 0.5rem 0;
+          }
+          
+          /* Language label */
+          .lang-label {
+              position: absolute;
+              top: 0;
+              right: 0;
+              background: #444;
+              color: #ccc;
+              font-size: 0.65rem;
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+              border-radius: 0 0.5rem 0 0.25rem;
+              padding: 0.2rem 0.5rem;
+              text-transform: uppercase;
+              letter-spacing: 0.05em;
+          }
+          
+          /* Ensure code block pre accounts for label */
+          .code-block pre {
+              padding-top: 1.5rem;
+              margin: 0;
+          }
+          
+          /* Copy button (for future use) */
           .copy-btn {
               position: absolute;
               top: 6px;
-              right: 6px;
+              right: 60px;
               background-color: #333;
               color: #ccc;
               border: none;
@@ -469,42 +711,38 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
               padding: 3px 6px;
               font-size: 0.75rem;
               cursor: pointer;
-              opacity: 0.4;
+              opacity: 0;
               transition: opacity 0.2s, background-color 0.2s;
           }
+          
+          .code-block:hover .copy-btn {
+              opacity: 0.7;
+          }
+          
           .copy-btn:hover {
-              opacity: 1;
+              opacity: 1 !important;
               background-color: #444;
-          }
-          .code-block { position: relative; }
-          .lang-label {
-              position: absolute;
-              top: 6px; right: 40px;
-              background: #444;
-              color: #ccc;
-              font-size: 0.65rem;
-              border-radius: 4px;
-              padding: 2px 6px;
-              text-transform: uppercase;
-          }
-          .message.assistant {
-              background-color: #2a2a2a;
-              color: #ddd;
-              border-radius: 0.75rem;
-              padding: 1rem 1.25rem;
-              line-height: 1.5;
-          }
-
-          .message.assistant > *:first-child {
-              margin-top: 0;
-          }
-
-          .message.assistant {
-              margin-top: 0.5rem;
           }
         </style>
         """.trimIndent()
 
+    // -------------------------------------------------------------------------
+    // External Resources (highlight.js, markdown-it)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Loads highlight.js library and GitHub Dark theme CSS.
+     *
+     * IMPORTANT: Use the browser build of highlight.js, not the Node.js build.
+     * The browser build should start with something like `var hljs=function()...`
+     * NOT `var hljs=require("./core")...`
+     *
+     * Download from: https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js
+     *
+     * Files must exist in src/main/resources/chat-window/
+     * - highlight.min.js (browser build, ~70KB)
+     * - github-dark.css
+     */
     private fun buildHighlightResources(): String {
         return try {
             val highlightJs = javaClass.getResource("/chat-window/highlight.min.js")?.readText()
@@ -518,21 +756,35 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
                 return "<!-- Highlight.js resources missing -->"
             }
 
+            Dev.info(log, "browser.resources",
+                "highlight_js_size" to highlightJs.length,
+                "highlight_css_size" to highlightCss.length
+            )
+
             """
-        <!-- highlight.js -->
-        <style>
-        $highlightCss
-        </style>
-        <script>
-        $highlightJs
-        </script>
-        """.trimIndent()
+            <!-- highlight.js theme -->
+            <style>
+            $highlightCss
+            </style>
+            <!-- highlight.js library -->
+            <script>
+            $highlightJs
+            </script>
+            """.trimIndent()
         } catch (e: Exception) {
             Dev.error(log, "browser.resources", e, "failed_to_load" to true)
             "<!-- Error loading highlight resources -->"
         }
     }
 
+    /**
+     * Loads markdown-it library.
+     *
+     * The library must exist at src/main/resources/chat-window/markdown-it.min.js
+     *
+     * Note: We only load the library here. Initialization happens in the
+     * unified initialization script to ensure proper ordering with highlight.js.
+     */
     private fun buildMarkdownResources(): String {
         return try {
             val markdownIt = javaClass.getResource("/chat-window/markdown-it.min.js")?.readText()
@@ -545,100 +797,47 @@ class ChatBrowserComponent(project: Project, private val chatState: ChatState) {
                 return "<!-- markdown-it resource missing -->"
             }
 
+            Dev.info(log, "browser.resources",
+                "markdown_it_size" to markdownIt.length
+            )
+
             """
-            <!-- markdown-it -->
+            <!-- markdown-it library -->
             <script>
             $markdownIt
             </script>
-            <script>
-            document.addEventListener("DOMContentLoaded", () => {
-                if (typeof window.markdownit !== "undefined") {
-                    window.md = window.markdownit({
-                        html: false,
-                        linkify: true,
-                        breaks: true
-                    });
-                    console.log("[YMM] markdown-it ready");
-                } else {
-                    console.error("[YMM] markdown-it missing");
-                }
-            });
-            </script>
-        """.trimIndent()
+            """.trimIndent()
         } catch (e: Exception) {
             Dev.error(log, "browser.resources", e, "failed_to_load_markdown" to true)
             "<!-- Error loading markdown resources -->"
         }
     }
 
-    private fun buildFenceRendererScript(): String = """
-        <script>
-        document.addEventListener("DOMContentLoaded", () => {
-          if (!window.md) {
-            console.error("[YMM] markdown-it instance not ready for fence override");
-            return;
-          }
-        
-          console.log("[YMM] Installing markdown-it fence renderer");
-        
-          window.md.renderer.rules.fence = function (tokens, idx) {
-            const token = tokens[idx];
-            const rawCode = token.content || "";
-            const rawLang = (token.info || "").trim().toLowerCase();
-            const langLabel = rawLang ? rawLang.toUpperCase() : "CODE";
-        
-            let highlightedHtml;
-            try {
-              if (window.hljs && rawLang && hljs.getLanguage(rawLang)) {
-                highlightedHtml = hljs.highlight(rawCode, { language: rawLang }).value;
-              } else if (window.hljs) {
-                highlightedHtml = hljs.highlightAuto(rawCode).value;
-              } else {
-                highlightedHtml = rawCode
-                  .replace(/&/g, "&amp;")
-                  .replace(/</g, "&lt;")
-                  .replace(/>/g, "&gt;");
-              }
-            } catch (err) {
-              console.warn("[YMM] highlight.js failed:", err);
-              highlightedHtml = rawCode;
-            }
-        
-            return `
-              <div class="code-block">
-                <span class="lang-label">${'$'}{langLabel}</span>
-                <pre><code class="hljs ${'$'}{rawLang}">${'$'}{highlightedHtml}</code></pre>
-              </div>
-            `;
-          };
-        
-          console.log("[YMM] Fence renderer installed successfully");
-        });
-        </script>
-        """.trimIndent()
+    // -------------------------------------------------------------------------
+    // JavaScript Execution
+    // -------------------------------------------------------------------------
 
     /**
      * Executes JavaScript with exponential backoff retry logic
      * to handle JCEF initialization timing issues.
+     *
+     * JCEF browser initialization can take 300-500ms after loadHTML() is called.
+     * This method wraps the script in a readiness check and retries with
+     * exponential backoff if JCEF isn't ready yet.
+     *
+     * @param script The JavaScript code to execute
      */
     private fun executeWhenReady(script: String) {
         val wrapped = """
         (function waitReady() {
-            console.log('[YMM] Checking readiness:', {
-                YMM_READY: window.YMM_READY,
-                addMessage: typeof addMessage,
-                hljs: !!window.hljs,
-                md: !!window.md
-            });
-            
-            if (window.YMM_READY === true && typeof addMessage === 'function') {
+            if (window.YMM_READY === true && typeof window.addMessage === 'function') {
                 try {
                     $script
                 } catch (err) {
                     console.error('[YMM] executeWhenReady script error:', err);
                 }
             } else {
-                setTimeout(waitReady, 100);
+                setTimeout(waitReady, 50);
             }
         })();
     """.trimIndent()
