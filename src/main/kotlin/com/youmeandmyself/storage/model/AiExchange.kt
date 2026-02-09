@@ -23,7 +23,8 @@ data class AiExchange(
     val modelId: String,
     val purpose: ExchangePurpose,
     val request: ExchangeRequest,
-    val rawResponse: ExchangeRawResponse
+    val rawResponse: ExchangeRawResponse,
+    val tokensUsed: Int?
 )
 
 /**

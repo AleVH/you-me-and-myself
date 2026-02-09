@@ -1,6 +1,5 @@
 package com.youmeandmyself.storage
 
-import com.intellij.openapi.application.PathManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
@@ -22,55 +21,42 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.time.Instant
-import java.time.YearMonth
-import java.time.ZoneOffset
 
 /**
  * LOCAL mode implementation of [StorageFacade].
  *
- * ## Architecture Decision: Hybrid Storage Model
+ * ## Architecture: Centralized Storage with SQLite
  *
- * This facade implements a hybrid storage strategy where data is split between two locations:
+ * This facade implements a two-layer storage strategy:
  *
- * 1. **Raw exchanges** (full request + raw response) → Project directory
- *    - Location: `<project-root>/.youmeandmyself/exchanges-YYYY-MM.jsonl`
- *    - Why: Keeps data portable with the project, can be version-controlled if desired,
- *      survives IDE reinstalls, and is easy for developers to inspect/debug.
+ * 1. **JSONL files** (source of truth) — full request + raw response content
+ *    - Location: `{storage-root}/chat/{project-id}/exchanges-YYYY-Www.jsonl`
+ *    - Append-only, never modified after writing
+ *    - Weekly partitioned using ISO week numbering
+ *    - If everything else breaks, the database can be rebuilt from these
  *
- * 2. **Metadata index** (lightweight records for fast querying) → IntelliJ system area
- *    - Location: `<intellij-system>/youmeandmyself/<project-hash>/metadata-index.json`
- *    - Why: Keeps derived/computed data separate from source code, follows JetBrains
- *      conventions for plugin data, and doesn't clutter the project directory.
+ * 2. **SQLite database** (the brain) — metadata, relationships, fast queries
+ *    - Location: `{storage-root}/youmeandmyself.db`
+ *    - 10 tables (all created upfront, some empty until their features are built)
+ *    - Replaces the old JSON metadata-index.json file
+ *    - Enables proper relational queries, indexing, and cross-project operations
  *
- * ## File Format: JSONL (JSON Lines)
+ * ## What Changed from v1
  *
- * Raw exchanges use JSONL format (one JSON object per line) because:
- * - Append-friendly: New exchanges are added without rewriting the entire file
- * - Streaming: Can read line-by-line without loading entire file into memory
- * - Debuggable: Human-readable, can be inspected with any text editor
- * - Recoverable: A corrupted line doesn't invalidate the entire file
- *
- * Files are partitioned by month (exchanges-2026-01.jsonl) to:
- * - Keep individual files from growing too large
- * - Make cleanup/archival of old data straightforward
- * - Allow efficient date-range queries (skip files outside the range)
- *
- * ## Linking Raw Data and Metadata
- *
- * Each metadata record contains:
- * - `id`: Unique identifier matching the exchange
- * - `rawFile`: Which JSONL file contains the full content (e.g., "exchanges-2026-01.jsonl")
- * - `rawDataAvailable`: Flag that becomes false if the raw file is deleted
- *
- * This allows the system to retain useful metadata (timestamps, provider info, labels)
- * even if the original content is purged for space reasons.
+ * | Aspect | v1 (Old) | v2 (New) |
+ * |--------|----------|----------|
+ * | Raw data location | Project dir (.youmeandmyself/) | Centralized root (~/YouMeAndMyself/chat/{id}/) |
+ * | JSONL partitioning | Monthly (YYYY-MM) | Weekly (YYYY-Www) |
+ * | Metadata storage | JSON file in IntelliJ system area | SQLite database in storage root |
+ * | Metadata caching | Full in-memory list | SQLite with indexed queries |
+ * | Project awareness | Implicit (one facade per project) | Explicit projectId on all operations |
+ * | Serialization | Custom SerializableExchange wrappers | Direct kotlinx.serialization |
  *
  * ## Thread Safety
  *
- * - Write operations use a [Mutex] to prevent concurrent file corruption
- * - Read operations are safe without locking because:
- *   - Raw JSONL files are append-only (existing content never modified)
- *   - Metadata index is written atomically (write to temp, then rename)
+ * - Write operations use a [Mutex] to prevent concurrent SQLite writes and JSONL appends
+ * - SQLite is configured in WAL mode (concurrent reads allowed alongside a single writer)
+ * - JSONL files are append-only, so reads don't conflict with writes
  *
  * ## Error Handling Philosophy
  *
@@ -79,8 +65,8 @@ import java.time.ZoneOffset
  * - Returned as graceful fallbacks (null, empty list, false)
  * - Never thrown to callers
  *
- * This ensures the plugin remains functional even if storage fails — the user
- * can still chat with AI, they just won't have persistence.
+ * The plugin remains functional even if storage fails — the user can still chat
+ * with AI, they just won't have persistence.
  *
  * @param project The IntelliJ project this facade is scoped to
  */
@@ -90,52 +76,52 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
     private val log = Logger.getInstance(LocalStorageFacade::class.java)
 
     /**
-     * JSON parser for metadata files.
-     * Pretty-printed for human readability since metadata files are small
-     * and may be inspected during debugging.
-     */
-    private val jsonPretty = Json {
-        prettyPrint = true
-        ignoreUnknownKeys = true  // Forward compatibility: ignore fields from newer versions
-        encodeDefaults = true     // Always write default values for clarity
-    }
-
-    /**
      * JSON parser for JSONL raw exchange files.
+     *
      * Compact (no pretty printing) to minimize file size since these can grow large.
+     * ignoreUnknownKeys provides forward compatibility with newer versions.
+     * encodeDefaults ensures all fields are present for clarity.
      */
-    private val jsonCompact = Json {
+    private val json = Json {
         prettyPrint = false
         ignoreUnknownKeys = true
         encodeDefaults = true
     }
 
     /**
-     * In-memory cache of all metadata records.
+     * Storage path configuration.
      *
-     * Loaded from disk on first access, then kept in sync with writes.
-     * This avoids repeated disk reads for queries — metadata is small enough
-     * to keep entirely in memory (even 10,000 records is only a few MB).
-     *
-     * Null means "not yet loaded" — use [loadMetadataCache] to access.
+     * Resolves all file paths for JSONL and the database.
+     * Initialized in [initialize] — null means "not yet initialized".
      */
-    private var metadataCache: MutableList<ExchangeMetadata>? = null
+    private var storageConfig: StorageConfig? = null
 
     /**
-     * Mutex protecting metadata write operations.
+     * SQLite database helper.
      *
-     * Ensures only one coroutine at a time can modify the metadata cache
-     * and persist it to disk. Without this, concurrent saves could result
-     * in lost writes or corrupted files.
+     * Manages the connection, schema, and provides typed query methods.
+     * Initialized in [initialize] — null means "not yet initialized".
      */
-    private val metadataMutex = Mutex()
+    private var db: DatabaseHelper? = null
+
+    /**
+     * Mutex protecting write operations.
+     *
+     * Ensures only one coroutine at a time can:
+     * - Append to JSONL files
+     * - Write to SQLite
+     *
+     * This prevents concurrent file corruption and SQLite write conflicts.
+     * Read operations don't need locking thanks to WAL mode and append-only JSONL.
+     */
+    private val writeMutex = Mutex()
 
     /**
      * Search engine instance for text content queries.
      *
      * Currently uses [SimpleSearchEngine] (in-memory substring matching).
-     * Can be swapped for a more sophisticated implementation (Lucene, SQLite FTS)
-     * without changing the facade interface.
+     * Can be swapped for SQLite FTS or another implementation without
+     * changing the facade interface.
      */
     private val searchEngine: SimpleSearchEngine = SimpleSearchEngine()
 
@@ -145,9 +131,6 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      * OFF = no persistence (useful for testing or privacy-sensitive contexts)
      * LOCAL = write to disk (this implementation)
      * CLOUD = future remote sync capability
-     *
-     * Can be changed at runtime via [setMode], though typically set once at startup
-     * based on user preferences.
      */
     private var mode: StorageMode = StorageMode.LOCAL
 
@@ -157,68 +140,79 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      * Persist a complete AI exchange.
      *
      * This is the primary entry point for saving AI interactions. It:
-     * 1. Writes the full exchange (request + raw response) to a JSONL file in the project directory
-     * 2. Creates a lightweight metadata record in the system area
-     * 3. Updates the search index for text queries
+     * 1. Ensures the project exists in the projects table
+     * 2. Appends the full exchange to a weekly JSONL file
+     * 3. Inserts metadata into the chat_exchanges SQLite table
+     * 4. Updates the search index for text queries
      *
-     * The exchange is immediately persisted — there's no batching or delayed write.
-     * This ensures data is safe even if the IDE crashes immediately after.
+     * The exchange is immediately persisted — no batching or delayed write.
+     * This ensures data is safe even if the IDE crashes right after.
      *
      * @param exchange The complete exchange to store (must have a unique ID)
+     * @param projectId The project this exchange belongs to
      * @return The exchange ID if saved successfully, null if storage is OFF or an error occurred
      */
-    override suspend fun saveExchange(exchange: AiExchange): String? {
-        // Early exit if persistence is disabled
+    override suspend fun saveExchange(exchange: AiExchange, projectId: String): String? {
         if (mode == StorageMode.OFF) {
             Dev.info(log, "save.skip", "reason" to "mode_off", "id" to exchange.id)
             return null
         }
 
-        // Run I/O on background thread to avoid blocking UI
         return withContext(Dispatchers.IO) {
-            try {
-                Dev.info(log, "save.start",
-                    "id" to exchange.id,
-                    "provider" to exchange.providerId,
-                    "purpose" to exchange.purpose
-                )
+            writeMutex.withLock {
+                try {
+                    val config = requireConfig()
+                    val database = requireDb()
 
-                // Step 1: Write raw exchange to JSONL file
-                // Returns the filename used (e.g., "exchanges-2026-01.jsonl")
-                val rawFile = writeRawExchange(exchange)
+                    Dev.info(log, "save.start",
+                        "id" to exchange.id,
+                        "projectId" to projectId,
+                        "provider" to exchange.providerId,
+                        "purpose" to exchange.purpose
+                    )
 
-                // Step 2: Create metadata record linking to the raw file
-                val metadata = ExchangeMetadata(
-                    id = exchange.id,
-                    timestamp = exchange.timestamp,
-                    providerId = exchange.providerId,
-                    modelId = exchange.modelId,
-                    purpose = exchange.purpose,
-                    tokensUsed = null, // Will be extracted later if available
-                    flags = mutableSetOf(),
-                    labels = mutableSetOf(),
-                    rawFile = rawFile,
-                    rawDataAvailable = true
-                )
-                addMetadata(metadata)
+                    // Step 1: Ensure project exists in the projects table
+                    ensureProjectRegistered(projectId, database)
 
-                // Step 3: Update search index
-                // For now, index only the request input since we don't have extracted content yet
-                searchEngine.onExchangeSaved(exchange)
+                    // Step 2: Ensure project directories exist for JSONL files
+                    config.ensureProjectDirectoriesExist(projectId)
 
-                Dev.info(log, "save.complete",
-                    "id" to exchange.id,
-                    "rawFile" to rawFile
-                )
+                    // Step 3: Append raw exchange to weekly JSONL file
+                    val rawFile = writeRawExchange(exchange, projectId, config)
 
-                exchange.id
-            } catch (e: Exception) {
-                // Log the error but don't crash — return null to indicate failure
-                Dev.error(log, "save.failed", e,
-                    "id" to exchange.id,
-                    "provider" to exchange.providerId
-                )
-                null
+                    // Step 4: Insert metadata into SQLite
+                    database.execute(
+                        """
+                        INSERT INTO chat_exchanges 
+                            (id, project_id, provider_id, model_id, purpose, timestamp, tokens_used, raw_file, raw_available)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """.trimIndent(),
+                        exchange.id,
+                        projectId,
+                        exchange.providerId,
+                        exchange.modelId,
+                        exchange.purpose.name,
+                        exchange.timestamp.toString(),
+                        exchange.tokensUsed,
+                        rawFile
+                    )
+
+                    // Step 5: Update search index
+                    searchEngine.onExchangeSaved(exchange)
+
+                    Dev.info(log, "save.complete",
+                        "id" to exchange.id,
+                        "rawFile" to rawFile
+                    )
+
+                    exchange.id
+                } catch (e: Exception) {
+                    Dev.error(log, "save.failed", e,
+                        "id" to exchange.id,
+                        "projectId" to projectId
+                    )
+                    null
+                }
             }
         }
     }
@@ -227,17 +221,14 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      * Retrieve a full exchange by its ID.
      *
      * This loads the complete request and raw response from the JSONL file.
-     * Use this when you need the actual content (e.g., for extraction, re-display).
+     * Use this when you need the actual content (e.g., for re-display, extraction).
      * For listing/filtering, use [queryMetadata] instead — it's much faster.
      *
      * @param id The unique exchange ID
-     * @return The complete exchange, or null if:
-     *         - Storage mode is OFF
-     *         - No metadata exists for this ID
-     *         - Raw data has been deleted (rawDataAvailable = false)
-     *         - The exchange isn't found in the raw file (shouldn't happen normally)
+     * @param projectId The project this exchange belongs to
+     * @return The complete exchange, or null if not found, raw data unavailable, or storage is OFF
      */
-    override suspend fun getExchange(id: String): AiExchange? {
+    override suspend fun getExchange(id: String, projectId: String): AiExchange? {
         if (mode == StorageMode.OFF) {
             Dev.info(log, "get.skip", "reason" to "mode_off", "id" to id)
             return null
@@ -245,28 +236,37 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
 
         return withContext(Dispatchers.IO) {
             try {
+                val config = requireConfig()
+                val database = requireDb()
+
                 Dev.info(log, "get.start", "id" to id)
 
-                // Step 1: Look up metadata to find which file contains this exchange
-                val metadata = getMetadataById(id)
-                if (metadata == null) {
+                // Step 1: Look up metadata in SQLite to find which file has this exchange
+                val row = database.queryOne(
+                    "SELECT raw_file, raw_available FROM chat_exchanges WHERE id = ? AND project_id = ?",
+                    id, projectId
+                ) { rs ->
+                    Pair(rs.getString("raw_file"), rs.getInt("raw_available") == 1)
+                }
+
+                if (row == null) {
                     Dev.info(log, "get.notfound", "id" to id, "reason" to "no_metadata")
                     return@withContext null
                 }
 
-                // Step 2: Check if raw data is still available
-                if (!metadata.rawDataAvailable) {
+                val (rawFile, rawAvailable) = row
+
+                if (!rawAvailable) {
                     Dev.info(log, "get.notfound", "id" to id, "reason" to "raw_unavailable")
                     return@withContext null
                 }
 
-                // Step 3: Read from the JSONL file
-                val exchange = readRawExchange(id, metadata.rawFile)
+                // Step 2: Read from the JSONL file
+                val exchange = readRawExchange(id, projectId, rawFile, config)
 
                 if (exchange != null) {
                     Dev.info(log, "get.complete", "id" to id)
                 } else {
-                    // This indicates data inconsistency — metadata exists but raw doesn't
                     Dev.info(log, "get.notfound", "id" to id, "reason" to "not_in_raw_file")
                 }
 
@@ -282,22 +282,9 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      * Query exchange metadata without loading full content.
      *
      * This is the fast path for listing, filtering, and displaying exchanges.
-     * It only reads the metadata index (small, cached in memory) — never touches
-     * the raw JSONL files.
+     * It queries SQLite only — never touches JSONL files.
      *
-     * Results are sorted by timestamp descending (newest first) by default.
-     *
-     * Example usage:
-     * ```kotlin
-     * // Get all chat exchanges from the last week
-     * val recentChats = facade.queryMetadata(MetadataFilter(
-     *     purpose = ExchangePurpose.CHAT,
-     *     after = Instant.now().minus(7, ChronoUnit.DAYS)
-     * ))
-     *
-     * // Get all starred exchanges
-     * val starred = facade.queryMetadata(MetadataFilter(hasFlag = "starred"))
-     * ```
+     * Results are sorted by timestamp descending (newest first).
      *
      * @param filter Criteria to filter by (all fields optional, combined with AND logic)
      * @return List of matching metadata records, empty if none match or storage is OFF
@@ -310,27 +297,86 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
 
         return withContext(Dispatchers.IO) {
             try {
+                val database = requireDb()
+
                 Dev.info(log, "query.start",
+                    "projectId" to filter.projectId,
                     "purpose" to filter.purpose,
-                    "provider" to filter.providerId,
                     "limit" to filter.limit
                 )
 
-                // Load from cache (or disk if first access)
-                val allMetadata = loadMetadataCache()
+                // Build dynamic WHERE clause from filter
+                val conditions = mutableListOf<String>()
+                val params = mutableListOf<Any?>()
 
-                // Apply filters, sort, and limit
-                val filtered = allMetadata
-                    .filter { matchesFilter(it, filter) }
-                    .sortedByDescending { it.timestamp }
-                    .take(filter.limit)
+                filter.projectId?.let {
+                    conditions.add("project_id = ?")
+                    params.add(it)
+                }
+                filter.purpose?.let {
+                    conditions.add("purpose = ?")
+                    params.add(it.name)
+                }
+                filter.providerId?.let {
+                    conditions.add("provider_id = ?")
+                    params.add(it)
+                }
+                filter.modelId?.let {
+                    conditions.add("model_id = ?")
+                    params.add(it)
+                }
+                filter.after?.let {
+                    conditions.add("timestamp > ?")
+                    params.add(it.toString())
+                }
+                filter.before?.let {
+                    conditions.add("timestamp < ?")
+                    params.add(it.toString())
+                }
+                filter.rawDataAvailable?.let {
+                    conditions.add("raw_available = ?")
+                    params.add(if (it) 1 else 0)
+                }
+                filter.hasFlag?.let {
+                    conditions.add("flags LIKE ?")
+                    params.add("%$it%")
+                }
+                filter.hasLabel?.let {
+                    conditions.add("labels LIKE ?")
+                    params.add("%$it%")
+                }
 
-                Dev.info(log, "query.complete",
-                    "total" to allMetadata.size,
-                    "matched" to filtered.size
-                )
+                val whereClause = if (conditions.isEmpty()) "" else "WHERE ${conditions.joinToString(" AND ")}"
+                val sql = """
+                    SELECT id, project_id, provider_id, model_id, purpose, timestamp,
+                           tokens_used, raw_file, raw_available, flags, labels
+                    FROM chat_exchanges
+                    $whereClause
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """.trimIndent()
 
-                filtered
+                params.add(filter.limit)
+
+                val results = database.query(sql, *params.toTypedArray()) { rs ->
+                    ExchangeMetadata(
+                        id = rs.getString("id"),
+                        projectId = rs.getString("project_id"),
+                        timestamp = Instant.parse(rs.getString("timestamp")),
+                        providerId = rs.getString("provider_id"),
+                        modelId = rs.getString("model_id"),
+                        purpose = ExchangePurpose.valueOf(rs.getString("purpose")),
+                        tokensUsed = rs.getInt("tokens_used").takeIf { !rs.wasNull() },
+                        flags = ExchangeMetadata.decodeSet(rs.getString("flags")),
+                        labels = ExchangeMetadata.decodeSet(rs.getString("labels")),
+                        rawFile = rs.getString("raw_file"),
+                        rawDataAvailable = rs.getInt("raw_available") == 1
+                    )
+                }
+
+                Dev.info(log, "query.complete", "matched" to results.size)
+
+                results
             } catch (e: Exception) {
                 Dev.error(log, "query.failed", e)
                 emptyList()
@@ -341,12 +387,12 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
     /**
      * Update flags or labels on an existing exchange.
      *
-     * This only modifies the metadata index — the raw exchange content is immutable.
-     * Use this for user actions like starring, archiving, or tagging exchanges.
+     * Only modifies SQLite metadata — the raw JSONL content is immutable.
+     * Use this for user actions like starring, archiving, or tagging.
      *
      * @param id The exchange ID to update
-     * @param flags New flag set (replaces existing flags). Pass null to leave unchanged.
-     * @param labels New label set (replaces existing labels). Pass null to leave unchanged.
+     * @param flags New flag set (replaces existing). Pass null to leave unchanged.
+     * @param labels New label set (replaces existing). Pass null to leave unchanged.
      * @return True if the exchange was found and updated, false otherwise
      */
     override suspend fun updateMetadata(id: String, flags: Set<String>?, labels: Set<String>?): Boolean {
@@ -356,36 +402,46 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         }
 
         return withContext(Dispatchers.IO) {
-            // Lock to prevent concurrent modifications
-            metadataMutex.withLock {
+            writeMutex.withLock {
                 try {
+                    val database = requireDb()
+
                     Dev.info(log, "update.start",
                         "id" to id,
                         "flags" to flags,
                         "labels" to labels
                     )
 
-                    val cache = loadMetadataCache()
-                    val index = cache.indexOfFirst { it.id == id }
+                    // Build dynamic SET clause — only update what was passed
+                    val setClauses = mutableListOf<String>()
+                    val params = mutableListOf<Any?>()
 
-                    if (index == -1) {
-                        Dev.info(log, "update.notfound", "id" to id)
-                        return@withLock false
+                    flags?.let {
+                        setClauses.add("flags = ?")
+                        params.add(ExchangeMetadata.encodeSet(it))
+                    }
+                    labels?.let {
+                        setClauses.add("labels = ?")
+                        params.add(ExchangeMetadata.encodeSet(it))
                     }
 
-                    // Create updated record (only change what was passed)
-                    val existing = cache[index]
-                    val updated = existing.copy(
-                        flags = flags?.toMutableSet() ?: existing.flags,
-                        labels = labels?.toMutableSet() ?: existing.labels
-                    )
-                    cache[index] = updated
+                    if (setClauses.isEmpty()) {
+                        Dev.info(log, "update.noop", "id" to id, "reason" to "nothing_to_update")
+                        return@withLock true
+                    }
 
-                    // Persist immediately
-                    saveMetadataCache(cache)
+                    params.add(id)
+                    val sql = "UPDATE chat_exchanges SET ${setClauses.joinToString(", ")} WHERE id = ?"
+                    val rowsAffected = database.execute(sql, *params.toTypedArray())
 
-                    Dev.info(log, "update.complete", "id" to id)
-                    true
+                    val found = rowsAffected > 0
+                    if (found) {
+                        Dev.info(log, "update.complete", "id" to id)
+                    } else {
+                        Dev.info(log, "update.notfound", "id" to id)
+                    }
+
+                    found
                 } catch (e: Exception) {
                     Dev.error(log, "update.failed", e, "id" to id)
                     false
@@ -397,24 +453,18 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
     /**
      * Search exchanges by text content in request and/or response.
      *
-     * This is the main entry point for finding previously discussed topics.
-     * Helps avoid redundant AI calls by surfacing relevant past exchanges.
-     *
-     * The search is delegated to [ExchangeSearchEngine], which can be swapped
-     * for different implementations. The default [SimpleSearchEngine] does
-     * case-insensitive substring matching.
-     *
-     * Note: This loads full exchange content for matches, so it's slower than
-     * [queryMetadata]. Use metadata queries when you only need to filter by
-     * structured fields (purpose, provider, date range, etc.).
+     * Delegates to [SimpleSearchEngine] for finding matching IDs, then loads
+     * full content from JSONL for each match.
      *
      * @param query The search text
+     * @param projectId The project to search within
      * @param searchIn Where to search (REQUEST_ONLY, RESPONSE_ONLY, or BOTH)
      * @param limit Maximum number of results
      * @return List of matching exchanges with full content, empty if no matches
      */
     override suspend fun searchExchanges(
         query: String,
+        projectId: String,
         searchIn: SearchScope,
         limit: Int
     ): List<AiExchange> {
@@ -427,14 +477,15 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             try {
                 Dev.info(log, "search.start",
                     "query" to Dev.preview(query, 50),
+                    "projectId" to projectId,
                     "scope" to searchIn
                 )
 
                 // Step 1: Get matching IDs from search engine (fast, in-memory)
                 val matchingIds = searchEngine.search(query, searchIn, limit)
 
-                // Step 2: Load full content for each match (slower, disk I/O)
-                val exchanges = matchingIds.mapNotNull { id -> getExchange(id) }
+                // Step 2: Load full content for each match
+                val exchanges = matchingIds.mapNotNull { id -> getExchange(id, projectId) }
 
                 Dev.info(log, "search.complete",
                     "query" to Dev.preview(query, 50),
@@ -454,62 +505,80 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
     /**
      * Validate that raw data files still exist for all metadata records.
      *
-     * Call this on startup or periodically to detect when raw files have been
-     * manually deleted (e.g., user clearing space, git clean, etc.).
+     * Scans all chat_exchanges for the given project where raw_available = 1,
+     * checks the JSONL file on disk, and sets raw_available = 0 for any
+     * missing files.
      *
-     * For any metadata where the raw file is missing, this sets `rawDataAvailable = false`.
-     * The metadata is retained so you still have timestamps, provider info, and labels —
-     * you just can't retrieve the full content anymore.
-     *
-     * @return Number of metadata records that were marked as unavailable
+     * @param projectId The project to validate
+     * @return Number of metadata records marked as unavailable
      */
-    override suspend fun validateRawDataAvailability(): Int {
+    override suspend fun validateRawDataAvailability(projectId: String): Int {
         if (mode == StorageMode.OFF) {
             Dev.info(log, "validate.skip", "reason" to "mode_off")
             return 0
         }
 
         return withContext(Dispatchers.IO) {
-            metadataMutex.withLock {
+            writeMutex.withLock {
                 try {
-                    Dev.info(log, "validate.start")
+                    val config = requireConfig()
+                    val database = requireDb()
 
-                    val cache = loadMetadataCache()
+                    Dev.info(log, "validate.start", "projectId" to projectId)
+
+                    // Get all distinct raw files that we think are still available
+                    val rawFiles = database.query(
+                        """
+                        SELECT DISTINCT raw_file FROM chat_exchanges
+                        WHERE project_id = ? AND raw_available = 1
+                        """.trimIndent(),
+                        projectId
+                    ) { rs -> rs.getString("raw_file") }
+
                     var markedUnavailable = 0
 
-                    cache.forEachIndexed { index, metadata ->
-                        // Only check records that we think have raw data
-                        if (metadata.rawDataAvailable) {
-                            val rawFile = getRawExchangesFile(metadata.rawFile)
-                            if (!rawFile.exists()) {
-                                // Raw file is gone — update metadata
-                                cache[index] = metadata.copy(rawDataAvailable = false)
+                    for (rawFile in rawFiles) {
+                        val file = config.chatFile(projectId, rawFile)
+                        if (!file.exists()) {
+                            // Raw file is gone — mark all exchanges pointing to it
+                            val affected = database.execute(
+                                """
+                                UPDATE chat_exchanges
+                                SET raw_available = 0
+                                WHERE project_id = ? AND raw_file = ? AND raw_available = 1
+                                """.trimIndent(),
+                                projectId, rawFile
+                            )
+                            markedUnavailable += affected
 
-                                // Also remove from search index since content is gone
-                                searchEngine.onRawDataRemoved(metadata.id)
-                                markedUnavailable++
-
-                                Dev.info(log, "validate.marked_unavailable",
-                                    "id" to metadata.id,
-                                    "rawFile" to metadata.rawFile
-                                )
-                            }
+                            Dev.info(log, "validate.marked_unavailable",
+                                "rawFile" to rawFile,
+                                "affected" to affected
+                            )
                         }
                     }
 
-                    // Persist changes if any
+                    // Also remove from search index for affected exchanges
                     if (markedUnavailable > 0) {
-                        saveMetadataCache(cache)
+                        val unavailableIds = database.query(
+                            """
+                            SELECT id FROM chat_exchanges
+                            WHERE project_id = ? AND raw_available = 0
+                            """.trimIndent(),
+                            projectId
+                        ) { rs -> rs.getString("id") }
+
+                        unavailableIds.forEach { searchEngine.onRawDataRemoved(it) }
                     }
 
                     Dev.info(log, "validate.complete",
-                        "total" to cache.size,
+                        "projectId" to projectId,
                         "markedUnavailable" to markedUnavailable
                     )
 
                     markedUnavailable
                 } catch (e: Exception) {
-                    Dev.error(log, "validate.failed", e)
+                    Dev.error(log, "validate.failed", e, "projectId" to projectId)
                     0
                 }
             }
@@ -524,11 +593,6 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
     /**
      * Change the storage mode at runtime.
      *
-     * Primarily used for:
-     * - Testing (set to OFF to disable persistence)
-     * - Future settings UI integration
-     * - Privacy-sensitive contexts where user wants to disable storage
-     *
      * Note: Changing mode doesn't migrate or delete existing data.
      * If you switch from LOCAL to OFF, existing data remains on disk
      * but won't be read or written until you switch back.
@@ -540,25 +604,23 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         mode = newMode
     }
 
+    // ==================== Initialization ====================
+
     /**
-     * Initialize the facade on project open.
+     * Initialize the facade when the project opens.
      *
-     * This must be called once when the project opens, before any other operations.
-     * It:
-     * 1. Creates storage directories if they don't exist
-     * 2. Loads the metadata index into memory
-     * 3. Rebuilds the search index from available exchanges
+     * Must be called once before any other operations. It:
+     * 1. Creates the StorageConfig with the storage root path
+     * 2. Ensures all directories exist
+     * 3. Opens the SQLite database and creates the schema
+     * 4. Registers the current project in the projects table
+     * 5. Rebuilds the search index from available exchanges
      *
      * Initialization is idempotent — safe to call multiple times.
      *
-     * Typical usage (in a startup activity or service constructor):
-     * ```kotlin
-     * project.coroutineScope.launch {
-     *     LocalStorageFacade.getInstance(project).initialize()
-     * }
-     * ```
+     * @param customRootPath Optional custom storage root (default: ~/YouMeAndMyself/)
      */
-    suspend fun initialize() {
+    suspend fun initialize(customRootPath: File? = null) {
         if (mode == StorageMode.OFF) {
             Dev.info(log, "init.skip", "reason" to "mode_off")
             return
@@ -568,23 +630,30 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             try {
                 Dev.info(log, "init.start", "project" to project.name)
 
-                // Step 1: Ensure directories exist
-                getRawStorageDir().mkdirs()
-                getMetadataDir().mkdirs()
+                // Step 1: Set up storage paths
+                val config = if (customRootPath != null) {
+                    StorageConfig(customRootPath)
+                } else {
+                    StorageConfig.withDefaultRoot()
+                }
+                config.ensureDirectoriesExist()
+                storageConfig = config
 
-                // Step 2: Load metadata index
-                val metadata = loadMetadataCache()
+                // Step 2: Open SQLite database
+                val database = DatabaseHelper(config.databaseFile)
+                database.open()
+                db = database
 
-                // Step 3: Rebuild search index from available exchanges
-                // This reads all raw files, so it can be slow for large histories
-                // Future optimization: persist the search index itself
-                val exchanges = metadata
-                    .filter { it.rawDataAvailable }
-                    .mapNotNull { meta -> readRawExchange(meta.id, meta.rawFile) }
-                searchEngine.rebuildIndex(exchanges)
+                // Step 3: Register this project
+                val projectId = resolveProjectId()
+                ensureProjectRegistered(projectId, database)
+
+                // Step 4: Rebuild search index from available exchanges
+                rebuildSearchIndex(projectId, config, database)
 
                 Dev.info(log, "init.complete",
-                    "metadataCount" to metadata.size,
+                    "project" to project.name,
+                    "storageRoot" to config.root.absolutePath,
                     "indexedCount" to searchEngine.indexSize()
                 )
             } catch (e: Exception) {
@@ -593,71 +662,47 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         }
     }
 
-    // ==================== Raw Storage (Project Directory) ====================
-
     /**
-     * Get the directory for raw JSONL files.
+     * Shut down the facade when the project is closing.
      *
-     * Location: `<project-root>/.youmeandmyself/`
-     *
-     * The dot prefix makes it a hidden directory on Unix systems,
-     * similar to .git, .idea, etc.
-     *
-     * @throws IllegalStateException if the project has no base path (shouldn't happen)
+     * Closes the database connection. After this, no operations are possible
+     * without calling [initialize] again.
      */
-    private fun getRawStorageDir(): File {
-        val projectPath = project.basePath
-            ?: throw IllegalStateException("Project has no base path — cannot determine storage location")
-        return File(projectPath, ".youmeandmyself")
+    fun dispose() {
+        try {
+            db?.close()
+            db = null
+            storageConfig = null
+            Dev.info(log, "dispose.complete")
+        } catch (e: Exception) {
+            Dev.error(log, "dispose.failed", e)
+        }
     }
 
-    /**
-     * Get a specific raw exchanges file by filename.
-     *
-     * @param filename The filename (e.g., "exchanges-2026-01.jsonl")
-     * @return File object (may not exist yet)
-     */
-    private fun getRawExchangesFile(filename: String): File {
-        return File(getRawStorageDir(), filename)
-    }
+    // ==================== Raw JSONL Storage ====================
 
     /**
-     * Determine the filename for the current month.
+     * Append an exchange to the appropriate weekly JSONL file.
      *
-     * Format: `exchanges-YYYY-MM.jsonl`
-     *
-     * Using UTC timezone ensures consistent filenames regardless of user's locale.
-     * Monthly partitioning keeps files from growing too large and makes
-     * date-based cleanup straightforward.
-     *
-     * @return Filename for the current month (e.g., "exchanges-2026-01.jsonl")
-     */
-    private fun currentRawFileName(): String {
-        val yearMonth = YearMonth.now(ZoneOffset.UTC)
-        return "exchanges-${yearMonth}.jsonl"
-    }
-
-    /**
-     * Append an exchange to the appropriate JSONL file.
-     *
-     * The exchange is converted to a compact JSON string and appended as a single line.
-     * This is an atomic-ish operation — either the whole line is written or it isn't.
+     * The exchange is serialized to compact JSON and appended as a single line.
+     * The file is created if it doesn't exist (first exchange of the week).
      *
      * @param exchange The exchange to write
-     * @return The filename used (needed for metadata linkage)
+     * @param projectId The project ID (determines the subdirectory)
+     * @param config Storage path configuration
+     * @return The filename used (e.g., "exchanges-2026-W05.jsonl") for metadata linkage
      */
-    private fun writeRawExchange(exchange: AiExchange): String {
-        val filename = currentRawFileName()
-        val file = getRawExchangesFile(filename)
+    private fun writeRawExchange(exchange: AiExchange, projectId: String, config: StorageConfig): String {
+        val file = config.currentChatFile(projectId)
+        val filename = file.name
 
-        // Ensure directory exists (first write of the month)
+        // Ensure project directory exists (first write for this project)
         file.parentFile?.mkdirs()
 
-        // Convert to serializable form and write as single line
-        val serializable = exchange.toSerializable()
-        val jsonLine = jsonCompact.encodeToString(serializable)
-
-        // appendText handles opening, writing, and closing the file
+        // Serialize to compact JSON and append as a single line.
+        // Include projectId in the record for database rebuild capability.
+        val serializable = exchange.toJsonl(projectId)
+        val jsonLine = json.encodeToString(serializable)
         file.appendText(jsonLine + "\n")
 
         Dev.info(log, "raw.write",
@@ -672,15 +717,24 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
     /**
      * Read a specific exchange from a JSONL file by ID.
      *
-     * This scans the file line by line looking for the matching ID.
+     * Scans the file line by line looking for the matching ID.
      * While not optimal for random access, JSONL doesn't support indexing.
+     * Lines that fail to parse are logged and skipped (one bad line doesn't
+     * break the whole file).
      *
      * @param id The exchange ID to find
-     * @param filename Which file to search
+     * @param projectId The project ID (determines the subdirectory)
+     * @param filename Which JSONL file to search
+     * @param config Storage path configuration
      * @return The exchange if found, null otherwise
      */
-    private fun readRawExchange(id: String, filename: String): AiExchange? {
-        val file = getRawExchangesFile(filename)
+    private fun readRawExchange(
+        id: String,
+        projectId: String,
+        filename: String,
+        config: StorageConfig
+    ): AiExchange? {
+        val file = config.chatFile(projectId, filename)
         if (!file.exists()) {
             Dev.info(log, "raw.read.nofile", "file" to filename)
             return null
@@ -692,9 +746,9 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 if (line.isBlank()) continue
 
                 try {
-                    val serializable = jsonCompact.decodeFromString<SerializableExchange>(line)
-                    if (serializable.id == id) {
-                        return serializable.toExchange()
+                    val record = json.decodeFromString<JsonlExchange>(line)
+                    if (record.id == id) {
+                        return record.toExchange()
                     }
                 } catch (e: Exception) {
                     // Log but continue — one bad line shouldn't break the whole file
@@ -709,162 +763,133 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         return null
     }
 
-    // ==================== Metadata Storage (IntelliJ System Area) ====================
+    // ==================== Project Registration ====================
 
     /**
-     * Get the directory for metadata files.
+     * Ensure the project exists in the projects table.
      *
-     * Location: `<intellij-system>/youmeandmyself/<project-hash>/`
+     * Uses INSERT OR IGNORE so this is safe to call on every save — if the project
+     * already exists, it just updates last_opened_at.
      *
-     * Uses [PathManager.getSystemPath] which is the standard JetBrains location
-     * for plugin data that shouldn't be in the project directory.
-     *
-     * The project hash (from [Project.getLocationHash]) ensures uniqueness
-     * even for projects with the same name in different locations.
+     * @param projectId The project's unique identifier
+     * @param database The database helper
      */
-    private fun getMetadataDir(): File {
-        val systemPath = PathManager.getSystemPath()
-        val projectHash = project.locationHash
-        return File(systemPath, "youmeandmyself/$projectHash")
+    private fun ensureProjectRegistered(projectId: String, database: DatabaseHelper) {
+        val projectPath = project.basePath ?: "unknown"
+        val now = Instant.now().toString()
+
+        // Insert if new, or update last_opened_at if existing
+        database.execute(
+            """
+            INSERT INTO projects (id, name, path, created_at, last_opened_at, is_active)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ON CONFLICT(id) DO UPDATE SET
+                last_opened_at = excluded.last_opened_at,
+                is_active = 1
+            """.trimIndent(),
+            projectId,
+            project.name,
+            projectPath,
+            now,
+            now
+        )
     }
 
     /**
-     * Get the metadata index file.
+     * Derive a stable project identifier from the IntelliJ project.
      *
-     * This single file contains all metadata records for the project.
-     * It's small enough to load entirely into memory.
+     * Uses the project's location hash, which is a stable identifier that
+     * doesn't change when the project is renamed (it's based on the path).
+     *
+     * @return A string identifier suitable for use as a directory name and database key
      */
-    private fun getMetadataFile(): File {
-        return File(getMetadataDir(), "metadata-index.json")
-    }
+    fun resolveProjectId(): String = project.locationHash
+
+    // ==================== Search Index ====================
 
     /**
-     * Load metadata from disk into the in-memory cache.
+     * Rebuild the in-memory search index from all available JSONL files.
      *
-     * This is called lazily on first access. Subsequent calls return the
-     * cached list without re-reading the file.
+     * This reads every exchange from every JSONL file for the project.
+     * It can be slow for large histories — future optimization: persist
+     * the search index itself (e.g., in SQLite FTS).
      *
-     * If the file doesn't exist (first run), returns an empty list.
-     * If the file is corrupted, logs an error and returns an empty list.
-     *
-     * @return The metadata list (never null after this call)
+     * Called during [initialize].
      */
-    private fun loadMetadataCache(): MutableList<ExchangeMetadata> {
-        // Return cached if available
-        metadataCache?.let { return it }
+    private suspend fun rebuildSearchIndex(projectId: String, config: StorageConfig, database: DatabaseHelper) {
+        val rawFiles = database.query(
+            """
+            SELECT DISTINCT raw_file FROM chat_exchanges
+            WHERE project_id = ? AND raw_available = 1
+            """.trimIndent(),
+            projectId
+        ) { rs -> rs.getString("raw_file") }
 
-        val file = getMetadataFile()
-        if (!file.exists()) {
-            Dev.info(log, "metadata.load.new", "file" to file.path)
-            metadataCache = mutableListOf()
-            return metadataCache!!
+        val exchanges = mutableListOf<AiExchange>()
+        for (rawFile in rawFiles) {
+            val file = config.chatFile(projectId, rawFile)
+            if (!file.exists()) continue
+
+            file.useLines { lines ->
+                for (line in lines) {
+                    if (line.isBlank()) continue
+                    try {
+                        val record = json.decodeFromString<JsonlExchange>(line)
+                        exchanges.add(record.toExchange())
+                    } catch (e: Exception) {
+                        Dev.warn(log, "index.rebuild.parse_error", e,
+                            "file" to rawFile,
+                            "linePreview" to Dev.preview(line, 100)
+                        )
+                    }
+                }
+            }
         }
 
-        return try {
-            val content = file.readText()
-            val serializable = jsonPretty.decodeFromString<List<SerializableMetadata>>(content)
-            val loaded = serializable.map { it.toMetadata() }.toMutableList()
-
-            Dev.info(log, "metadata.load.complete",
-                "file" to file.path,
-                "count" to loaded.size
-            )
-
-            metadataCache = loaded
-            loaded
-        } catch (e: Exception) {
-            // Corrupted file — start fresh rather than crash
-            Dev.error(log, "metadata.load.failed", e, "file" to file.path)
-            metadataCache = mutableListOf()
-            metadataCache!!
-        }
+        searchEngine.rebuildIndex(exchanges)
     }
 
+    // ==================== Internal Helpers ====================
+
     /**
-     * Persist the metadata cache to disk.
-     *
-     * This writes the entire cache as a JSON array.
-     *
-     * @param cache The metadata list to save
+     * Get the storage config, throwing if not initialized.
      */
-    private fun saveMetadataCache(cache: List<ExchangeMetadata>) {
-        val file = getMetadataFile()
-        file.parentFile?.mkdirs()
-
-        try {
-            val serializable = cache.map { it.toSerializable() }
-            val content = jsonPretty.encodeToString(serializable)
-            file.writeText(content)
-
-            Dev.info(log, "metadata.save.complete",
-                "file" to file.path,
-                "count" to cache.size
-            )
-        } catch (e: Exception) {
-            Dev.error(log, "metadata.save.failed", e, "file" to file.path)
-        }
+    private fun requireConfig(): StorageConfig {
+        return storageConfig
+            ?: throw IllegalStateException("StorageFacade not initialized. Call initialize() first.")
     }
 
     /**
-     * Add a new metadata entry and persist immediately.
-     *
-     * Uses mutex to ensure thread safety.
-     *
-     * @param metadata The new metadata record to add
+     * Get the database helper, throwing if not initialized.
      */
-    private suspend fun addMetadata(metadata: ExchangeMetadata) {
-        metadataMutex.withLock {
-            val cache = loadMetadataCache()
-            cache.add(metadata)
-            saveMetadataCache(cache)
-        }
+    private fun requireDb(): DatabaseHelper {
+        return db
+            ?: throw IllegalStateException("StorageFacade not initialized. Call initialize() first.")
     }
 
+    // ==================== JSONL Serialization ====================
+
     /**
-     * Find metadata by exchange ID.
+     * Serializable record for JSONL files.
      *
-     * @param id The exchange ID
-     * @return The metadata record, or null if not found
-     */
-    private fun getMetadataById(id: String): ExchangeMetadata? {
-        return loadMetadataCache().find { it.id == id }
-    }
-
-    // ==================== Filtering ====================
-
-    /**
-     * Check if a metadata record matches all specified filter criteria.
+     * This is what gets written as one line in the JSONL file. It must contain
+     * enough information to fully rebuild the SQLite database if needed.
      *
-     * @param metadata The record to check
-     * @param filter The filter criteria
-     * @return True if all criteria match
-     */
-    private fun matchesFilter(metadata: ExchangeMetadata, filter: MetadataFilter): Boolean {
-        if (filter.purpose != null && metadata.purpose != filter.purpose) return false
-        if (filter.providerId != null && metadata.providerId != filter.providerId) return false
-        if (filter.modelId != null && metadata.modelId != filter.modelId) return false
-        if (filter.hasFlag != null && !metadata.flags.contains(filter.hasFlag)) return false
-        if (filter.hasLabel != null && !metadata.labels.contains(filter.hasLabel)) return false
-        if (filter.after != null && metadata.timestamp.isBefore(filter.after)) return false
-        if (filter.before != null && metadata.timestamp.isAfter(filter.before)) return false
-        if (filter.rawDataAvailable != null && metadata.rawDataAvailable != filter.rawDataAvailable) return false
-        return true
-    }
-
-    // ==================== Serialization ====================
-
-    /**
-     * Serializable form of [AiExchange] for JSON encoding.
+     * Note: [projectId] is included in the JSONL record even though the file
+     * is already inside a project-specific directory. This redundancy is intentional —
+     * it makes each record self-describing and simplifies database rebuilds.
      */
     @Serializable
-    private data class SerializableExchange(
+    data class JsonlExchange(
         val id: String,
+        val projectId: String? = null,
         val timestamp: String,
         val providerId: String,
         val modelId: String,
         val purpose: String,
-        val request: SerializableRequest,
-        val rawResponse: SerializableRawResponse
+        val request: JsonlRequest,
+        val rawResponse: JsonlRawResponse,
+        val tokensUsed: Int? = null
     ) {
         fun toExchange(): AiExchange = AiExchange(
             id = id,
@@ -873,15 +898,13 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             modelId = modelId,
             purpose = ExchangePurpose.valueOf(purpose),
             request = request.toRequest(),
-            rawResponse = rawResponse.toRawResponse()
+            rawResponse = rawResponse.toRawResponse(),
+            tokensUsed = tokensUsed
         )
     }
 
-    /**
-     * Serializable form of [ExchangeRequest].
-     */
     @Serializable
-    private data class SerializableRequest(
+    data class JsonlRequest(
         val input: String,
         val systemPrompt: String? = null,
         val contextFiles: List<String>? = null,
@@ -901,11 +924,8 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         )
     }
 
-    /**
-     * Serializable form of [ExchangeRawResponse].
-     */
     @Serializable
-    private data class SerializableRawResponse(
+    data class JsonlRawResponse(
         val json: String,
         val httpStatus: Int? = null
     ) {
@@ -916,45 +936,20 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
     }
 
     /**
-     * Serializable form of [ExchangeMetadata].
+     * Convert an AiExchange domain model to JSONL serializable form.
+     *
+     * @param projectId Optional project ID to embed in the record (for rebuild).
+     *                  Included for self-describing records — even though the file
+     *                  is already in a project-specific directory.
      */
-    @Serializable
-    private data class SerializableMetadata(
-        val id: String,
-        val timestamp: String,
-        val providerId: String,
-        val modelId: String,
-        val purpose: String,
-        val tokensUsed: Int?,
-        val flags: List<String>,
-        val labels: List<String>,
-        val rawFile: String,
-        val rawDataAvailable: Boolean
-    ) {
-        fun toMetadata(): ExchangeMetadata = ExchangeMetadata(
-            id = id,
-            timestamp = Instant.parse(timestamp),
-            providerId = providerId,
-            modelId = modelId,
-            purpose = ExchangePurpose.valueOf(purpose),
-            tokensUsed = tokensUsed,
-            flags = flags.toMutableSet(),
-            labels = labels.toMutableSet(),
-            rawFile = rawFile,
-            rawDataAvailable = rawDataAvailable
-        )
-    }
-
-    /**
-     * Convert domain model to serializable form.
-     */
-    private fun AiExchange.toSerializable(): SerializableExchange = SerializableExchange(
+    private fun AiExchange.toJsonl(projectId: String? = null): JsonlExchange = JsonlExchange(
         id = id,
+        projectId = projectId,
         timestamp = timestamp.toString(),
         providerId = providerId,
         modelId = modelId,
         purpose = purpose.name,
-        request = SerializableRequest(
+        request = JsonlRequest(
             input = request.input,
             systemPrompt = request.systemPrompt,
             contextFiles = request.contextFiles,
@@ -963,35 +958,14 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             topP = request.topP,
             stopSequences = request.stopSequences
         ),
-        rawResponse = SerializableRawResponse(
+        rawResponse = JsonlRawResponse(
             json = rawResponse.json,
             httpStatus = rawResponse.httpStatus
-        )
-    )
-
-    /**
-     * Convert domain model to serializable form.
-     */
-    private fun ExchangeMetadata.toSerializable(): SerializableMetadata = SerializableMetadata(
-        id = id,
-        timestamp = timestamp.toString(),
-        providerId = providerId,
-        modelId = modelId,
-        purpose = purpose.name,
-        tokensUsed = tokensUsed,
-        flags = flags.toList(),
-        labels = labels.toList(),
-        rawFile = rawFile,
-        rawDataAvailable = rawDataAvailable
+        ),
+        tokensUsed = tokensUsed
     )
 
     companion object {
-        /**
-         * Get the facade instance for a project.
-         *
-         * @param project The project
-         * @return The facade instance
-         */
         fun getInstance(project: Project): LocalStorageFacade =
             project.getService(LocalStorageFacade::class.java)
     }

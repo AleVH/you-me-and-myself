@@ -51,6 +51,8 @@ class CorrectionFlowHelper(
 ) {
     private val log = Logger.getInstance(CorrectionFlowHelper::class.java)
 
+    private val projectId: String = project.locationHash
+
     /**
      * State for tracking the last response that can be corrected.
      * Used when user clicks "Not right?" after the fact.
@@ -333,7 +335,7 @@ class CorrectionFlowHelper(
 
         return withContext(Dispatchers.IO) {
             try {
-                storageFacade.getExchange(exchangeId)?.rawResponse?.json
+                storageFacade.getExchange(exchangeId, projectId)?.rawResponse?.json
             } catch (e: Exception) {
                 log.error("Failed to fetch exchange $exchangeId", e)
                 null

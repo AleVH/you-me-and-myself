@@ -1,67 +1,79 @@
 package com.youmeandmyself.storage
 
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
+import com.intellij.openapi.util.Disposer
 import com.youmeandmyself.dev.Dev
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 /**
- * Initializes the storage system when a project opens.
+ * Initializes the storage subsystem when a project opens.
  *
- * This is a [ProjectActivity] — IntelliJ automatically runs it after
- * the project is fully loaded. It's the recommended way to perform
- * startup tasks that need a project context.
+ * ## What It Does
  *
- * What happens during initialization:
- * 1. Storage directories are created if they don't exist
- * 2. Metadata index is loaded into memory
- * 3. Search index is rebuilt from available exchanges
+ * 1. Gets the [LocalStorageFacade] service for the project
+ * 2. Calls [LocalStorageFacade.initialize] which:
+ *    - Creates the storage root directory structure
+ *    - Opens the SQLite database and creates all 10 tables
+ *    - Registers the project in the projects table
+ *    - Rebuilds the search index from existing JSONL files
+ * 3. Validates raw data availability (checks for deleted JSONL files)
+ * 4. Registers a dispose handler to close the database on project close
  *
- * If initialization fails, errors are logged but the plugin continues
- * to function — the user can still chat, they just won't have persistence.
+ * ## Registration
  *
- * ## Why ProjectActivity instead of ProjectComponent?
+ * This class must be registered in plugin.xml as a postStartupActivity:
+ * ```xml
+ * <postStartupActivity implementation="com.youmeandmyself.storage.StorageInitializer"/>
+ * ```
  *
- * ProjectComponent is deprecated since 2019.3. ProjectActivity is:
- * - Non-blocking (runs as a coroutine)
- * - Runs after the project is fully initialized
- * - Doesn't slow down IDE startup
+ * ## Error Handling
+ *
+ * If initialization fails, the error is logged but the IDE continues normally.
+ * The user can still use the plugin — they just won't have storage persistence
+ * until the issue is resolved and the IDE is restarted.
  */
 class StorageInitializer : ProjectActivity {
 
     private val log = Logger.getInstance(StorageInitializer::class.java)
 
     /**
-     * Called by IntelliJ when the project finishes loading.
+     * Called by IntelliJ after the project is fully loaded.
      *
-     * @param project The project that just opened
+     * This runs on a background thread (ProjectActivity is non-blocking),
+     * so it's safe to do I/O here.
      */
     override suspend fun execute(project: Project) {
-        Dev.info(log, "storage.init.starting", "project" to project.name)
-
         try {
-            // Get the facade instance (created by IntelliJ's service system)
+            Dev.info(log, "storage.init.start", "project" to project.name)
+
             val facade = LocalStorageFacade.getInstance(project)
 
-            // Run initialization on IO dispatcher
-            withContext(Dispatchers.IO) {
-                facade.initialize()
-            }
+            // Initialize storage (creates dirs, opens DB, builds search index)
+            facade.initialize()
 
-            // Validate that raw files still exist (detect manual deletions)
-            val unavailableCount = facade.validateRawDataAvailability()
-            if (unavailableCount > 0) {
+            // Check for deleted raw files and update metadata
+            val projectId = facade.resolveProjectId()
+            val unavailable = facade.validateRawDataAvailability(projectId)
+            if (unavailable > 0) {
                 Dev.info(log, "storage.init.stale_data",
                     "project" to project.name,
-                    "unavailableCount" to unavailableCount
+                    "unavailable" to unavailable
                 )
             }
 
+            // Register dispose handler to close DB when project closes.
+            // Disposer.register requires a parent Disposable — the project
+            // itself implements Disposable and is disposed when closed.
+            @Suppress("DEPRECATION")
+            Disposer.register(project as Disposable, Disposable {
+                Dev.info(log, "storage.dispose", "project" to project.name)
+                facade.dispose()
+            })
+
             Dev.info(log, "storage.init.complete", "project" to project.name)
         } catch (e: Exception) {
-            // Don't crash the IDE — log and continue
             Dev.error(log, "storage.init.failed", e, "project" to project.name)
         }
     }

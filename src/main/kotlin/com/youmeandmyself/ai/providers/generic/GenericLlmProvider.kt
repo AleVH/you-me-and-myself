@@ -184,13 +184,14 @@ class GenericLlmProvider(
                 rawResponse = ExchangeRawResponse(
                     json = rawJson ?: "",
                     httpStatus = httpStatus
-                )
+                ),
+                tokensUsed = null  // Can be extracted from rawJson later if needed
                 // TODO: Add sessionId and projectId when AiExchange model is updated
                 // sessionId = sessionId,
                 // projectId = project.name
             )
 
-            val savedId = storage.saveExchange(exchange)
+            val savedId = storage.saveExchange(exchange, storage.resolveProjectId())
 
             if (savedId != null) {
                 Dev.info(log, "storage.saved",

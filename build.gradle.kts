@@ -28,6 +28,8 @@ dependencies {
     // Kotlinx JSON (match Ktor 2.3.x with 1.6.x)
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 
+    implementation("org.xerial:sqlite-jdbc:3.45.1.0")
+
     // IntelliJ Platform target (parameterized)
     intellijPlatform {
         val type    = providers.gradleProperty("platformType").orElse("IC")

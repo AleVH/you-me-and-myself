@@ -11,9 +11,19 @@ import com.youmeandmyself.storage.search.SearchScope
  * All code that needs to read/write exchanges or summaries goes through here.
  * The rest of the plugin doesn't know or care how/where things are stored.
  *
- * Supports multiple modes (configured via settings):
+ * ## Project Awareness
+ *
+ * The new centralized storage architecture keeps data from all projects under
+ * a single storage root. Methods that write or read data require a projectId
+ * so the facade knows which project subfolder and database records to target.
+ *
+ * The IntelliJ [Project] instance is still used for service scoping (one facade
+ * per open project), but the projectId string is what links data in storage.
+ *
+ * ## Storage Modes
+ *
  * - OFF: No persistence, data lives only in memory for current session
- * - LOCAL: Write to disk (project dir for raw data, system area for metadata)
+ * - LOCAL: Write to disk (centralized root for JSONL + SQLite for metadata)
  * - CLOUD: Future — remote sync
  *
  * Implementation: [LocalStorageFacade]
@@ -22,24 +32,32 @@ interface StorageFacade {
 
     /**
      * Persist a complete AI exchange.
-     * Writes raw data to project directory, metadata to system area.
+     *
+     * Writes raw content to a weekly JSONL file under chat/{projectId}/,
+     * and inserts metadata into the chat_exchanges SQLite table.
      *
      * @param exchange The full exchange to store
+     * @param projectId The project this exchange belongs to
      * @return The ID of the stored exchange, or null if storage mode is OFF
      */
-    suspend fun saveExchange(exchange: AiExchange): String?
+    suspend fun saveExchange(exchange: AiExchange, projectId: String): String?
 
     /**
      * Retrieve full exchange by ID.
-     * Reads from raw JSONL file in project directory.
+     *
+     * Looks up the metadata in SQLite to find which JSONL file holds the content,
+     * then reads the full exchange from that file.
      *
      * @param id Exchange ID
+     * @param projectId The project this exchange belongs to
      * @return The exchange, or null if not found or raw data unavailable
      */
-    suspend fun getExchange(id: String): AiExchange?
+    suspend fun getExchange(id: String, projectId: String): AiExchange?
 
     /**
      * Query exchange metadata (lightweight, fast).
+     *
+     * Reads from SQLite only — never touches JSONL files.
      * Does not load full request/response content.
      *
      * @param filter Criteria to filter by (purpose, provider, flags, date range, etc.)
@@ -49,7 +67,8 @@ interface StorageFacade {
 
     /**
      * Update flags or labels on an existing exchange.
-     * Only modifies metadata index, not raw data.
+     *
+     * Only modifies the metadata in SQLite, not raw JSONL data.
      *
      * @param id Exchange ID
      * @param flags New flags (replaces existing). Pass null to leave unchanged.
@@ -60,26 +79,33 @@ interface StorageFacade {
 
     /**
      * Search exchanges by text content.
-     * Delegates to the configured [ExchangeSearchEngine].
+     *
+     * Delegates to the configured search engine for finding matching IDs,
+     * then loads full content from JSONL for matches.
      *
      * @param query The search text
+     * @param projectId The project to search within
      * @param searchIn Where to search (request, response, or both)
      * @param limit Max results to return
      * @return List of matching exchanges (full content loaded). Empty if no matches.
      */
     suspend fun searchExchanges(
         query: String,
+        projectId: String,
         searchIn: SearchScope = SearchScope.BOTH,
         limit: Int = 20
     ): List<AiExchange>
 
     /**
      * Check raw data availability and update metadata accordingly.
-     * Call this on startup or periodically to detect deleted raw files.
      *
-     * @return Number of metadata records marked as rawDataAvailable=false
+     * Scans JSONL files referenced by chat_exchanges and marks any missing
+     * files as raw_available = 0 in SQLite.
+     *
+     * @param projectId The project to validate
+     * @return Number of metadata records marked as raw_available = 0
      */
-    suspend fun validateRawDataAvailability(): Int
+    suspend fun validateRawDataAvailability(projectId: String): Int
 
     /**
      * Current storage mode.
