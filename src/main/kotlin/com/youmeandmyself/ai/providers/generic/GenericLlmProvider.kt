@@ -13,6 +13,7 @@ package com.youmeandmyself.ai.providers.generic
  * - DTOs are minimal and private to avoid leaking vendor shapes.
  * - Response parsing is delegated to ResponseParser (universal format detection).
  * - Raw responses are saved to storage IMMEDIATELY before parsing.
+ * - Separate methods for chat() and summarize() with different settings and purposes.
  *
  * NOTES
  * - Keys are still plain in AiProfile for now. Phase 2 will fetch them from PasswordSafe (Secrets helper).
@@ -29,6 +30,7 @@ import com.youmeandmyself.ai.providers.parsing.ParseStrategy
 import com.youmeandmyself.ai.providers.parsing.Confidence
 import com.youmeandmyself.ai.settings.ApiProtocol
 import com.youmeandmyself.ai.settings.CustomProtocolConfig
+import com.youmeandmyself.ai.settings.RequestSettings
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.storage.model.AiExchange
@@ -42,20 +44,60 @@ import kotlinx.serialization.Serializable
 import java.time.Instant
 import java.util.UUID
 
+/**
+ * Vendor-agnostic LLM provider that handles multiple API protocols.
+ *
+ * ## Purpose
+ *
+ * This class is the workhorse that actually talks to LLM APIs. It abstracts away the
+ * differences between OpenAI, Gemini, and custom endpoints behind a common interface.
+ *
+ * ## Protocol Support
+ *
+ * - **OPENAI_COMPAT**: Standard OpenAI API format (also used by many other providers)
+ * - **GEMINI**: Google's Gemini REST API
+ * - **CUSTOM**: User-defined paths and auth headers for exotic providers
+ *
+ * ## Chat vs Summarize
+ *
+ * Both methods make LLM requests but use different settings:
+ * - chat(): Uses chatSettings (higher temperature, longer responses)
+ * - summarize(): Uses summarySettings (lower temperature, shorter responses, different purpose)
+ *
+ * ## Storage
+ *
+ * Every request/response is saved to storage BEFORE parsing. This ensures:
+ * - Raw data is never lost, even if parsing fails
+ * - We have a complete audit trail
+ * - Responses can be re-parsed if the parsing logic improves
+ *
+ * @param id Unique identifier for this provider instance
+ * @param displayName Human-friendly name for UI
+ * @param baseUrl API endpoint base URL
+ * @param apiKey Authentication secret
+ * @param model Model identifier to use
+ * @param protocol Which API format to use
+ * @param custom Custom protocol settings (only used when protocol=CUSTOM)
+ * @param chatSettings Request parameters for chat (temperature, maxTokens, etc.)
+ * @param summarySettings Request parameters for summarization
+ * @param project IntelliJ project context (for storage access)
+ */
 class GenericLlmProvider(
-    override val id: String,              // free text id (e.g., providerId or "generic")
-    override val displayName: String,     // label shown to the user
-    private val baseUrl: String,          // endpoint base (required by OPENAI_COMPAT, GEMINI, CUSTOM)
-    private val apiKey: String,           // auth secret (Phase 2: PasswordSafe)
-    private val model: String?,           // model name (required by GEMINI; default for OPENAI_COMPAT/CUSTOM)
-    private val protocol: ApiProtocol,    // OPENAI_COMPAT | GEMINI | CUSTOM
-    private val custom: CustomProtocolConfig?, // optional knobs for CUSTOM
-    private val project: Project          // IntelliJ project context (for storage, etc.)
+    override val id: String,
+    override val displayName: String,
+    private val baseUrl: String,
+    private val apiKey: String,
+    private val model: String?,
+    private val protocol: ApiProtocol,
+    private val custom: CustomProtocolConfig?,
+    private val chatSettings: RequestSettings?,
+    private val summarySettings: RequestSettings?,
+    private val project: Project
 ) : AiProvider {
 
     private val log = Dev.logger(GenericLlmProvider::class.java)
 
-    // Storage facade for persisting exchanges
+    /** Storage facade for persisting exchanges. Lazy to avoid initialization order issues. */
     private val storage: LocalStorageFacade by lazy {
         LocalStorageFacade.getInstance(project)
     }
@@ -83,11 +125,15 @@ class GenericLlmProvider(
         require(baseUrl.isNotBlank()) { "Base URL is required" }
     }
 
-    // Reuse the hardened, shared Ktor client (timeouts, logging, proxy, JSON configured centrally).
+    /** Reuse the hardened, shared Ktor client (timeouts, logging, proxy, JSON configured centrally). */
     private val client get() = HttpClientFactory.client
 
-    // ---- Public API ----
+    // ==================== Public API ====================
 
+    /**
+     * Quick health check to verify connectivity and credentials.
+     * Calls the provider's model listing endpoint (fast, low cost).
+     */
     override suspend fun ping(): String = when (protocol) {
         ApiProtocol.OPENAI_COMPAT -> pingOpenAiCompat()
         ApiProtocol.GEMINI        -> pingGemini()
@@ -97,19 +143,40 @@ class GenericLlmProvider(
     /**
      * Send a chat prompt and get a parsed response.
      *
-     * Flow:
-     * 1. Make HTTP request based on protocol
-     * 2. Save raw response to storage IMMEDIATELY (get exchangeId)
-     * 3. Parse response using ResponseParser (universal format detection)
-     * 4. Return ParsedResponse with extracted content or error info
+     * Uses chatSettings for request parameters.
+     * Saves to storage with ExchangePurpose.CHAT.
+     *
+     * @param prompt The user's message/question
+     * @return ParsedResponse with extracted text or error info
      */
-    override suspend fun chat(prompt: String): ParsedResponse = when (protocol) {
-        ApiProtocol.OPENAI_COMPAT -> chatOpenAiCompat(prompt)
-        ApiProtocol.GEMINI        -> chatGemini(prompt)
-        ApiProtocol.CUSTOM        -> chatCustom(prompt)
+    override suspend fun chat(prompt: String): ParsedResponse {
+        val settings = chatSettings ?: RequestSettings.chatDefaults()
+        return when (protocol) {
+            ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings, ExchangePurpose.CHAT)
+            ApiProtocol.GEMINI        -> requestGemini(prompt, settings, ExchangePurpose.CHAT)
+            ApiProtocol.CUSTOM        -> requestCustom(prompt, settings, ExchangePurpose.CHAT)
+        }
     }
 
-    // ---- Unified Response Handling ----
+    /**
+     * Send a summarization prompt and get a parsed response.
+     *
+     * Uses summarySettings for request parameters (lower temperature, shorter max tokens).
+     * Saves to storage with ExchangePurpose.SUMMARY.
+     *
+     * @param prompt The summarization prompt (built by SummaryExtractor)
+     * @return ParsedResponse with extracted summary text or error info
+     */
+    override suspend fun summarize(prompt: String): ParsedResponse {
+        val settings = summarySettings ?: RequestSettings.summaryDefaults()
+        return when (protocol) {
+            ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings, ExchangePurpose.FILE_SUMMARY)
+            ApiProtocol.GEMINI        -> requestGemini(prompt, settings, ExchangePurpose.FILE_SUMMARY)
+            ApiProtocol.CUSTOM        -> requestCustom(prompt, settings, ExchangePurpose.FILE_SUMMARY)
+        }
+    }
+
+    // ==================== Unified Response Handling ====================
 
     /**
      * Handle the raw HTTP response: save to storage, then parse.
@@ -120,40 +187,40 @@ class GenericLlmProvider(
      * @param rawJson The raw response body (may be null on network error)
      * @param httpStatus The HTTP status code (may be null on network error)
      * @param prompt The original prompt (for storage)
+     * @param purpose CHAT or SUMMARY (affects how it's stored)
      * @return ParsedResponse with extracted content or error information
      */
     private suspend fun handleResponse(
         rawJson: String?,
         httpStatus: Int?,
-        prompt: String
+        prompt: String,
+        purpose: ExchangePurpose
     ): ParsedResponse {
         // Generate exchange ID for this request
         val exchangeId = UUID.randomUUID().toString()
 
         // Save to storage IMMEDIATELY (before any parsing)
-        saveToStorage(exchangeId, rawJson, httpStatus, prompt)
+        saveToStorage(exchangeId, rawJson, httpStatus, prompt, purpose)
 
         // Parse the response
         val parsed = ResponseParser.parse(rawJson, httpStatus, exchangeId)
 
         // Log the result
+        val logPrefix = if (purpose == ExchangePurpose.CHAT) "chat" else "summary"
         if (parsed.isError) {
-            Dev.warn(log, "chat.parsed_as_error", null,
+            Dev.warn(log, "$logPrefix.parsed_as_error", null,
                 "exchangeId" to exchangeId,
                 "errorType" to parsed.errorType?.name,
                 "errorMessage" to parsed.errorMessage?.take(100)
             )
         } else {
-            Dev.info(log, "chat.parsed_success",
+            Dev.info(log, "$logPrefix.parsed_success",
                 "exchangeId" to exchangeId,
                 "strategy" to parsed.metadata.parseStrategy.name,
                 "confidence" to parsed.metadata.confidence.name,
                 "contentLength" to (parsed.rawText?.length ?: 0)
             )
         }
-
-        // TODO: Update storage with parseMetadata after parsing
-        // This would allow us to query "show me all responses parsed with heuristics"
 
         return parsed
     }
@@ -163,12 +230,19 @@ class GenericLlmProvider(
      *
      * This happens BEFORE parsing so we never lose raw data.
      * Even if parsing fails, the raw response is preserved.
+     *
+     * @param exchangeId Unique ID for this exchange
+     * @param rawJson The raw response JSON
+     * @param httpStatus HTTP status code
+     * @param prompt The original prompt
+     * @param purpose CHAT or SUMMARY
      */
     private suspend fun saveToStorage(
         exchangeId: String,
         rawJson: String?,
         httpStatus: Int?,
-        prompt: String
+        prompt: String,
+        purpose: ExchangePurpose
     ) {
         try {
             val exchange = AiExchange(
@@ -176,7 +250,7 @@ class GenericLlmProvider(
                 timestamp = Instant.now(),
                 providerId = id,
                 modelId = model ?: "unknown",
-                purpose = ExchangePurpose.CHAT,
+                purpose = purpose,
                 request = ExchangeRequest(
                     input = prompt,
                     contextFiles = null // TODO: pass context files from ChatPanel
@@ -185,10 +259,7 @@ class GenericLlmProvider(
                     json = rawJson ?: "",
                     httpStatus = httpStatus
                 ),
-                tokensUsed = null  // Can be extracted from rawJson later if needed
-                // TODO: Add sessionId and projectId when AiExchange model is updated
-                // sessionId = sessionId,
-                // projectId = project.name
+                tokensUsed = null // TODO: extract from rawJson in Phase 4
             )
 
             val savedId = storage.saveExchange(exchange, storage.resolveProjectId())
@@ -196,6 +267,7 @@ class GenericLlmProvider(
             if (savedId != null) {
                 Dev.info(log, "storage.saved",
                     "exchangeId" to exchangeId,
+                    "purpose" to purpose.name,
                     "rawLength" to (rawJson?.length ?: 0)
                 )
             } else {
@@ -205,7 +277,7 @@ class GenericLlmProvider(
                 )
             }
         } catch (e: Exception) {
-            // Don't let storage failures break the chat flow
+            // Don't let storage failures break the flow
             Dev.error(log, "storage.save_failed", e,
                 "exchangeId" to exchangeId
             )
@@ -217,15 +289,17 @@ class GenericLlmProvider(
      */
     private suspend fun handleRequestFailure(
         error: Exception,
-        prompt: String
+        prompt: String,
+        purpose: ExchangePurpose
     ): ParsedResponse {
         val exchangeId = UUID.randomUUID().toString()
         val errorJson = """{"error": "${error.message?.replace("\"", "'")}"}"""
 
         // Still save to storage so we have a record of the failure
-        saveToStorage(exchangeId, errorJson, null, prompt)
+        saveToStorage(exchangeId, errorJson, null, prompt, purpose)
 
-        Dev.error(log, "chat.request_failed", error,
+        val logPrefix = if (purpose == ExchangePurpose.CHAT) "chat" else "summary"
+        Dev.error(log, "$logPrefix.request_failed", error,
             "exchangeId" to exchangeId
         )
 
@@ -240,8 +314,7 @@ class GenericLlmProvider(
         )
     }
 
-    // ---- Protocol Implementations ----
-    // Each method just makes the HTTP request and delegates to handleResponse()
+    // ==================== Protocol Implementations ====================
 
     // 1) OpenAI-compatible ----------------------------------------------------
 
@@ -253,17 +326,34 @@ class GenericLlmProvider(
         return "${resp.status.value}"
     }
 
-    private suspend fun chatOpenAiCompat(prompt: String): ParsedResponse {
+    /**
+     * Make an OpenAI-compatible request with the given settings.
+     */
+    private suspend fun requestOpenAiCompat(
+        prompt: String,
+        settings: RequestSettings,
+        purpose: ExchangePurpose
+    ): ParsedResponse {
         val url = normalizeBaseUrl(baseUrl) + "/v1/chat/completions"
         val m = model ?: "gpt-4o-mini"
+
         val payload = OpenAiChatRequest(
             model = m,
-            messages = listOf(OpenAiMessage(role = "user", content = prompt))
+            messages = listOf(OpenAiMessage(role = "user", content = prompt)),
+            temperature = settings.temperature,
+            max_tokens = settings.maxTokens,
+            top_p = settings.topP,
+            frequency_penalty = settings.frequencyPenalty,
+            presence_penalty = settings.presencePenalty,
+            stop = settings.stopSequences?.takeIf { it.isNotEmpty() }
         )
 
         Dev.info(log, "openai.request",
             "url" to url,
             "model" to m,
+            "purpose" to purpose.name,
+            "temperature" to settings.temperature,
+            "maxTokens" to settings.maxTokens,
             "promptLength" to prompt.length,
             "promptPreview" to Dev.preview(prompt, 200)
         )
@@ -284,9 +374,9 @@ class GenericLlmProvider(
                 "preview" to Dev.preview(rawResponse, 500)
             )
 
-            handleResponse(rawResponse, httpStatus, prompt)
+            handleResponse(rawResponse, httpStatus, prompt, purpose)
         } catch (e: Exception) {
-            handleRequestFailure(e, prompt)
+            handleRequestFailure(e, prompt, purpose)
         }
     }
 
@@ -302,12 +392,22 @@ class GenericLlmProvider(
         return status
     }
 
-    private suspend fun chatGemini(prompt: String): ParsedResponse {
+    /**
+     * Make a Gemini request with the given settings.
+     */
+    private suspend fun requestGemini(
+        prompt: String,
+        settings: RequestSettings,
+        purpose: ExchangePurpose
+    ): ParsedResponse {
         val m = requireNotNull(model) { "Model required for GEMINI" }
         val url = normalizeBaseUrl(baseUrl) + "/v1beta/models/$m:generateContent"
 
         Dev.info(log, "gemini.request",
             "url" to url,
+            "purpose" to purpose.name,
+            "temperature" to settings.temperature,
+            "maxTokens" to settings.maxTokens,
             "promptLength" to prompt.length,
             "promptPreview" to Dev.preview(prompt, 200)
         )
@@ -322,12 +422,22 @@ class GenericLlmProvider(
             )
         }
 
+        // Build generation config from settings
+        val generationConfig = GeminiGenerationConfig(
+            temperature = settings.temperature,
+            maxOutputTokens = settings.maxTokens,
+            topP = settings.topP,
+            topK = settings.topK,
+            stopSequences = settings.stopSequences?.takeIf { it.isNotEmpty() }
+        )
+
         return try {
             val resp = client.post(url) {
                 url { parameters.append("key", apiKey) }
                 contentType(ContentType.Application.Json)
                 setBody(GeminiRequest(
-                    contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = prompt))))
+                    contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = prompt)))),
+                    generationConfig = generationConfig.takeIf { it.hasSettings() }
                 ))
             }
 
@@ -340,9 +450,9 @@ class GenericLlmProvider(
                 "preview" to Dev.preview(rawResponse, 500)
             )
 
-            handleResponse(rawResponse, httpStatus, prompt)
+            handleResponse(rawResponse, httpStatus, prompt, purpose)
         } catch (e: Exception) {
-            handleRequestFailure(e, prompt)
+            handleRequestFailure(e, prompt, purpose)
         }
     }
 
@@ -360,18 +470,35 @@ class GenericLlmProvider(
         return "${resp.status.value}"
     }
 
-    private suspend fun chatCustom(prompt: String): ParsedResponse {
+    /**
+     * Make a custom protocol request (OpenAI-compatible body, custom auth).
+     */
+    private suspend fun requestCustom(
+        prompt: String,
+        settings: RequestSettings,
+        purpose: ExchangePurpose
+    ): ParsedResponse {
         val cfg = custom ?: CustomProtocolConfig()
         val url = normalizeBaseUrl(baseUrl) + cfg.chatPath
         val m = model ?: "gpt-4o-mini"
+
         val payload = OpenAiChatRequest(
             model = m,
-            messages = listOf(OpenAiMessage(role = "user", content = prompt))
+            messages = listOf(OpenAiMessage(role = "user", content = prompt)),
+            temperature = settings.temperature,
+            max_tokens = settings.maxTokens,
+            top_p = settings.topP,
+            frequency_penalty = settings.frequencyPenalty,
+            presence_penalty = settings.presencePenalty,
+            stop = settings.stopSequences?.takeIf { it.isNotEmpty() }
         )
 
         Dev.info(log, "custom.request",
             "url" to url,
             "model" to m,
+            "purpose" to purpose.name,
+            "temperature" to settings.temperature,
+            "maxTokens" to settings.maxTokens,
             "promptLength" to prompt.length,
             "promptPreview" to Dev.preview(prompt, 200)
         )
@@ -392,13 +519,13 @@ class GenericLlmProvider(
                 "preview" to Dev.preview(rawResponse, 500)
             )
 
-            handleResponse(rawResponse, httpStatus, prompt)
+            handleResponse(rawResponse, httpStatus, prompt, purpose)
         } catch (e: Exception) {
-            handleRequestFailure(e, prompt)
+            handleRequestFailure(e, prompt, purpose)
         }
     }
 
-    // ---- Helpers ----
+    // ==================== Helpers ====================
 
     /**
      * Normalize base URL: trim trailing slashes, handle protocol.
@@ -415,55 +542,71 @@ class GenericLlmProvider(
         }
     }
 
-    // ---- Minimal DTOs (scoped/private) -------------------------------------
-    // Request DTOs are still needed for constructing payloads.
-    // Response DTOs can be removed once we confirm ResponseParser handles all cases.
+    // ==================== Request DTOs ====================
 
-    // OpenAI-compatible request
+    /**
+     * OpenAI-compatible chat request.
+     *
+     * Includes optional parameters that most OpenAI-compatible providers support.
+     * Null values are not serialized (explicitNulls = false in JSON config).
+     */
     @Serializable
     private data class OpenAiChatRequest(
         val model: String,
-        val messages: List<OpenAiMessage>
+        val messages: List<OpenAiMessage>,
+        val temperature: Double? = null,
+        val max_tokens: Int? = null,
+        val top_p: Double? = null,
+        val frequency_penalty: Double? = null,
+        val presence_penalty: Double? = null,
+        val stop: List<String>? = null
     )
+
     @Serializable
     private data class OpenAiMessage(
         val role: String,
         val content: String
     )
 
-    // Gemini request
+    /**
+     * Gemini request with optional generation config.
+     */
     @Serializable
     private data class GeminiRequest(
-        val contents: List<GeminiContent>
+        val contents: List<GeminiContent>,
+        val generationConfig: GeminiGenerationConfig? = null
     )
+
     @Serializable
     private data class GeminiContent(
         val parts: List<GeminiPart>
     )
+
     @Serializable
     private data class GeminiPart(
         val text: String? = null
     )
 
-    // ---- Legacy Response DTOs (TO BE REMOVED) ----
-    // Keeping these temporarily for reference. ResponseParser now handles parsing.
-    // TODO: Delete once confirmed working
-    /*
+    /**
+     * Gemini generation configuration.
+     *
+     * Maps our RequestSettings to Gemini's API format.
+     */
     @Serializable
-    private data class OpenAiChatResponse(
-        val choices: List<OpenAiChoice> = emptyList()
-    )
-    @Serializable
-    private data class OpenAiChoice(
-        val message: OpenAiMessage
-    )
-    @Serializable
-    private data class GeminiResponse(
-        val candidates: List<GeminiCandidate> = emptyList()
-    )
-    @Serializable
-    private data class GeminiCandidate(
-        val content: GeminiContent? = null
-    )
-    */
+    private data class GeminiGenerationConfig(
+        val temperature: Double? = null,
+        val maxOutputTokens: Int? = null,
+        val topP: Double? = null,
+        val topK: Int? = null,
+        val stopSequences: List<String>? = null
+    ) {
+        /** Check if any settings are configured (to avoid sending empty config). */
+        fun hasSettings(): Boolean {
+            return temperature != null ||
+                    maxOutputTokens != null ||
+                    topP != null ||
+                    topK != null ||
+                    !stopSequences.isNullOrEmpty()
+        }
+    }
 }

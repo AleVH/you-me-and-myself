@@ -50,7 +50,11 @@ object DevMode {
         "/dev-scenario2" to "Test heuristic response with correction option",
         "/dev-scenario3" to "Test low confidence response (immediate dialog)",
         "/dev-error" to "Test error response parsing",
-        "/dev-status" to "Show current dev mode status and config"
+        "/dev-status" to "Show current dev mode status and config",
+        "/dev-summary-test" to "Test summary pipeline on current file (dry-run, no API call)",
+        "/dev-summarize" to "Request summary for current file (makes API call if not dry-run)",
+        "/dev-summary-status" to "Show summary system status (mode, budget, queue)",
+        "/dev-summary-stop" to "Cancel all queued summaries and disable summarization"
     )
 
     /**

@@ -2,6 +2,7 @@
 package com.youmeandmyself.context.orchestrator
 
 import com.intellij.openapi.components.Service
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileManager
@@ -12,21 +13,34 @@ import com.intellij.openapi.vfs.newvfs.events.VFileDeleteEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileMoveEvent
 import com.intellij.util.messages.MessageBusConnection
+import com.youmeandmyself.context.orchestrator.config.SummaryConfigService
+import com.youmeandmyself.context.orchestrator.config.SummaryMode
+import com.youmeandmyself.dev.Dev
 import java.io.InputStream
 import java.security.MessageDigest
 
 /**
  * Project-level VFS watcher that keeps SummaryStore in sync with file changes.
  *
- * Responsibilities:
- *  - Listen to VFS events (create, content change, move/rename, delete).
- *  - Compute a stable content hash for changed files (cheap SHA-256 streaming).
- *  - Notify SummaryStore about changes so synopses/header samples refresh lazily.
+ * ## Responsibilities
  *
- * Notes:
- *  - We purposefully do NOT trigger immediate re-summarization here.
- *    SummaryStore will refresh on-demand (lazy) via getOrEnqueueSynopsis().
- *  - We ignore directories, symlinks, and binary/very large files heuristically.
+ * - Listen to VFS events (create, content change, move/rename, delete)
+ * - Compute a stable content hash for changed files (cheap SHA-256 streaming)
+ * - Notify SummaryStore about changes so synopses/header samples refresh lazily
+ *
+ * ## Phase 3 Changes
+ *
+ * Now checks [SummaryConfigService] before notifying SummaryStore:
+ * - Hash changes are ALWAYS tracked (staleness detection is free, no API call)
+ * - File deletions are ALWAYS handled (cache cleanup is free)
+ * - But we only log/track — actual summarization decisions are made by SummaryStore
+ *   when it checks config via evaluateAndEnqueue()
+ *
+ * ## Design Note
+ *
+ * We purposefully do NOT trigger immediate re-summarization here.
+ * SummaryStore will refresh on-demand (lazy) via getOrEnqueueSynopsis(),
+ * which checks config (mode, budget, scope, dry-run) before doing anything.
  */
 @Service(Service.Level.PROJECT)
 class VfsSummaryWatcher(
@@ -34,7 +48,13 @@ class VfsSummaryWatcher(
     private val summaryStore: SummaryStore
 ) {
 
-    // We keep a connection so it’s disposed with the project automatically.
+    private val log = Logger.getInstance(VfsSummaryWatcher::class.java)
+
+    /** Lazy reference to config service. */
+    private val configService: SummaryConfigService by lazy {
+        SummaryConfigService.getInstance(project)
+    }
+
     private val connection: MessageBusConnection = project.messageBus.connect()
 
     init {
@@ -53,8 +73,6 @@ class VfsSummaryWatcher(
                             }
                             is VFileMoveEvent -> {
                                 val vf = e.file ?: continue
-                                // treat move/rename like content-stable but path-changed;
-                                // we’ll mark stale on the new path to be safe
                                 onMovedOrRenamed(vf)
                             }
                             is VFileDeleteEvent -> {
@@ -63,7 +81,7 @@ class VfsSummaryWatcher(
                             }
                         }
                     } catch (_: Throwable) {
-                        // Swallow to avoid breaking the VFS pipeline; optionally log
+                        // Swallow to avoid breaking the VFS pipeline
                     }
                 }
             }
@@ -72,40 +90,49 @@ class VfsSummaryWatcher(
 
     private fun onCreated(vf: VirtualFile) {
         if (!isProcessable(vf)) return
-        val (hash, lang) = computeHashAndLang(vf) ?: return
-        // Mark “stale but usable” and let SummaryStore lazily refresh on demand
+        val (hash, _) = computeHashAndLang(vf) ?: return
+
+        // Always track hash changes — staleness detection is free
         summaryStore.onHashChange(vf.path, hash)
-        // We DO NOT auto enqueue here to avoid storms during mass imports
+
+        // Log if summarization is active (useful for dry-run visibility)
+        if (configService.isEnabled() && configService.getMode() == SummaryMode.SMART_BACKGROUND) {
+            Dev.info(log, "vfs.created.tracked",
+                "path" to vf.path,
+                "mode" to configService.getMode().name
+            )
+        }
     }
 
     private fun onContentChanged(vf: VirtualFile) {
         if (!isProcessable(vf)) return
         val (hash, _) = computeHashAndLang(vf) ?: return
+
+        // Always track hash changes
         summaryStore.onHashChange(vf.path, hash)
     }
 
     private fun onMovedOrRenamed(vf: VirtualFile) {
         if (!isProcessable(vf)) return
         val (hash, _) = computeHashAndLang(vf) ?: return
+
+        // Always track hash changes
         summaryStore.onHashChange(vf.path, hash)
     }
 
     private fun onDeleted(path: String) {
+        // Always handle deletions — cache cleanup is free
         summaryStore.onFileDeleted(path)
     }
 
-    // -------- Helpers --------
+    // -------- Helpers (unchanged from original) --------
 
     private fun isProcessable(vf: VirtualFile): Boolean {
         if (!vf.isValid || vf.isDirectory) return false
-        // Skip very large files (> 5 MB) to avoid heavy hashing on save
         val len = runCatching { vf.length }.getOrDefault(0L)
         if (len <= 0L || len > 5 * 1024 * 1024) return false
-
-        // Cheap binary-ish filter: if file type reports binary, skip
         if (vf.fileType.isBinary) return false
 
-        // Exclusions (match your orchestrator caps/exclusions policy)
         val path = vf.path
         if (path.contains("/.git/") ||
             path.contains("/.idea/") ||

@@ -14,11 +14,16 @@
                     factoryClass="com.youmeandmyself.ai.chat.ChatToolWindowFactory"
                     anchor="right"/>
 
-        <!-- Single settings page: AI Profiles -->
+        <!-- Settings page: AI Profiles -->
         <projectConfigurable instance="com.youmeandmyself.ai.settings.AiProfilesConfigurable"
                              displayName="YMM Assistant"
                              id="com.youmeandmyself.ai.settings"
                              parentId="tools"/>
+
+        <projectConfigurable instance="com.youmeandmyself.ai.settings.SummaryConfigurable"
+                             displayName="Summary"
+                             id="com.youmeandmyself.ai.settings.summary"
+                             parentId="com.youmeandmyself.ai.settings"/>
 
         <notificationGroup id="AI Plugin" displayType="BALLOON" isLogByDefault="true"/>
 
@@ -27,6 +32,15 @@
 
         <!-- Initialize storage system on project open -->
         <postStartupActivity implementation="com.youmeandmyself.storage.StorageInitializer"/>
+
+        <!-- Summary configuration service -->
+        <projectService serviceImplementation="com.youmeandmyself.context.orchestrator.config.SummaryConfigService"/>
+
+        <!-- Summary store for code summary caching and orchestration -->
+        <projectService serviceImplementation="com.youmeandmyself.context.orchestrator.SummaryStore"/>
+
+        <!-- VFS watcher for tracking file changes and summary staleness -->
+        <projectService serviceImplementation="com.youmeandmyself.context.orchestrator.VfsSummaryWatcher"/>
     </extensions>
 
     <actions>

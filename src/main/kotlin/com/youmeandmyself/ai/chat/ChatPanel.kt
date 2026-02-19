@@ -134,10 +134,6 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
     private val providerSelector = JComboBox<String>()
     private val summarySelector = JComboBox<String>()
 
-    private val attachContext = JCheckBox("Attach context").apply {
-        setToolTipText("Include IDE-derived context (language, frameworks, project structure, related files)")
-    }
-
     private val scope = CoroutineScope(Dispatchers.IO)
 
     private var stateDisposable: Disposable? = null
@@ -237,31 +233,9 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                 gbc.gridx = 0
                 gbc.gridy = 0
                 gbc.fill = GridBagConstraints.BOTH
-                gbc.weightx = 0.75
+                gbc.weightx = 1.0
                 gbc.weighty = 1.0
                 add(dropdownsPanel, gbc)
-
-                gbc.gridx = 1
-                gbc.fill = GridBagConstraints.NONE
-                gbc.weightx = 0.25
-                gbc.anchor = GridBagConstraints.CENTER
-
-                val checkboxPanel = JPanel().apply {
-                    layout = BoxLayout(this, BoxLayout.Y_AXIS)
-
-                    val checkboxWrapper = JPanel(FlowLayout(FlowLayout.CENTER, 0, 0))
-                    checkboxWrapper.add(attachContext.apply { text = "" })
-                    add(checkboxWrapper)
-
-                    val labelWrapper = JPanel(FlowLayout(FlowLayout.CENTER, 0, 0))
-                    labelWrapper.add(JBLabel("Attach context").apply {
-                        font = font.deriveFont(10f)
-                        foreground = Color.GRAY
-                    })
-                    add(labelWrapper)
-                }
-
-                add(checkboxPanel, gbc)
             }
 
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -301,7 +275,7 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
             }
         }
 
-        chatService.sendUserMessage(userInput, attachContext.isSelected)
+        chatService.sendUserMessage(userInput, true)
 
         val editorFile = FileEditorManager.getInstance(project).selectedFiles.firstOrNull()
 
@@ -315,9 +289,8 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         val isGenericExplain = listOf("what does this do", "explain", "analyze", "describe")
             .any { it in t }
 
-        val needContext = (attachContext.isSelected
-                || isContextLikelyUseful(userInput)
-                || refersToCurrentFile(userInput))
+        val needContext = isContextLikelyUseful(userInput)
+                || refersToCurrentFile(userInput)
                 || (isEditorCodeFile && isGenericExplain)
 
         Dev.info(log, "chat.ctx", "need" to needContext, "isEditorCodeFile" to isEditorCodeFile, "genericExplain" to isGenericExplain)

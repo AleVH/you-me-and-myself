@@ -21,6 +21,8 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.time.Instant
+import com.youmeandmyself.context.orchestrator.config.SummaryConfig
+import com.youmeandmyself.context.orchestrator.config.SummaryMode
 
 /**
  * LOCAL mode implementation of [StorageFacade].
@@ -968,5 +970,122 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
     companion object {
         fun getInstance(project: Project): LocalStorageFacade =
             project.getService(LocalStorageFacade::class.java)
+    }
+
+    // ── Summary Config (Phase 3) ──
+
+    /**
+     * Load the summary configuration for a project.
+     *
+     * Reads are safe without the Mutex (WAL mode allows concurrent reads).
+     *
+     * @param projectId The project's unique identifier
+     * @return The stored config, or null if no config row exists
+     */
+    override fun loadSummaryConfig(projectId: String): SummaryConfig? {
+        val database = db ?: return null
+
+        return try {
+            database.queryOne(
+                """SELECT mode, enabled, max_tokens_per_session, complexity_threshold,
+                   include_patterns, exclude_patterns, min_file_lines
+                   FROM summary_config WHERE project_id = ?""",
+                projectId
+            ) { rs ->
+                SummaryConfig(
+                    mode = SummaryMode.fromString(rs.getString("mode")),
+                    enabled = rs.getInt("enabled") == 1,
+                    maxTokensPerSession = rs.getObject("max_tokens_per_session") as? Int,
+                    tokensUsedSession = 0, // Always reset on load
+                    complexityThreshold = rs.getObject("complexity_threshold") as? Int,
+                    includePatterns = deserializePatternsHelper(rs.getString("include_patterns")),
+                    excludePatterns = deserializePatternsHelper(rs.getString("exclude_patterns")),
+                    minFileLines = rs.getObject("min_file_lines") as? Int,
+                    dryRun = true // Default safe; column to be added later if needed
+                )
+            }
+        } catch (e: Throwable) {
+            Dev.warn(log, "storage.load_summary_config.failed", e, "projectId" to projectId)
+            null
+        }
+    }
+
+    /**
+     * Save (upsert) the summary configuration for a project.
+     *
+     * Uses the writeMutex to maintain the single-writer model.
+     * This is a blocking call — summary config saves are infrequent
+     * (only on settings apply or kill switch toggle).
+     *
+     * @param projectId The project's unique identifier
+     * @param config The configuration to persist
+     */
+    override fun saveSummaryConfig(projectId: String, config: SummaryConfig) {
+        val database = db ?: run {
+            Dev.warn(log, "storage.save_summary_config.no_db", null, "projectId" to projectId)
+            return
+        }
+
+        try {
+            // Using runBlocking here is acceptable because:
+            // 1. Summary config saves are rare (settings apply, kill switch)
+            // 2. The write is tiny and fast
+            // 3. We need the Mutex to protect the single-writer model
+            kotlinx.coroutines.runBlocking {
+                writeMutex.withLock {
+                    database.execute(
+                        """INSERT OR REPLACE INTO summary_config
+                           (project_id, mode, enabled, max_tokens_per_session, tokens_used_session,
+                            complexity_threshold, include_patterns, exclude_patterns, min_file_lines)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        projectId,
+                        config.mode.name,
+                        if (config.enabled) 1 else 0,
+                        config.maxTokensPerSession,
+                        config.tokensUsedSession,
+                        config.complexityThreshold,
+                        serializePatternsHelper(config.includePatterns),
+                        serializePatternsHelper(config.excludePatterns),
+                        config.minFileLines
+                    )
+                }
+            }
+
+            Dev.info(log, "storage.save_summary_config.ok",
+                "projectId" to projectId,
+                "mode" to config.mode.name,
+                "enabled" to config.enabled
+            )
+        } catch (e: Throwable) {
+            Dev.warn(log, "storage.save_summary_config.failed", e, "projectId" to projectId)
+        }
+    }
+
+    // ── Helpers for pattern serialization ──
+
+    /**
+     * Serialize a list of patterns to JSON for SQLite storage.
+     * Returns null for empty lists.
+     */
+    private fun serializePatternsHelper(patterns: List<String>): String? {
+        if (patterns.isEmpty()) return null
+        return try {
+            json.encodeToString(patterns)
+        } catch (_: Throwable) {
+            patterns.joinToString(",")
+        }
+    }
+
+    /**
+     * Deserialize patterns from SQLite back to a list.
+     * Handles both JSON arrays and comma-separated fallback.
+     */
+    private fun deserializePatternsHelper(raw: String?): List<String> {
+        if (raw.isNullOrBlank()) return emptyList()
+        return try {
+            json.decodeFromString<List<String>>(raw)
+        } catch (_: Throwable) {
+            raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        }
     }
 }

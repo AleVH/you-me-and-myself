@@ -1,5 +1,6 @@
 package com.youmeandmyself.storage
 
+import com.youmeandmyself.context.orchestrator.config.SummaryConfig
 import com.youmeandmyself.storage.model.AiExchange
 import com.youmeandmyself.storage.model.ExchangeMetadata
 import com.youmeandmyself.storage.model.MetadataFilter
@@ -111,4 +112,22 @@ interface StorageFacade {
      * Current storage mode.
      */
     fun getMode(): StorageMode
+
+    // ── Summary Config ──
+
+    /**
+     * Load the summary configuration for a project.
+     *
+     * @param projectId The project's unique identifier
+     * @return The stored config, or null if no config exists yet
+     */
+    fun loadSummaryConfig(projectId: String): SummaryConfig?
+
+    /**
+     * Save (upsert) the summary configuration for a project.
+     *
+     * @param projectId The project's unique identifier
+     * @param config The configuration to persist
+     */
+    fun saveSummaryConfig(projectId: String, config: SummaryConfig)
 }
