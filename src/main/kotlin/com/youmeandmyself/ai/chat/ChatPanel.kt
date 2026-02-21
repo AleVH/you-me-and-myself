@@ -43,6 +43,9 @@ import com.youmeandmyself.ai.chat.service.ChatUIService
 import com.youmeandmyself.ai.chat.service.SwingChatService
 import com.youmeandmyself.ai.chat.service.SystemMessageType
 import com.youmeandmyself.dev.DevCommandHandler
+import com.youmeandmyself.storage.model.IdeContextCapture
+import com.youmeandmyself.storage.model.IdeContext
+import com.youmeandmyself.ai.library.LibraryPanelHolder
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 
@@ -73,35 +76,28 @@ import java.awt.GridBagLayout
 class ChatPanel(private val project: Project, private val onReady: ((Boolean) -> Unit)? = null) {
     private val log = Dev.logger(ChatPanel::class.java)
 
+    // ── Chat service (JCEF browser or Swing fallback) ────────────────────
+
     private val chatService: ChatUIService by lazy {
-        Dev.info(log, "chatpanel.service", "lazy_init_start" to true)
         try {
             BrowserChatService(project).apply {
-                Dev.info(log, "chatpanel.browser", "browser_service_created" to true)
                 setOnReady { isReady ->
-                    Dev.info(log, "chatpanel.browser_ready", "callback_called" to true, "isReady" to isReady)
                     cancelTimeout()
                     onReady?.invoke(isReady)
                 }
-            }.also {
-                it.getComponent()
-                Dev.info(log, "chatpanel.browser", "component_retrieved" to true)
-            }
+            }.also { it.getComponent() }
         } catch (e: Throwable) {
             Dev.error(log, "chatpanel.browser_failed", e, "falling_back" to true)
             cancelTimeout()
             onReady?.invoke(false)
             SwingChatService(project).also {
                 it.addSystemMessage("Enhanced chat unavailable - using basic mode")
-                Dev.info(log, "chatpanel.swing", "fallback_created" to true)
             }
         }
     }
 
-    /**
-     * Handles correction flow when response parsing uses heuristics.
-     * Decides when to show correction dialogs and manages format hint learning.
-     */
+    // ── Correction flow for heuristic-parsed responses ───────────────────
+
     private val correctionHelper: CorrectionFlowHelper by lazy {
         CorrectionFlowHelper(
             project = project,
@@ -110,12 +106,13 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         )
     }
 
-    /**
-     * Handles dev-only test commands. Only active when -Dymm.devMode=true.
-     */
+    // ── Dev commands (only active with -Dymm.devMode=true) ───────────────
+
     private val devCommandHandler: DevCommandHandler by lazy {
         DevCommandHandler(project, chatService, correctionHelper, scope)
     }
+
+    // ── UI components ────────────────────────────────────────────────────
 
     internal val root = JPanel(BorderLayout())
 
@@ -137,14 +134,30 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
     private val scope = CoroutineScope(Dispatchers.IO)
 
     private var stateDisposable: Disposable? = null
-
     private var readinessTimeout: Timer? = null
 
-    init {
-        Dev.info(log, "chatpanel.init", "start" to true)
+    // ── Combo box state ──────────────────────────────────────────────────
+    //
+    // These track the current items in each combo box so the ActionListeners
+    // (registered ONCE in init) can map selectedIndex → profile ID.
+    //
+    // The isRefreshing guard prevents listener callbacks during rebuild:
+    //   removeAllItems() triggers selection → null
+    //   addItem(x)       triggers selection → x
+    //   setSelectedIndex  triggers selection → final
+    // Without the guard, each of these fires the listener → writes to
+    // AiProfilesState → potentially triggers another refresh → loop.
 
+    private var isRefreshing = false
+    private var chatProfileItems: List<Pair<String, String>> = emptyList()
+    private var summaryProfileItems: List<Pair<String, String>> = emptyList()
+
+    // ── Initialization ───────────────────────────────────────────────────
+
+    init {
+        // Safety timeout: if JCEF never reports ready, unblock the UI
         readinessTimeout = Timer(5000) {
-            Dev.warn(log, "chatpanel.timeout", null,"readiness_timeout" to true)
+            Dev.warn(log, "chatpanel.timeout", null, "readiness_timeout" to true)
             onReady?.invoke(false)
         }.apply {
             isRepeats = false
@@ -153,20 +166,36 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
 
         root.layout = BorderLayout()
 
+        // Force lazy init of the chat service
         val service = chatService
-        Dev.info(log, "chatpanel.init", "service_created" to true)
 
         root.add(service.getComponent(), BorderLayout.CENTER)
         root.add(createInputPanel(), BorderLayout.SOUTH)
 
+        // Input actions
         send.addActionListener { doSend() }
         input.addActionListener { doSend() }
 
+        // Combo listeners registered ONCE — never re-added during refresh
+        providerSelector.addActionListener {
+            if (isRefreshing) return@addActionListener
+            val ps = AiProfilesState.getInstance(project)
+            val idx = providerSelector.selectedIndex
+            ps.selectedChatProfileId = if (idx in chatProfileItems.indices) chatProfileItems[idx].first else null
+        }
+
+        summarySelector.addActionListener {
+            if (isRefreshing) return@addActionListener
+            val ps = AiProfilesState.getInstance(project)
+            val idx = summarySelector.selectedIndex
+            ps.selectedSummaryProfileId = if (idx in summaryProfileItems.indices) summaryProfileItems[idx].first else null
+        }
+
+        // Initial population
         refreshProviderSelector()
         refreshSummarySelector()
 
-        Dev.info(log, "chatpanel.init", "complete" to true)
-
+        // Watch for profile changes (tool window state changes, settings edits)
         setupProfileObservation()
     }
 
@@ -175,11 +204,13 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         readinessTimeout = null
     }
 
+    // ── Profile observation ──────────────────────────────────────────────
+
     private fun setupProfileObservation() {
         val connection = project.messageBus.connect()
         stateDisposable = connection
 
-        project.messageBus.connect().subscribe(
+        connection.subscribe(
             com.intellij.openapi.wm.ex.ToolWindowManagerListener.TOPIC,
             object : com.intellij.openapi.wm.ex.ToolWindowManagerListener {
                 @Deprecated("Deprecated in Java")
@@ -199,6 +230,8 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
     fun dispose() {
         stateDisposable?.dispose()
     }
+
+    // ── Input panel layout ───────────────────────────────────────────────
 
     private fun createInputPanel(): JPanel {
         return JPanel(BorderLayout()).apply {
@@ -244,6 +277,127 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         }
     }
 
+    // ── Combo box refresh (guarded to prevent listener cascade) ──────────
+
+    /**
+     * Rebuild the chat provider combo box from current profiles.
+     *
+     * The isRefreshing guard suppresses ActionListener callbacks during
+     * item manipulation, preventing the feedback loop:
+     *   removeAllItems → triggers listener → writes state → triggers refresh → ...
+     */
+    private fun refreshProviderSelector() {
+        isRefreshing = true
+        try {
+            val ps = AiProfilesState.getInstance(project)
+
+            val chatProfiles = ps.profiles
+                .filter { it.roles.chat }
+                .filter { it.apiKey.isNotBlank() && it.baseUrl.isNotBlank() && it.model?.isNotBlank() == true }
+                .sortedByDescending { it.id }
+
+            Dev.info(log, "chat.filtered.profiles",
+                "beforeFilter" to ps.profiles.count { it.roles.chat },
+                "afterFilter" to chatProfiles.size)
+
+            providerSelector.removeAllItems()
+
+            if (chatProfiles.isEmpty()) {
+                providerSelector.addItem("(No chat profiles)")
+                providerSelector.isEnabled = false
+                send.isEnabled = false
+                input.isEnabled = false
+                input.emptyText.text = "No AI profiles available - configure in Settings"
+
+                chatProfileItems = emptyList()
+                return
+            }
+
+            // Build items list: (profileId, displayLabel)
+            chatProfileItems = chatProfiles.map { profile ->
+                profile.id to "${profile.label.ifBlank { "Generic LLM" }} [${profile.protocol?.name ?: "unknown"}]"
+            }
+            chatProfileItems.forEach { (_, label) -> providerSelector.addItem(label) }
+
+            // Restore or default selection
+            val currentId = ps.selectedChatProfileId
+            val selectedIdx = when {
+                currentId != null -> chatProfileItems.indexOfFirst { it.first == currentId }.takeIf { it >= 0 } ?: 0
+                chatProfileItems.isNotEmpty() -> 0
+                else -> -1
+            }
+
+            if (selectedIdx >= 0) {
+                providerSelector.selectedIndex = selectedIdx
+                // Persist selection if it changed (e.g., first run or previously-selected profile was deleted)
+                if (ps.selectedChatProfileId != chatProfileItems[selectedIdx].first) {
+                    ps.selectedChatProfileId = chatProfileItems[selectedIdx].first
+                }
+            }
+
+            send.isEnabled = true
+            input.isEnabled = true
+            providerSelector.isEnabled = true
+            input.emptyText.text = "Type a prompt…"
+
+            transcript.text = ""
+        } finally {
+            isRefreshing = false
+        }
+    }
+
+    /**
+     * Rebuild the summary provider combo box from current profiles.
+     * Same guarded pattern as refreshProviderSelector().
+     */
+    private fun refreshSummarySelector() {
+        isRefreshing = true
+        try {
+            val ps = AiProfilesState.getInstance(project)
+
+            val summaryProfiles = ps.profiles
+                .filter { it.roles.summary }
+                .filter { it.apiKey.isNotBlank() && it.baseUrl.isNotBlank() && it.model?.isNotBlank() == true }
+                .sortedByDescending { it.id }
+
+            summarySelector.removeAllItems()
+
+            if (summaryProfiles.isEmpty()) {
+                summarySelector.addItem("(No summary profiles)")
+                summarySelector.isEnabled = false
+                summaryProfileItems = emptyList()
+                return
+            }
+
+            // Build items list: (profileId, displayLabel)
+            summaryProfileItems = summaryProfiles.map { profile ->
+                profile.id to "${profile.label.ifBlank { "Generic LLM" }} [${profile.protocol?.name ?: "unknown"}]"
+            }
+            summaryProfileItems.forEach { (_, label) -> summarySelector.addItem(label) }
+
+            // Restore or default selection
+            val currentId = ps.selectedSummaryProfileId
+            val selectedIdx = when {
+                currentId != null -> summaryProfileItems.indexOfFirst { it.first == currentId }.takeIf { it >= 0 } ?: 0
+                summaryProfileItems.isNotEmpty() -> 0
+                else -> -1
+            }
+
+            if (selectedIdx >= 0) {
+                summarySelector.selectedIndex = selectedIdx
+                if (ps.selectedSummaryProfileId != summaryProfileItems[selectedIdx].first) {
+                    ps.selectedSummaryProfileId = summaryProfileItems[selectedIdx].first
+                }
+            }
+
+            summarySelector.isEnabled = true
+        } finally {
+            isRefreshing = false
+        }
+    }
+
+    // ── Message send ─────────────────────────────────────────────────────
+
     /**
      * Handles user input submission.
      *
@@ -259,9 +413,7 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         input.text = ""
 
         // Dev mode test commands (only active with -Dymm.devMode=true)
-        if (devCommandHandler.handleIfDevCommand(userInput)) {
-            return
-        }
+        if (devCommandHandler.handleIfDevCommand(userInput)) return
 
         // Handle special commands for response correction and debugging
         when {
@@ -279,8 +431,6 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
 
         val editorFile = FileEditorManager.getInstance(project).selectedFiles.firstOrNull()
 
-        Dev.info(log, "chat.send", "text" to Dev.preview(userInput), "editor" to Dev.fileName(editorFile))
-
         val isEditorCodeFile = editorFile?.extension?.lowercase() in setOf(
             "kt","kts","java","js","jsx","ts","tsx","py","php","rb","go","rs","c","cpp","h","cs","xml","json","yml","yaml"
         )
@@ -292,8 +442,6 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         val needContext = isContextLikelyUseful(userInput)
                 || refersToCurrentFile(userInput)
                 || (isEditorCodeFile && isGenericExplain)
-
-        Dev.info(log, "chat.ctx", "need" to needContext, "isEditorCodeFile" to isEditorCodeFile, "genericExplain" to isGenericExplain)
 
         scope.launch {
             val provider = ProviderRegistry.selectedChatProvider(project)
@@ -309,10 +457,6 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                 val effectivePrompt: String
 
                 if (needContext) {
-                    Dev.info(log, "chat.context_building",
-                        "userInput" to Dev.preview(userInput),
-                        "editorFile" to Dev.fileName(editorFile)
-                    )
                     if (DumbService.isDumb(project)) {
                         chatService.addAssistantMessage(
                             "This question requires project context, but the IDE is currently indexing files. " +
@@ -428,7 +572,7 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                 // Show thinking indicator while waiting for AI response
                 (chatService as? BrowserChatService)?.showThinking()
 
-                // Call provider - returns ParsedResponse
+                // Call provider — returns ParsedResponse
                 val result = provider.chat(effectivePrompt)
 
                 // Clear any previous correction context when new message arrives
@@ -443,12 +587,11 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                 val finalIsError: Boolean
 
                 when {
-                    // Scenario 3: Low confidence - ask user to pick correct content before displaying
+                    // Scenario 3: Low confidence — ask user to pick correct content before displaying
                     correctionHelper.shouldAskImmediately(result) && result.metadata.candidates.isNotEmpty() -> {
                         Dev.info(log, "chat.correction_flow",
                             "scenario" to 3,
-                            "confidence" to result.metadata.confidence.name,
-                            "candidates" to result.metadata.candidates.size
+                            "strategy" to result.metadata.parseStrategy.name
                         )
 
                         val corrected = correctionHelper.handleImmediateCorrection(
@@ -461,19 +604,18 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                             finalDisplayText = corrected.displayText
                             finalIsError = false
                         } else {
-                            // User cancelled - show best guess, store for potential post-correction
+                            // User cancelled — show best guess, store for potential post-correction
                             finalDisplayText = result.displayText
                             finalIsError = result.isError
                             correctionHelper.storeForPostCorrection(result, provider.id, modelId)
                         }
                     }
 
-                    // Scenario 2: Heuristic used but confident - show response with correction option
+                    // Scenario 2: Heuristic used but confident — show response with correction option
                     correctionHelper.shouldOfferPostCorrection(result) -> {
                         Dev.info(log, "chat.correction_flow",
                             "scenario" to 2,
-                            "confidence" to result.metadata.confidence.name,
-                            "candidates" to result.metadata.candidates.size
+                            "strategy" to result.metadata.parseStrategy.name
                         )
 
                         finalDisplayText = result.displayText
@@ -481,7 +623,7 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                         correctionHelper.storeForPostCorrection(result, provider.id, modelId)
                     }
 
-                    // Scenario 1: Known format - just display
+                    // Scenario 1: Known format — just display
                     else -> {
                         Dev.info(log, "chat.correction_flow",
                             "scenario" to 1,
@@ -513,16 +655,19 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                     "wasHeuristic" to result.metadata.wasHeuristicUsed
                 )
 
+                LibraryPanelHolder.get(project)?.refresh()
             } catch (t: Throwable) {
-                // Hide thinking indicator on error (it won't auto-hide since no assistant message is added before the error)
+                // Hide thinking indicator on error
                 (chatService as? BrowserChatService)?.hideThinking()
                 chatService.addAssistantMessage("Error: ${t.message}", null, true)
             }
         }
     }
 
+    // ── Correction commands ──────────────────────────────────────────────
+
     /**
-     * Handle /correct command - opens correction dialog for the last auto-detected response.
+     * Handle /correct command — opens correction dialog for the last auto-detected response.
      * Allows user to pick the correct content from ranked candidates.
      */
     private fun handleCorrectionCommand() {
@@ -537,22 +682,16 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         scope.launch {
             val corrected = correctionHelper.handlePostCorrection()
             if (corrected != null) {
-                chatService.addSystemMessage(
-                    "✓ Response corrected:",
-                    SystemMessageType.INFO
-                )
+                chatService.addSystemMessage("✓ Response corrected:", SystemMessageType.INFO)
                 chatService.addAssistantMessage(corrected.displayText, null, false)
             } else {
-                chatService.addSystemMessage(
-                    "Correction cancelled.",
-                    SystemMessageType.INFO
-                )
+                chatService.addSystemMessage("Correction cancelled.", SystemMessageType.INFO)
             }
         }
     }
 
     /**
-     * Handle /raw command - shows raw JSON of the last response for debugging.
+     * Handle /raw command — shows raw JSON of the last response for debugging.
      */
     private fun handleRawCommand() {
         val context = correctionHelper.lastCorrectionContext
@@ -573,6 +712,8 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         }
     }
 
+    // ── Context heuristics ───────────────────────────────────────────────
+
     /**
      * Heuristic to determine if the prompt likely benefits from project context.
      * Looks for code markers, error keywords, file paths, etc.
@@ -580,14 +721,17 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
     private fun isContextLikelyUseful(text: String): Boolean {
         val t = text.lowercase()
 
+        // Code fences
         if ("```" in t) return true
 
+        // Error/exception keywords
         val errorHints = listOf(
             "error", "exception", "traceback", "stack trace", "unresolved reference",
             "undefined", "cannot find symbol", "no such method", "classnotfound"
         )
         if (errorHints.any { it in t }) return true
 
+        // File extensions
         val extHints = listOf(
             ".kt", ".kts", ".java", ".js", ".ts", ".tsx", ".py", ".php", ".rb",
             ".go", ".rs", ".cpp", ".c", ".h", ".cs", ".xml", ".json", ".gradle",
@@ -596,17 +740,32 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         if (extHints.any { it in t }) return true
         if (Regex("""[\\/].+\.(\w{1,6})""").containsMatchIn(t)) return true
 
+        // Code keywords
         val codeHints = listOf(
             "import ", "package ", "class ", "interface ", "fun ", "def ",
             "require(", "include(", "from ", "new ", "extends ", "implements "
         )
         if (codeHints.any { it in t }) return true
 
+        // Short greetings — definitely no context needed
         val words = t.split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.size <= 3 && setOf("hi", "hello", "hey", "yo").any { it == t || t.startsWith(it) }) return false
 
         return false
     }
+
+    /**
+     * Detect deictic phrasing that clearly refers to the active file.
+     */
+    private fun refersToCurrentFile(text: String): Boolean {
+        val t = text.lowercase()
+        return listOf(
+            "this file", "explain this file", "walk me through this file",
+            "what does this file do", "analyze this file"
+        ).any { it in t }
+    }
+
+    // ── Swing text helpers (legacy fallback mode) ────────────────────────
 
     private fun appendUser(text: String) {
         appendBlock("You:", bold = true)
@@ -623,9 +782,7 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
         appendSpacer()
     }
 
-    private fun splitByTripleBackticks(s: String): List<String> {
-        return s.split("```")
-    }
+    private fun splitByTripleBackticks(s: String): List<String> = s.split("```")
 
     private fun appendBlock(text: String, bold: Boolean = false, isError: Boolean = false) {
         SwingUtilities.invokeLater {
@@ -648,218 +805,7 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
 
     private fun appendSpacer() = appendBlock("")
 
-    private fun hasValidChatProfiles(): Boolean {
-        val ps = AiProfilesState.getInstance(project)
-        return ps.profiles.any { profile ->
-            profile.roles.chat &&
-                    profile.apiKey.isNotBlank() &&
-                    profile.baseUrl.isNotBlank() &&
-                    profile.model?.isNotBlank() == true
-        }
-    }
-
-    private fun initProviderSelector() {
-        refreshProviderSelector()
-    }
-
-    private fun refreshProviderSelector() {
-        val ps = AiProfilesState.getInstance(project)
-
-        Dev.info(log, "chat.profiles.debug",
-            "allProfiles" to ps.profiles.size,
-            "profilesDetails" to ps.profiles.map {
-                "${it.label} (chat:${it.roles.chat}, summary:${it.roles.summary}, apiKey:${it.apiKey.isNotBlank()}, baseUrl:${it.baseUrl.isNotBlank()}, model:${it.model?.isNotBlank()})"
-            })
-
-        val chatProfiles = ps.profiles
-            .filter { it.roles.chat }
-            .filter { it.apiKey.isNotBlank() && it.baseUrl.isNotBlank() && it.model?.isNotBlank() == true }
-            .sortedByDescending { it.id }
-
-        Dev.info(log, "chat.filtered.profiles",
-            "beforeFilter" to ps.profiles.count { it.roles.chat },
-            "afterFilter" to chatProfiles.size)
-
-        providerSelector.removeAllItems()
-        summarySelector.removeAllItems()
-
-        val hasValidProfiles = chatProfiles.isNotEmpty()
-
-        if (!hasValidProfiles) {
-            providerSelector.addItem("(No chat profiles)")
-            providerSelector.isEnabled = false
-            send.isEnabled = false
-            input.isEnabled = false
-            input.emptyText.text = "No AI profiles available - configure in Settings"
-
-            summarySelector.removeAllItems()
-            summarySelector.addItem("(No summary profiles)")
-            summarySelector.isEnabled = false
-
-            appendAssistant("❌ No AI profiles configured\n\nTo use this plugin, please:\n1. Go to Settings/Preferences → YMM Assistant\n2. Create at least one AI profile with API credentials\n3. Enable the 'Chat' role for the profile\n\nOnce configured, the chat will be enabled automatically.", isError = true)
-            return
-        }
-
-        val items: List<Pair<String, String>> = chatProfiles.map { profile ->
-            profile.id to "${profile.label.ifBlank { "Generic LLM" }} [${profile.protocol?.name ?: "unknown"}]"
-        }
-        items.forEach { (_, label) -> providerSelector.addItem(label) }
-
-        val currentId = ps.selectedChatProfileId
-        val selectedIdx = when {
-            currentId != null -> items.indexOfFirst { it.first == currentId }.takeIf { it >= 0 } ?: 0
-            items.isNotEmpty() -> 0
-            else -> -1
-        }
-
-        if (selectedIdx >= 0) {
-            providerSelector.selectedIndex = selectedIdx
-            if (ps.selectedChatProfileId != items[selectedIdx].first) {
-                ps.selectedChatProfileId = items[selectedIdx].first
-            }
-        }
-
-        providerSelector.addActionListener {
-            val idx = providerSelector.selectedIndex
-            ps.selectedChatProfileId = if (idx in items.indices) items[idx].first else null
-        }
-
-        refreshSummarySelector()
-
-        send.isEnabled = true
-        input.isEnabled = true
-        providerSelector.isEnabled = true
-        input.emptyText.text = "Type a prompt…"
-
-        transcript.text = ""
-    }
-
-    private fun initSummarySelector() {
-        val ps = AiProfilesState.getInstance(project)
-        val profiles = ps.profiles
-
-        val summaryProfiles = profiles.filter { it.roles.summary }
-
-        if (summaryProfiles.isEmpty()) {
-            summarySelector.model = DefaultComboBoxModel(arrayOf("(no summary profiles)"))
-            summarySelector.isEnabled = false
-            return
-        }
-
-        val labels = summaryProfiles.map { it.labelOrFallback() }.toTypedArray()
-        summarySelector.model = DefaultComboBoxModel(labels)
-
-        val preferredId = ps.selectedSummaryProfileId
-            ?: ps.selectedChatProfileId
-            ?: summaryProfiles.first().id
-
-        summarySelector.selectedItem = idToLabel(summaryProfiles, preferredId)
-
-        summarySelector.addActionListener {
-            val chosenLabel = summarySelector.selectedItem as String
-            ps.selectedSummaryProfileId = labelToId(summaryProfiles, chosenLabel)
-        }
-    }
-
-    private fun refreshSummarySelector() {
-        val ps = AiProfilesState.getInstance(project)
-
-        val summaryProfiles = ps.profiles
-            .filter { it.roles.summary }
-            .filter { it.apiKey.isNotBlank() && it.baseUrl.isNotBlank() && it.model?.isNotBlank() == true }
-            .sortedByDescending { it.id }
-
-        summarySelector.removeAllItems()
-
-        val hasValidSummaryProfiles = summaryProfiles.isNotEmpty()
-
-        if (!hasValidSummaryProfiles) {
-            summarySelector.addItem("(No summary profiles)")
-            summarySelector.isEnabled = false
-            return
-        }
-
-        val items: List<Pair<String, String>> = summaryProfiles.map { profile ->
-            profile.id to "${profile.label.ifBlank { "Generic LLM" }} [${profile.protocol?.name ?: "unknown"}]"
-        }
-        items.forEach { (_, label) -> summarySelector.addItem(label) }
-
-        val currentId = ps.selectedSummaryProfileId
-        val selectedIdx = when {
-            currentId != null -> items.indexOfFirst { it.first == currentId }.takeIf { it >= 0 } ?: 0
-            items.isNotEmpty() -> 0
-            else -> -1
-        }
-
-        if (selectedIdx >= 0) {
-            summarySelector.selectedIndex = selectedIdx
-            if (ps.selectedSummaryProfileId != items[selectedIdx].first) {
-                ps.selectedSummaryProfileId = items[selectedIdx].first
-            }
-        }
-
-        summarySelector.addActionListener {
-            val idx = summarySelector.selectedIndex
-            ps.selectedSummaryProfileId = if (idx in items.indices) items[idx].first else null
-        }
-
-        summarySelector.isEnabled = true
-    }
-
-    private fun com.youmeandmyself.ai.settings.AiProfile.labelOrFallback(): String =
-        if (label.isNotBlank()) label else "(unnamed) [${providerId}]"
-
-    private fun idToLabel(
-        list: List<com.youmeandmyself.ai.settings.AiProfile>,
-        id: String?
-    ): String {
-        val found = list.firstOrNull { it.id == id } ?: list.first()
-        return found.labelOrFallback()
-    }
-
-    private fun labelToId(
-        list: List<com.youmeandmyself.ai.settings.AiProfile>,
-        label: String
-    ): String {
-        return list.first { it.labelOrFallback() == label }.id
-    }
-
-    /**
-     * Formats a compact context note from a ContextBundle for the model.
-     */
-    private fun formatContextNote(bundle: ContextBundle): String {
-        val lang = bundle.language?.languageId ?: "unknown"
-        val frameworks = bundle.frameworks.joinToString(", ") { f ->
-            if (f.version.isNullOrBlank()) f.name else "${f.name} ${f.version}"
-        }.ifBlank { "none" }
-        val build = bundle.projectStructure?.buildSystem ?: "unknown"
-        val modules = bundle.projectStructure?.modules?.joinToString(", ")?.ifBlank { null }
-
-        val filesLine = if (bundle.files.isNotEmpty()) {
-            val preview = bundle.files.take(5).joinToString("\n- ") { it.path }
-            val truncNote = if (bundle.truncatedCount > 0) " (truncated: ${bundle.truncatedCount})" else ""
-            "\nFiles: ${bundle.files.size}$truncNote (~${bundle.totalChars} chars)\n- $preview"
-        } else ""
-
-        val modulesLine = modules?.let { "\nModules: $it" } ?: ""
-        return """
-        [Context]
-        Language: $lang
-        Frameworks: $frameworks
-        Build: $build$modulesLine$filesLine
-    """.trimIndent()
-    }
-
-    /**
-     * Detect deictic phrasing that clearly refers to the active file.
-     */
-    private fun refersToCurrentFile(text: String): Boolean {
-        val t = text.lowercase()
-        return listOf(
-            "this file", "explain this file", "walk me through this file",
-            "what does this file do", "analyze this file"
-        ).any { it in t }
-    }
+    // ── File reading helpers ─────────────────────────────────────────────
 
     /**
      * Read editor file content with a safe cap, under ReadAction.
@@ -905,9 +851,37 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
             else -> ""
         }
     }
+
+    // ── Context formatting ───────────────────────────────────────────────
+
+    /**
+     * Formats a compact context note from a ContextBundle for the model.
+     */
+    private fun formatContextNote(bundle: ContextBundle): String {
+        val lang = bundle.language?.languageId ?: "unknown"
+        val frameworks = bundle.frameworks.joinToString(", ") { f ->
+            if (f.version.isNullOrBlank()) f.name else "${f.name} ${f.version}"
+        }.ifBlank { "none" }
+        val build = bundle.projectStructure?.buildSystem ?: "unknown"
+        val modules = bundle.projectStructure?.modules?.joinToString(", ")?.ifBlank { null }
+
+        val filesLine = if (bundle.files.isNotEmpty()) {
+            val preview = bundle.files.take(5).joinToString("\n- ") { it.path }
+            val truncNote = if (bundle.truncatedCount > 0) " (truncated: ${bundle.truncatedCount})" else ""
+            "\nFiles: ${bundle.files.size}$truncNote (~${bundle.totalChars} chars)\n- $preview"
+        } else ""
+
+        val modulesLine = modules?.let { "\nModules: $it" } ?: ""
+        return """
+        [Context]
+        Language: $lang
+        Frameworks: $frameworks
+        Build: $build$modulesLine$filesLine
+    """.trimIndent()
+    }
 }
 
-// --- helpers ---
+// ── Extension helpers ────────────────────────────────────────────────────
 
 private fun ContextBundle.manifestLine(): String {
     val raw = files.count { it.kind == ContextKind.RAW }

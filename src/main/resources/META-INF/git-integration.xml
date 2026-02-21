@@ -1,0 +1,3 @@
+<idea-plugin>
+    <!-- Enables git branch detection in IdeContextCapture when Git4Idea is available -->
+</idea-plugin>

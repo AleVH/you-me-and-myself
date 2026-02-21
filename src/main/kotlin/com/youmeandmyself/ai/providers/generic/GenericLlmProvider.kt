@@ -37,6 +37,10 @@ import com.youmeandmyself.storage.model.AiExchange
 import com.youmeandmyself.storage.model.ExchangePurpose
 import com.youmeandmyself.storage.model.ExchangeRequest
 import com.youmeandmyself.storage.model.ExchangeRawResponse
+import com.youmeandmyself.storage.model.ExchangeTokenUsage
+import com.youmeandmyself.storage.model.DerivedMetadata
+import com.youmeandmyself.storage.model.IdeContext
+import com.youmeandmyself.storage.model.IdeContextCapture
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -121,6 +125,18 @@ class GenericLlmProvider(
      */
     private val sessionId: String = UUID.randomUUID().toString()
 
+    /**
+     * IDE context captured at the moment the user sends a chat prompt.
+     *
+     * Set in chat() BEFORE the HTTP request, read in handleResponse() AFTER.
+     * This captures what the developer was looking at when they asked the question,
+     * not what they switched to while waiting for the response.
+     *
+     * Only relevant for CHAT exchanges — summaries are background tasks
+     * with no meaningful editor context.
+     */
+    private var capturedContext: IdeContext = IdeContext.empty()
+
     init {
         require(baseUrl.isNotBlank()) { "Base URL is required" }
     }
@@ -151,6 +167,17 @@ class GenericLlmProvider(
      */
     override suspend fun chat(prompt: String): ParsedResponse {
         val settings = chatSettings ?: RequestSettings.chatDefaults()
+
+        // Capture IDE state NOW, before the HTTP request.
+        // The caller (ChatPanel) is on EDT, so editor state is accessible.
+        // By the time the response comes back, the user may have switched files.
+        capturedContext = try {
+            IdeContextCapture.capture(project)
+        } catch (e: Exception) {
+            Dev.warn(log, "context.capture_failed", e)
+            IdeContext.empty()
+        }
+
         return when (protocol) {
             ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings, ExchangePurpose.CHAT)
             ApiProtocol.GEMINI        -> requestGemini(prompt, settings, ExchangePurpose.CHAT)
@@ -179,16 +206,19 @@ class GenericLlmProvider(
     // ==================== Unified Response Handling ====================
 
     /**
-     * Handle the raw HTTP response: save to storage, then parse.
+     * Handle the raw HTTP response: save to storage, parse, then index metadata.
      *
      * This is the single point where all protocol responses converge.
-     * Raw data is persisted BEFORE parsing to ensure nothing is lost.
+     * Flow:
+     * 1. Save raw data to storage IMMEDIATELY (safety net — nothing is lost)
+     * 2. Parse the response (extracts content, tokens, metadata)
+     * 3. Index extracted data back into SQLite:
+     *    a. Token usage (prompt, completion, total)
+     *    b. Assistant text (parsed response content)
+     *    c. Derived metadata (code blocks, topics, file paths, duplicate hash)
      *
-     * @param rawJson The raw response body (may be null on network error)
-     * @param httpStatus The HTTP status code (may be null on network error)
-     * @param prompt The original prompt (for storage)
-     * @param purpose CHAT or SUMMARY (affects how it's stored)
-     * @return ParsedResponse with extracted content or error information
+     * If step 3 fails, no data is lost — everything is in the raw JSONL
+     * and can be backfilled during a database rebuild.
      */
     private suspend fun handleResponse(
         rawJson: String?,
@@ -196,14 +226,54 @@ class GenericLlmProvider(
         prompt: String,
         purpose: ExchangePurpose
     ): ParsedResponse {
-        // Generate exchange ID for this request
         val exchangeId = UUID.randomUUID().toString()
 
-        // Save to storage IMMEDIATELY (before any parsing)
+        // Step 1: Save to storage IMMEDIATELY (before any parsing)
         saveToStorage(exchangeId, rawJson, httpStatus, prompt, purpose)
 
-        // Parse the response
+        // Step 2: Parse the response (extracts content, tokens, metadata)
         val parsed = ResponseParser.parse(rawJson, httpStatus, exchangeId)
+
+        // Step 3a: Index tokens
+        parsed.metadata.tokenUsage?.let { usage ->
+            val tokenUsage = ExchangeTokenUsage(
+                promptTokens = usage.promptTokens,
+                completionTokens = usage.completionTokens,
+                totalTokens = usage.totalTokens
+            )
+            try {
+                storage.updateTokenUsage(exchangeId, tokenUsage)
+            } catch (e: Exception) {
+                Dev.warn(log, "tokens.update_failed", e, "exchangeId" to exchangeId)
+            }
+        }
+
+        // Step 3b: Cache assistant text
+        val assistantText = parsed.rawText
+        if (!assistantText.isNullOrBlank()) {
+            try {
+                storage.cacheAssistantText(exchangeId, assistantText)
+            } catch (e: Exception) {
+                Dev.warn(log, "assistant_text.cache_failed", e, "exchangeId" to exchangeId)
+            }
+        }
+
+        // Step 3c: Extract and store derived metadata
+        try {
+            val derived = DerivedMetadata.extract(assistantText, prompt)
+            storage.updateDerivedMetadata(exchangeId, derived)
+        } catch (e: Exception) {
+            Dev.warn(log, "derived.update_failed", e, "exchangeId" to exchangeId)
+        }
+
+        // Step 3d: Store IDE context (only for CHAT — summaries have no editor context)
+        if (purpose == ExchangePurpose.CHAT && !capturedContext.isEmpty) {
+            try {
+                storage.updateIdeContext(exchangeId, capturedContext)
+            } catch (e: Exception) {
+                Dev.warn(log, "context.store_failed", e, "exchangeId" to exchangeId)
+            }
+        }
 
         // Log the result
         val logPrefix = if (purpose == ExchangePurpose.CHAT) "chat" else "summary"
@@ -218,7 +288,10 @@ class GenericLlmProvider(
                 "exchangeId" to exchangeId,
                 "strategy" to parsed.metadata.parseStrategy.name,
                 "confidence" to parsed.metadata.confidence.name,
-                "contentLength" to (parsed.rawText?.length ?: 0)
+                "contentLength" to (parsed.rawText?.length ?: 0),
+                "promptTokens" to parsed.metadata.tokenUsage?.promptTokens,
+                "completionTokens" to parsed.metadata.tokenUsage?.completionTokens,
+                "totalTokens" to parsed.metadata.tokenUsage?.totalTokens
             )
         }
 
@@ -230,6 +303,9 @@ class GenericLlmProvider(
      *
      * This happens BEFORE parsing so we never lose raw data.
      * Even if parsing fails, the raw response is preserved.
+     *
+     * Token columns are NULL at this point — they get filled in
+     * by updateTokenUsage() after parsing completes.
      *
      * @param exchangeId Unique ID for this exchange
      * @param rawJson The raw response JSON
@@ -259,7 +335,7 @@ class GenericLlmProvider(
                     json = rawJson ?: "",
                     httpStatus = httpStatus
                 ),
-                tokensUsed = null // TODO: extract from rawJson in Phase 4
+                tokenUsage = null  // Filled in after parsing via updateTokenUsage()
             )
 
             val savedId = storage.saveExchange(exchange, storage.resolveProjectId())

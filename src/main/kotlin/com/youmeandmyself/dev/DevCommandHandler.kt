@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import com.youmeandmyself.context.orchestrator.config.SummaryConfigService
 import com.youmeandmyself.context.orchestrator.SummaryStore
+import com.youmeandmyself.storage.model.IdeContextCapture
 
 /**
  * Handles dev-only test commands for exercising the correction flow.
@@ -79,6 +80,8 @@ class DevCommandHandler(
             command == "/dev-summarize" -> runSummarize()
             command == "/dev-summary-status" -> runSummaryStatus()
             command == "/dev-summary-stop" -> runSummaryStop()
+            command == "/dev-git-test" -> runGitTest()
+            command == "/dev-context-test" -> runContextTest()
             else -> {
                 chatService.addSystemMessage(
                     "Unknown dev command: $input\nType /dev-help to see available commands.",
@@ -464,5 +467,172 @@ class DevCommandHandler(
                     "Re-enable in Settings → Tools → YMM Assistant → Summary.",
             SystemMessageType.INFO
         )
+    }
+
+    /**
+     * Test git branch detection step by step.
+     *
+     * Reports exactly where the detection succeeds or fails, including
+     * the specific exception at each step. This helps diagnose why
+     * branch might be null in IdeContext.
+     */
+    private fun runGitTest() {
+        chatService.addSystemMessage(
+            "🧪 Testing Git Branch Detection",
+            SystemMessageType.INFO
+        )
+
+        val report = buildString {
+            // Step 1: Can we load the class?
+            appendLine("Step 1: Load git4idea.repo.GitRepositoryManager class")
+            val clazz = try {
+                val c = Class.forName("git4idea.repo.GitRepositoryManager")
+                appendLine("  ✅ Class found: ${c.name}")
+                c
+            } catch (e: ClassNotFoundException) {
+                appendLine("  ❌ Class not found — Git4Idea plugin may not be installed")
+                appendLine("  Error: ${e.message}")
+                null
+            } catch (e: Exception) {
+                appendLine("  ❌ Unexpected error loading class")
+                appendLine("  Error: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
+
+            if (clazz == null) {
+                appendLine()
+                appendLine("🔧 Fix: Add Git4Idea as optional dependency in plugin.xml:")
+                appendLine("  <depends optional=\"true\" config-file=\"git-integration.xml\">Git4Idea</depends>")
+                return@buildString
+            }
+
+            // Step 2: Can we get the service?
+            appendLine()
+            appendLine("Step 2: Get GitRepositoryManager service from project")
+            val manager = try {
+                val m = project.getService(clazz)
+                if (m != null) {
+                    appendLine("  ✅ Service instance obtained: ${m.javaClass.name}")
+                } else {
+                    appendLine("  ❌ getService returned null — service not registered for this project")
+                    appendLine("  This usually means Git4Idea plugin is installed but not active for this project")
+                }
+                m
+            } catch (e: Exception) {
+                appendLine("  ❌ getService failed")
+                appendLine("  Error: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
+
+            if (manager == null) return@buildString
+
+            // Step 3: Can we call getRepositories?
+            appendLine()
+            appendLine("Step 3: Call getRepositories()")
+            val repos = try {
+                val method = manager.javaClass.getMethod("getRepositories")
+                val result = method.invoke(manager) as? List<*>
+                appendLine("  ✅ Got ${result?.size ?: 0} repositories")
+                result?.forEachIndexed { i, repo ->
+                    appendLine("  [$i] ${repo?.javaClass?.simpleName}: $repo")
+                }
+                result
+            } catch (e: NoSuchMethodException) {
+                appendLine("  ❌ Method 'getRepositories' not found")
+                appendLine("  Error: ${e.message}")
+                appendLine("  Available methods: ${manager.javaClass.methods.map { it.name }.distinct().sorted().take(20)}")
+                null
+            } catch (e: Exception) {
+                appendLine("  ❌ Failed to invoke getRepositories")
+                appendLine("  Error: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
+
+            if (repos.isNullOrEmpty()) {
+                appendLine()
+                appendLine("  ⚠️ No git repositories found. Is the project root a git repo?")
+                appendLine("  Project basePath: ${project.basePath}")
+                return@buildString
+            }
+
+            // Step 4: Can we get the branch?
+            appendLine()
+            appendLine("Step 4: Get current branch from first repository")
+            val firstRepo = repos.first()!!
+            try {
+                val getBranch = firstRepo.javaClass.getMethod("getCurrentBranch")
+                val branch = getBranch.invoke(firstRepo)
+                if (branch != null) {
+                    val getName = branch.javaClass.getMethod("getName")
+                    val branchName = getName.invoke(branch) as? String
+                    appendLine("  ✅ Current branch: $branchName")
+                } else {
+                    appendLine("  ⚠️ getCurrentBranch() returned null")
+                    appendLine("  This can happen in detached HEAD state or during rebase")
+                }
+            } catch (e: NoSuchMethodException) {
+                appendLine("  ❌ Method not found on repository object")
+                appendLine("  Error: ${e.message}")
+                appendLine("  Repo class: ${firstRepo.javaClass.name}")
+                appendLine("  Available methods: ${firstRepo.javaClass.methods.map { it.name }.distinct().sorted().take(20)}")
+            } catch (e: Exception) {
+                appendLine("  ❌ Failed to get branch")
+                appendLine("  Error: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+
+        chatService.addSystemMessage(report, SystemMessageType.INFO)
+    }
+
+    /**
+     * Test the full IdeContext capture pipeline.
+     *
+     * Runs IdeContextCapture.capture() and displays everything it found:
+     * active file, all open files, language, module, git branch.
+     * Useful for verifying the capture works before sending a real chat.
+     */
+    private fun runContextTest() {
+        chatService.addSystemMessage(
+            "🧪 Testing IDE Context Capture",
+            SystemMessageType.INFO
+        )
+
+        val context = try {
+            IdeContextCapture.capture(project)
+        } catch (e: Exception) {
+            chatService.addSystemMessage(
+                "❌ Capture threw exception: ${e.javaClass.simpleName}: ${e.message}",
+                SystemMessageType.INFO
+            )
+            return
+        }
+
+        val report = buildString {
+            if (context.isEmpty) {
+                appendLine("⚠️ Context is empty — no editor state available")
+                appendLine()
+            }
+
+            appendLine("📄 Active file: ${context.activeFile ?: "(none)"}")
+            appendLine("🗣️ Language: ${context.language ?: "(unknown)"}")
+            appendLine("📦 Module: ${context.module ?: "(unknown)"}")
+            appendLine("🌿 Branch: ${context.branch ?: "(not detected)"}")
+            appendLine()
+
+            val openFiles = context.openFiles
+            if (openFiles.isNullOrEmpty()) {
+                appendLine("📑 Open tabs: (none besides active)")
+            } else {
+                appendLine("📑 Open tabs (${openFiles.size}):")
+                openFiles.forEachIndexed { i, path ->
+                    appendLine("  ${i + 1}. $path")
+                }
+            }
+
+            appendLine()
+            appendLine("isEmpty: ${context.isEmpty}")
+        }
+
+        chatService.addSystemMessage(report, SystemMessageType.INFO)
     }
 }

@@ -3,12 +3,14 @@ package com.youmeandmyself.storage
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.youmeandmyself.ai.providers.parsing.FormatDetector
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.model.AiExchange
 import com.youmeandmyself.storage.model.ExchangeMetadata
 import com.youmeandmyself.storage.model.ExchangePurpose
 import com.youmeandmyself.storage.model.ExchangeRawResponse
 import com.youmeandmyself.storage.model.ExchangeRequest
+import com.youmeandmyself.storage.model.ExchangeTokenUsage
 import com.youmeandmyself.storage.model.MetadataFilter
 import com.youmeandmyself.storage.search.SearchScope
 import com.youmeandmyself.storage.search.SimpleSearchEngine
@@ -23,6 +25,9 @@ import java.io.File
 import java.time.Instant
 import com.youmeandmyself.context.orchestrator.config.SummaryConfig
 import com.youmeandmyself.context.orchestrator.config.SummaryMode
+import com.youmeandmyself.storage.model.DerivedMetadata
+import com.youmeandmyself.storage.model.IdeContext
+import com.youmeandmyself.storage.JsonlRebuildService
 
 /**
  * LOCAL mode implementation of [StorageFacade].
@@ -136,6 +141,10 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      */
     private var mode: StorageMode = StorageMode.LOCAL
 
+    @Volatile
+    var isInitialized: Boolean = false
+        private set
+
     // ==================== Public API ====================
 
     /**
@@ -149,6 +158,11 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      *
      * The exchange is immediately persisted — no batching or delayed write.
      * This ensures data is safe even if the IDE crashes right after.
+     *
+     * Note: Token columns (prompt_tokens, completion_tokens, total_tokens) are
+     * initially NULL in the SQLite row. They get populated by [updateTokenUsage]
+     * after the response is parsed. This is the "save then index" pattern —
+     * raw data is safe immediately, tokens are indexed as a second step.
      *
      * @param exchange The complete exchange to store (must have a unique ID)
      * @param projectId The project this exchange belongs to
@@ -183,11 +197,14 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                     val rawFile = writeRawExchange(exchange, projectId, config)
 
                     // Step 4: Insert metadata into SQLite
+                    // Token columns are NULL here — filled by updateTokenUsage() after parsing
                     database.execute(
                         """
                         INSERT INTO chat_exchanges 
-                            (id, project_id, provider_id, model_id, purpose, timestamp, tokens_used, raw_file, raw_available)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                            (id, project_id, provider_id, model_id, purpose, timestamp,
+                             prompt_tokens, completion_tokens, total_tokens,
+                             raw_file, raw_available)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                         """.trimIndent(),
                         exchange.id,
                         projectId,
@@ -195,7 +212,9 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                         exchange.modelId,
                         exchange.purpose.name,
                         exchange.timestamp.toString(),
-                        exchange.tokensUsed,
+                        exchange.tokenUsage?.promptTokens,
+                        exchange.tokenUsage?.completionTokens,
+                        exchange.tokenUsage?.effectiveTotal,
                         rawFile
                     )
 
@@ -214,6 +233,59 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                         "projectId" to projectId
                     )
                     null
+                }
+            }
+        }
+    }
+
+    /**
+     * Update token usage for an existing exchange.
+     *
+     * Called after ResponseParser extracts token data from the raw response.
+     * The exchange row already exists (created by [saveExchange] with null tokens),
+     * this just fills in the token columns.
+     *
+     * This is the "index" step in the save-then-index pattern:
+     * 1. [saveExchange] → raw JSONL safe, SQLite row with null tokens
+     * 2. ResponseParser.parse() → extracts token counts from raw JSON
+     * 3. [updateTokenUsage] → fills in the SQLite token columns
+     *
+     * If this fails, no data is lost — tokens are still in the raw JSONL
+     * and can be backfilled later during a database rebuild.
+     *
+     * @param exchangeId The exchange to update (must already exist)
+     * @param tokenUsage The extracted token breakdown
+     */
+    suspend fun updateTokenUsage(exchangeId: String, tokenUsage: ExchangeTokenUsage) {
+        if (mode == StorageMode.OFF) return
+
+        withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                try {
+                    val database = requireDb()
+                    database.execute(
+                        """
+                        UPDATE chat_exchanges 
+                        SET prompt_tokens = ?, completion_tokens = ?, total_tokens = ?
+                        WHERE id = ?
+                        """.trimIndent(),
+                        tokenUsage.promptTokens,
+                        tokenUsage.completionTokens,
+                        tokenUsage.effectiveTotal,
+                        exchangeId
+                    )
+
+                    Dev.info(log, "tokens.indexed",
+                        "exchangeId" to exchangeId,
+                        "prompt" to tokenUsage.promptTokens,
+                        "completion" to tokenUsage.completionTokens,
+                        "total" to tokenUsage.effectiveTotal
+                    )
+                } catch (e: Exception) {
+                    // Non-fatal: tokens are still in raw JSONL, can be backfilled
+                    Dev.warn(log, "tokens.index_failed", e,
+                        "exchangeId" to exchangeId
+                    )
                 }
             }
         }
@@ -351,7 +423,8 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 val whereClause = if (conditions.isEmpty()) "" else "WHERE ${conditions.joinToString(" AND ")}"
                 val sql = """
                     SELECT id, project_id, provider_id, model_id, purpose, timestamp,
-                           tokens_used, raw_file, raw_available, flags, labels
+                           prompt_tokens, completion_tokens, total_tokens,
+                           raw_file, raw_available, flags, labels
                     FROM chat_exchanges
                     $whereClause
                     ORDER BY timestamp DESC
@@ -368,7 +441,11 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                         providerId = rs.getString("provider_id"),
                         modelId = rs.getString("model_id"),
                         purpose = ExchangePurpose.valueOf(rs.getString("purpose")),
-                        tokensUsed = rs.getInt("tokens_used").takeIf { !rs.wasNull() },
+                        tokenUsage = ExchangeTokenUsage(
+                            promptTokens = rs.getInt("prompt_tokens").takeIf { !rs.wasNull() },
+                            completionTokens = rs.getInt("completion_tokens").takeIf { !rs.wasNull() },
+                            totalTokens = rs.getInt("total_tokens").takeIf { !rs.wasNull() }
+                        ).takeIf { it.promptTokens != null || it.completionTokens != null || it.totalTokens != null },
                         flags = ExchangeMetadata.decodeSet(rs.getString("flags")),
                         labels = ExchangeMetadata.decodeSet(rs.getString("labels")),
                         rawFile = rs.getString("raw_file"),
@@ -646,11 +723,24 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 database.open()
                 db = database
 
-                // Step 3: Register this project
+                // Step 3: Rebuild SQLite index from JSONL files on disk.
+                // This is the "JSONL is truth" promise: if the DB was wiped
+                // (dev mode, corruption, migration), we reconstruct everything
+                // we can from the raw files. Fast no-op if DB already has data.
+                val rebuildService = JsonlRebuildService(database)
+                val stats = rebuildService.rebuildFromDirectory(config.root)
+                if (stats.imported > 0) {
+                    Dev.info(log, "rebuild.imported",
+                        "imported" to stats.imported,
+                        "files" to stats.filesScanned
+                    )
+                }
+
+                // Step 4: Register this project
                 val projectId = resolveProjectId()
                 ensureProjectRegistered(projectId, database)
 
-                // Step 4: Rebuild search index from available exchanges
+                // Step 5: Rebuild search index from available exchanges
                 rebuildSearchIndex(projectId, config, database)
 
                 Dev.info(log, "init.complete",
@@ -658,6 +748,8 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                     "storageRoot" to config.root.absolutePath,
                     "indexedCount" to searchEngine.indexSize()
                 )
+
+                isInitialized = true
             } catch (e: Exception) {
                 Dev.error(log, "init.failed", e)
             }
@@ -703,7 +795,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
 
         // Serialize to compact JSON and append as a single line.
         // Include projectId in the record for database rebuild capability.
-        val serializable = exchange.toJsonl(projectId)
+        val serializable = exchange.toJsonl(projectId, project.name)
         val jsonLine = json.encodeToString(serializable)
         file.appendText(jsonLine + "\n")
 
@@ -765,6 +857,36 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         return null
     }
 
+    // ==================== Token Backfill ====================
+
+    /**
+     * Attempt to extract token usage from a raw response JSON string.
+     *
+     * Used during database rebuild to backfill token data for exchanges
+     * that were saved before Phase 4 (or where the update step failed).
+     * Re-parses the raw JSON through FormatDetector, which knows how to
+     * find token usage in OpenAI, Gemini, and Anthropic response formats.
+     *
+     * @param rawJson The raw provider response JSON
+     * @return Extracted token usage, or null if not available
+     */
+    private fun backfillTokenUsage(rawJson: String?): ExchangeTokenUsage? {
+        if (rawJson.isNullOrBlank()) return null
+        return try {
+            val detection = FormatDetector.detect(rawJson)
+            detection.tokenUsage?.let { usage ->
+                ExchangeTokenUsage(
+                    promptTokens = usage.promptTokens,
+                    completionTokens = usage.completionTokens,
+                    totalTokens = usage.totalTokens
+                )
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "tokens.backfill_failed", e)
+            null
+        }
+    }
+
     // ==================== Project Registration ====================
 
     /**
@@ -807,50 +929,6 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      */
     fun resolveProjectId(): String = project.locationHash
 
-    // ==================== Search Index ====================
-
-    /**
-     * Rebuild the in-memory search index from all available JSONL files.
-     *
-     * This reads every exchange from every JSONL file for the project.
-     * It can be slow for large histories — future optimization: persist
-     * the search index itself (e.g., in SQLite FTS).
-     *
-     * Called during [initialize].
-     */
-    private suspend fun rebuildSearchIndex(projectId: String, config: StorageConfig, database: DatabaseHelper) {
-        val rawFiles = database.query(
-            """
-            SELECT DISTINCT raw_file FROM chat_exchanges
-            WHERE project_id = ? AND raw_available = 1
-            """.trimIndent(),
-            projectId
-        ) { rs -> rs.getString("raw_file") }
-
-        val exchanges = mutableListOf<AiExchange>()
-        for (rawFile in rawFiles) {
-            val file = config.chatFile(projectId, rawFile)
-            if (!file.exists()) continue
-
-            file.useLines { lines ->
-                for (line in lines) {
-                    if (line.isBlank()) continue
-                    try {
-                        val record = json.decodeFromString<JsonlExchange>(line)
-                        exchanges.add(record.toExchange())
-                    } catch (e: Exception) {
-                        Dev.warn(log, "index.rebuild.parse_error", e,
-                            "file" to rawFile,
-                            "linePreview" to Dev.preview(line, 100)
-                        )
-                    }
-                }
-            }
-        }
-
-        searchEngine.rebuildIndex(exchanges)
-    }
-
     // ==================== Internal Helpers ====================
 
     /**
@@ -880,19 +958,44 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      * Note: [projectId] is included in the JSONL record even though the file
      * is already inside a project-specific directory. This redundancy is intentional —
      * it makes each record self-describing and simplifies database rebuilds.
+     *
+     * ## Backward Compatibility
+     *
+     * Pre-Phase 4 records may have:
+     * - `tokensUsed: Int` (old single-integer format)
+     * - No `tokenUsage` block
+     *
+     * The [toExchange] method handles both cases:
+     * - If `tokenUsage` is present → use the breakdown directly
+     * - If only `tokensUsed` is present → map it to `totalTokens`
+     * - If neither → tokenUsage will be null (can be backfilled from rawResponse.json)
      */
     @Serializable
     data class JsonlExchange(
         val id: String,
         val projectId: String? = null,
+        val projectName: String? = null,
         val timestamp: String,
         val providerId: String,
         val modelId: String,
         val purpose: String,
         val request: JsonlRequest,
         val rawResponse: JsonlRawResponse,
+        // Phase 4: structured token breakdown
+        val tokenUsage: JsonlTokenUsage? = null,
+        // Legacy field — kept for backward compatibility with pre-Phase 4 JSONL records.
+        // New records write to tokenUsage instead. During deserialization, if tokenUsage
+        // is null but tokensUsed is present, we map tokensUsed → totalTokens.
         val tokensUsed: Int? = null
     ) {
+        /**
+         * Convert JSONL record back to domain model.
+         *
+         * Handles backward compatibility:
+         * - New records: tokenUsage block present → use directly
+         * - Legacy records: only tokensUsed Int → treat as totalTokens
+         * - Very old records: neither present → null (backfillable from rawResponse.json)
+         */
         fun toExchange(): AiExchange = AiExchange(
             id = id,
             timestamp = Instant.parse(timestamp),
@@ -901,8 +1004,35 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             purpose = ExchangePurpose.valueOf(purpose),
             request = request.toRequest(),
             rawResponse = rawResponse.toRawResponse(),
-            tokensUsed = tokensUsed
+            tokenUsage = tokenUsage?.toDomain()
+                ?: tokensUsed?.let { ExchangeTokenUsage(totalTokens = it) }
         )
+    }
+
+    /**
+     * Token usage breakdown for JSONL serialization.
+     *
+     * Mirrors [ExchangeTokenUsage] but is @Serializable for kotlinx.serialization.
+     */
+    @Serializable
+    data class JsonlTokenUsage(
+        val promptTokens: Int? = null,
+        val completionTokens: Int? = null,
+        val totalTokens: Int? = null
+    ) {
+        fun toDomain(): ExchangeTokenUsage = ExchangeTokenUsage(
+            promptTokens = promptTokens,
+            completionTokens = completionTokens,
+            totalTokens = totalTokens
+        )
+
+        companion object {
+            fun fromDomain(usage: ExchangeTokenUsage): JsonlTokenUsage = JsonlTokenUsage(
+                promptTokens = usage.promptTokens,
+                completionTokens = usage.completionTokens,
+                totalTokens = usage.totalTokens
+            )
+        }
     }
 
     @Serializable
@@ -944,9 +1074,10 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      *                  Included for self-describing records — even though the file
      *                  is already in a project-specific directory.
      */
-    private fun AiExchange.toJsonl(projectId: String? = null): JsonlExchange = JsonlExchange(
+    private fun AiExchange.toJsonl(projectId: String? = null, projectName: String? = null): JsonlExchange = JsonlExchange(
         id = id,
         projectId = projectId,
+        projectName = projectName,
         timestamp = timestamp.toString(),
         providerId = providerId,
         modelId = modelId,
@@ -964,8 +1095,125 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             json = rawResponse.json,
             httpStatus = rawResponse.httpStatus
         ),
-        tokensUsed = tokensUsed
+        tokenUsage = tokenUsage?.let { JsonlTokenUsage.fromDomain(it) },
+        tokensUsed = null  // Legacy field — not written by new code
     )
+
+    // ==================== Database Access for Services ====================
+
+    /**
+     * Provides writable database access for services (SearchService, BookmarkService).
+     * Replaces reflection hacks — this is the clean way for services to run SQL.
+     */
+    fun <T> withDatabase(block: (DatabaseHelper) -> T): T {
+        val database = db ?: throw IllegalStateException("Storage not initialized yet")
+        return block(database)
+    }
+
+    /**
+     * Read-only database access for query operations.
+     */
+    fun <T> withReadableDatabase(block: (DatabaseHelper) -> T): T {
+        val database = db ?: throw IllegalStateException("Storage not initialized yet")
+        return block(database)
+    }
+
+    // ==================== Library Support ====================
+
+    /**
+     * Stats for the Library tab footer and sidebar counts.
+     */
+    data class LibraryStats(
+        val totalExchanges: Int,
+        val totalBookmarks: Int,
+        val totalWithCode: Int,
+        val totalTokens: Long
+    )
+
+    fun getLibraryStats(): LibraryStats {
+        if (mode == StorageMode.OFF) return LibraryStats(0, 0, 0, 0)
+
+        return try {
+            val database = db ?: return LibraryStats(0, 0, 0, 0)
+            val projectId = resolveProjectId()
+
+            val total = database.queryOne(
+                "SELECT COUNT(*) as cnt FROM chat_exchanges WHERE project_id = ?", projectId
+            ) { rs -> rs.getInt("cnt") } ?: 0
+
+            val bookmarked = database.queryOne(
+                "SELECT COUNT(*) as cnt FROM chat_exchanges WHERE project_id = ? AND flags LIKE '%BOOKMARKED%'", projectId
+            ) { rs -> rs.getInt("cnt") } ?: 0
+
+            val withCode = database.queryOne(
+                "SELECT COUNT(*) as cnt FROM chat_exchanges WHERE project_id = ? AND has_code_block = 1", projectId
+            ) { rs -> rs.getInt("cnt") } ?: 0
+
+            val totalTokens = database.queryOne(
+                "SELECT COALESCE(SUM(total_tokens), 0) as total FROM chat_exchanges WHERE project_id = ? AND total_tokens IS NOT NULL", projectId
+            ) { rs -> rs.getLong("total") } ?: 0L
+
+            LibraryStats(total, bookmarked, withCode, totalTokens)
+        } catch (e: Exception) {
+            Dev.error(log, "library_stats.failed", e)
+            LibraryStats(0, 0, 0, 0)
+        }
+    }
+
+    /**
+     * Full exchange detail for the Library detail panel.
+     */
+    data class FullExchange(
+        val id: String,
+        val profileName: String?,
+        val userPrompt: String?,
+        val assistantText: String?,
+        val timestamp: Instant,
+        val tokensUsed: Int?,
+        val hasCode: Boolean,
+        val languages: List<String>,
+        val topics: List<String>,
+        val filePaths: List<String>,
+        val ideContextFile: String?,
+        val ideContextBranch: String?,
+        val openFiles: List<String>
+    )
+
+    fun getFullExchange(exchangeId: String): FullExchange? {
+        if (mode == StorageMode.OFF) return null
+
+        return try {
+            val database = db ?: return null
+            database.queryOne(
+                """
+                SELECT id, model_id, assistant_text, timestamp, total_tokens,
+                       has_code_block, code_languages, detected_topics, file_paths,
+                       context_file, context_branch, open_files
+                FROM chat_exchanges WHERE id = ?
+                """.trimIndent(),
+                exchangeId
+            ) { rs ->
+                FullExchange(
+                    id = rs.getString("id"),
+                    profileName = rs.getString("model_id"),
+                    userPrompt = null, // user prompt is in JSONL, not cached in SQLite
+                    assistantText = rs.getString("assistant_text"),
+                    timestamp = Instant.parse(rs.getString("timestamp")),
+                    tokensUsed = rs.getInt("total_tokens").takeIf { !rs.wasNull() },
+                    hasCode = rs.getInt("has_code_block") == 1,
+                    languages = rs.getString("code_languages")?.split(",")?.filter { it.isNotBlank() } ?: emptyList(),
+                    topics = rs.getString("detected_topics")?.split(",")?.filter { it.isNotBlank() } ?: emptyList(),
+                    filePaths = rs.getString("file_paths")?.split(",")?.filter { it.isNotBlank() } ?: emptyList(),
+                    ideContextFile = rs.getString("context_file"),
+                    ideContextBranch = rs.getString("context_branch"),
+                    openFiles = rs.getString("open_files")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
+                )
+            }
+        } catch (e: Exception) {
+            Dev.error(log, "full_exchange.failed", e, "exchangeId" to exchangeId)
+            null
+        }
+    }
 
     companion object {
         fun getInstance(project: Project): LocalStorageFacade =
@@ -1087,5 +1335,353 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         } catch (_: Throwable) {
             raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }
         }
+    }
+
+    // ==================== Assistant Text ====================
+
+    /**
+     * Cache parsed assistant text in SQLite.
+     *
+     * Called after ResponseParser extracts the response content.
+     * This avoids re-parsing the raw JSON every time the Library
+     * needs to display a response preview or run a text search.
+     *
+     * @param exchangeId The exchange to update
+     * @param assistantText The parsed response text
+     */
+    suspend fun cacheAssistantText(exchangeId: String, assistantText: String) {
+        if (mode == StorageMode.OFF) return
+
+        withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                try {
+                    val database = requireDb()
+                    database.execute(
+                        "UPDATE chat_exchanges SET assistant_text = ? WHERE id = ?",
+                        assistantText, exchangeId
+                    )
+                    Dev.info(log, "assistant_text.cached",
+                        "exchangeId" to exchangeId,
+                        "length" to assistantText.length
+                    )
+                } catch (e: Exception) {
+                    Dev.warn(log, "assistant_text.cache_failed", e,
+                        "exchangeId" to exchangeId
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Get assistant text for an exchange, with lazy loading from JSONL.
+     *
+     * Flow:
+     * 1. Check SQLite (fast path — already cached)
+     * 2. If NULL → read raw JSON from JSONL → re-parse → cache in SQLite
+     * 3. If JSONL also fails → return null
+     *
+     * After the first access, subsequent reads are instant from SQLite.
+     *
+     * @param exchangeId The exchange ID
+     * @param projectId The project ID (needed for JSONL file lookup)
+     * @return The assistant text, or null if not available
+     */
+    suspend fun getAssistantText(exchangeId: String, projectId: String): String? {
+        if (mode == StorageMode.OFF) return null
+
+        return withContext(Dispatchers.IO) {
+            try {
+                val database = requireDb()
+
+                // Step 1: Check SQLite cache
+                val cached = database.queryOne(
+                    "SELECT assistant_text FROM chat_exchanges WHERE id = ?",
+                    exchangeId
+                ) { rs -> rs.getString("assistant_text") }
+
+                if (cached != null) return@withContext cached
+
+                // Step 2: Lazy load from JSONL
+                Dev.info(log, "assistant_text.lazy_load", "exchangeId" to exchangeId)
+
+                val exchange = getExchange(exchangeId, projectId) ?: return@withContext null
+                val rawJson = exchange.rawResponse.json
+                if (rawJson.isBlank()) return@withContext null
+
+                // Re-parse through ResponseParser to extract content
+                val parsed = com.youmeandmyself.ai.providers.parsing.ResponseParser.parse(
+                    rawJson, exchange.rawResponse.httpStatus, exchangeId
+                )
+                val assistantText = parsed.rawText
+
+                // Step 3: Cache for next time
+                if (!assistantText.isNullOrBlank()) {
+                    writeMutex.withLock {
+                        database.execute(
+                            "UPDATE chat_exchanges SET assistant_text = ? WHERE id = ?",
+                            assistantText, exchangeId
+                        )
+                    }
+                    Dev.info(log, "assistant_text.lazy_cached",
+                        "exchangeId" to exchangeId,
+                        "length" to assistantText.length
+                    )
+                }
+
+                assistantText
+            } catch (e: Exception) {
+                Dev.warn(log, "assistant_text.get_failed", e, "exchangeId" to exchangeId)
+                null
+            }
+        }
+    }
+
+// ==================== Derived Metadata ====================
+
+    /**
+     * Store derived metadata for an exchange.
+     *
+     * Called after assistant text is extracted, during the save pipeline.
+     * Also called during database rebuild to backfill from JSONL.
+     *
+     * @param exchangeId The exchange to update
+     * @param derived The extracted metadata
+     */
+    suspend fun updateDerivedMetadata(exchangeId: String, derived: DerivedMetadata) {
+        if (mode == StorageMode.OFF) return
+
+        withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                try {
+                    val database = requireDb()
+                    database.execute(
+                        """
+                    UPDATE chat_exchanges SET
+                        has_code_block = ?,
+                        code_languages = ?,
+                        has_command = ?,
+                        has_stacktrace = ?,
+                        detected_topics = ?,
+                        file_paths = ?,
+                        duplicate_hash = ?
+                    WHERE id = ?
+                    """.trimIndent(),
+                        if (derived.hasCodeBlock) 1 else 0,
+                        derived.codeLanguages.joinToString(",").ifBlank { null },
+                        if (derived.hasCommand) 1 else 0,
+                        if (derived.hasStacktrace) 1 else 0,
+                        derived.detectedTopics.joinToString(",").ifBlank { null },
+                        derived.filePaths.joinToString(",").ifBlank { null },
+                        derived.duplicateHash,
+                        exchangeId
+                    )
+                    Dev.info(log, "derived.stored",
+                        "exchangeId" to exchangeId,
+                        "hasCode" to derived.hasCodeBlock,
+                        "languages" to derived.codeLanguages,
+                        "topics" to derived.detectedTopics,
+                        "duplicateHash" to derived.duplicateHash?.take(16)
+                    )
+                } catch (e: Exception) {
+                    Dev.warn(log, "derived.store_failed", e, "exchangeId" to exchangeId)
+                }
+            }
+        }
+    }
+
+// ==================== IDE Context ====================
+
+    /**
+     * Store IDE context for an exchange.
+     *
+     * Called at chat-send time with the captured IDE state.
+     *
+     * @param exchangeId The exchange to update
+     * @param context The captured IDE context
+     */
+    suspend fun updateIdeContext(exchangeId: String, context: IdeContext) {
+        if (mode == StorageMode.OFF || context.isEmpty) return
+
+        withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                try {
+                    val database = requireDb()
+                    // Store open files as comma-separated paths (same pattern as code_languages)
+                    val openFilesStr = context.openFiles?.joinToString(",")
+                    database.execute(
+                        """
+                    UPDATE chat_exchanges SET
+                        context_file = ?,
+                        context_language = ?,
+                        context_module = ?,
+                        context_branch = ?,
+                        open_files = ?
+                    WHERE id = ?
+                    """.trimIndent(),
+                        context.activeFile,
+                        context.language,
+                        context.module,
+                        context.branch,
+                        openFilesStr,
+                        exchangeId
+                    )
+                    Dev.info(log, "context.stored",
+                        "exchangeId" to exchangeId,
+                        "file" to context.activeFile,
+                        "openFiles" to (context.openFiles?.size ?: 0),
+                        "branch" to context.branch
+                    )
+                } catch (e: Exception) {
+                    Dev.warn(log, "context.store_failed", e, "exchangeId" to exchangeId)
+                }
+            }
+        }
+    }
+
+// ==================== Duplicate Detection ====================
+
+    /**
+     * Find exchanges with the same prompt hash.
+     *
+     * Used for "you asked this before" feature.
+     *
+     * @param duplicateHash SHA-256 hash of the normalized prompt
+     * @param excludeId Exchange ID to exclude (the current one)
+     * @return List of matching exchange metadata, newest first
+     */
+    suspend fun findDuplicatePrompts(duplicateHash: String, excludeId: String? = null): List<ExchangeMetadata> {
+        if (mode == StorageMode.OFF) return emptyList()
+
+        return withContext(Dispatchers.IO) {
+            try {
+                val database = requireDb()
+                val sql = if (excludeId != null) {
+                    "SELECT * FROM chat_exchanges WHERE duplicate_hash = ? AND id != ? ORDER BY timestamp DESC LIMIT 10"
+                } else {
+                    "SELECT * FROM chat_exchanges WHERE duplicate_hash = ? ORDER BY timestamp DESC LIMIT 10"
+                }
+                val params = if (excludeId != null) arrayOf<Any?>(duplicateHash, excludeId) else arrayOf<Any?>(duplicateHash)
+
+                database.query(sql, *params) { rs ->
+                    ExchangeMetadata(
+                        id = rs.getString("id"),
+                        projectId = rs.getString("project_id"),
+                        timestamp = Instant.parse(rs.getString("timestamp")),
+                        providerId = rs.getString("provider_id"),
+                        modelId = rs.getString("model_id"),
+                        purpose = ExchangePurpose.valueOf(rs.getString("purpose")),
+                        tokenUsage = ExchangeTokenUsage(
+                            promptTokens = rs.getInt("prompt_tokens").takeIf { !rs.wasNull() },
+                            completionTokens = rs.getInt("completion_tokens").takeIf { !rs.wasNull() },
+                            totalTokens = rs.getInt("total_tokens").takeIf { !rs.wasNull() }
+                        ).takeIf { it.promptTokens != null || it.completionTokens != null || it.totalTokens != null },
+                        flags = ExchangeMetadata.decodeSet(rs.getString("flags")),
+                        labels = ExchangeMetadata.decodeSet(rs.getString("labels")),
+                        rawFile = rs.getString("raw_file"),
+                        rawDataAvailable = rs.getInt("raw_available") == 1
+                    )
+                }
+            } catch (e: Exception) {
+                Dev.error(log, "duplicates.find_failed", e, "hash" to duplicateHash)
+                emptyList()
+            }
+        }
+    }
+
+// ==================== Updated Rebuild ====================
+
+    /**
+     * REPLACE the existing rebuildSearchIndex() with this version.
+     *
+     * Changes from previous:
+     * - Populates assistant_text cache during rebuild
+     * - Extracts and stores derived metadata during rebuild
+     * - Backfills token usage (unchanged from Phase 4)
+     */
+    private suspend fun rebuildSearchIndex(projectId: String, config: StorageConfig, database: DatabaseHelper) {
+        val rawFiles = database.query(
+            """
+        SELECT DISTINCT raw_file FROM chat_exchanges
+        WHERE project_id = ? AND raw_available = 1
+        """.trimIndent(),
+            projectId
+        ) { rs -> rs.getString("raw_file") }
+
+        val exchanges = mutableListOf<AiExchange>()
+        for (rawFile in rawFiles) {
+            val file = config.chatFile(projectId, rawFile)
+            if (!file.exists()) continue
+
+            file.useLines { lines ->
+                for (line in lines) {
+                    if (line.isBlank()) continue
+                    try {
+                        val record = json.decodeFromString<JsonlExchange>(line)
+                        val exchange = record.toExchange()
+
+                        // Backfill token usage if missing
+                        val finalExchange = if (exchange.tokenUsage == null) {
+                            val backfilled = backfillTokenUsage(exchange.rawResponse.json)
+                            if (backfilled != null) {
+                                exchange.copy(tokenUsage = backfilled)
+                            } else {
+                                exchange
+                            }
+                        } else {
+                            exchange
+                        }
+
+                        // Cache assistant text if not yet in SQLite
+                        val existingText = database.queryOne(
+                            "SELECT assistant_text FROM chat_exchanges WHERE id = ?",
+                            exchange.id
+                        ) { rs -> rs.getString("assistant_text") }
+
+                        if (existingText == null) {
+                            val parsed = com.youmeandmyself.ai.providers.parsing.ResponseParser.parse(
+                                exchange.rawResponse.json, exchange.rawResponse.httpStatus, exchange.id
+                            )
+                            val assistantText = parsed.rawText
+                            if (!assistantText.isNullOrBlank()) {
+                                database.execute(
+                                    "UPDATE chat_exchanges SET assistant_text = ? WHERE id = ?",
+                                    assistantText, exchange.id
+                                )
+
+                                // Also extract and store derived metadata
+                                val derived = DerivedMetadata.extract(assistantText, exchange.request.input)
+                                database.execute(
+                                    """
+                                UPDATE chat_exchanges SET
+                                    has_code_block = ?, code_languages = ?, has_command = ?,
+                                    has_stacktrace = ?, detected_topics = ?, file_paths = ?,
+                                    duplicate_hash = ?
+                                WHERE id = ?
+                                """.trimIndent(),
+                                    if (derived.hasCodeBlock) 1 else 0,
+                                    derived.codeLanguages.joinToString(",").ifBlank { null },
+                                    if (derived.hasCommand) 1 else 0,
+                                    if (derived.hasStacktrace) 1 else 0,
+                                    derived.detectedTopics.joinToString(",").ifBlank { null },
+                                    derived.filePaths.joinToString(",").ifBlank { null },
+                                    derived.duplicateHash,
+                                    exchange.id
+                                )
+                            }
+                        }
+
+                        exchanges.add(finalExchange)
+                    } catch (e: Exception) {
+                        Dev.warn(log, "index.rebuild.parse_error", e,
+                            "file" to rawFile,
+                            "linePreview" to Dev.preview(line, 100)
+                        )
+                    }
+                }
+            }
+        }
+
+        searchEngine.rebuildIndex(exchanges)
     }
 }

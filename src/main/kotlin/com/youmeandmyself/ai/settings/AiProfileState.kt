@@ -443,7 +443,6 @@ class AiProfilesState : PersistentStateComponent<AiProfilesState.State> {
     var profiles: MutableList<AiProfile>
         get() = state.profiles
         set(value) {
-            Dev.info(log, "state.profiles.set", "count" to value.size)
             state.profiles = value
         }
 
@@ -451,7 +450,6 @@ class AiProfilesState : PersistentStateComponent<AiProfilesState.State> {
     var selectedChatProfileId: String?
         get() = state.selectedChatProfileId
         set(value) {
-            Dev.info(log, "state.chatId.set", "id" to value)
             state.selectedChatProfileId = value
         }
 
@@ -459,7 +457,6 @@ class AiProfilesState : PersistentStateComponent<AiProfilesState.State> {
     var selectedSummaryProfileId: String?
         get() = state.selectedSummaryProfileId
         set(value) {
-            Dev.info(log, "state.summaryId.set", "id" to value)
             state.selectedSummaryProfileId = value
         }
 
@@ -467,17 +464,7 @@ class AiProfilesState : PersistentStateComponent<AiProfilesState.State> {
      * Called by IntelliJ when persisting state.
      * Returns the current state for XML serialization.
      */
-    override fun getState(): State {
-        Dev.info(log, "state.getState", "currentProfilesSize" to state.profiles.size)
-        state.profiles.forEachIndexed { i, profile ->
-            Dev.info(log, "state.currentProfile",
-                "index" to i,
-                "label" to profile.label,
-                "id" to profile.id
-            )
-        }
-        return state
-    }
+    override fun getState(): State = state
 
     /**
      * Called by IntelliJ when loading persisted state.
@@ -508,10 +495,6 @@ class AiProfilesState : PersistentStateComponent<AiProfilesState.State> {
         }
 
         if (validProfiles.size != incoming.profiles.size) {
-            Dev.info(log, "state.cleaningEmptyProfiles",
-                "before" to incoming.profiles.size,
-                "after" to validProfiles.size
-            )
             incoming.profiles.clear()
             incoming.profiles.addAll(validProfiles)
         }
@@ -525,14 +508,8 @@ class AiProfilesState : PersistentStateComponent<AiProfilesState.State> {
                     "gemini" -> ApiProtocol.GEMINI
                     else -> ApiProtocol.OPENAI_COMPAT
                 }
-                Dev.info(log, "state.migration.protocol",
-                    "profile" to p.label,
-                    "protocol" to p.protocol
-                )
             }
         }
-
-        Dev.info(log, "state.loadState.complete", "finalProfilesSize" to state.profiles.size)
     }
 
     companion object {
@@ -541,7 +518,6 @@ class AiProfilesState : PersistentStateComponent<AiProfilesState.State> {
          */
         fun getInstance(project: Project): AiProfilesState {
             val instance = project.service<AiProfilesState>()
-            Dev.info(Dev.logger(AiProfilesState::class.java), "state.getInstance", "instance" to instance.hashCode())
             return instance
         }
     }

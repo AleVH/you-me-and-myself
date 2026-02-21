@@ -16,6 +16,13 @@ import java.time.Instant
  * - Flags and labels are stored as comma-separated strings in SQLite
  *   (simpler than JSON arrays, easy to query with LIKE)
  *
+ * ## What Changed in Phase 4
+ *
+ * - Replaced [tokensUsed: Int?] with [tokenUsage: ExchangeTokenUsage?]
+ *   to carry the full breakdown (prompt, completion, total) from SQLite.
+ *   Null when no token data is available (pre-Phase 4 exchanges or providers
+ *   that don't report usage).
+ *
  * ## Relationship to SQLite
  *
  * Maps directly to the `chat_exchanges` table. The facade converts between
@@ -27,7 +34,7 @@ import java.time.Instant
  * @param providerId AI provider identifier (e.g., "deepseek")
  * @param modelId Model identifier (e.g., "deepseek-chat")
  * @param purpose What the exchange was for (CHAT, SUMMARY, etc.)
- * @param tokensUsed Token count if known, null otherwise
+ * @param tokenUsage Token breakdown (prompt, completion, total) if known, null otherwise
  * @param flags User-applied flags (starred, archived, etc.)
  * @param labels User-applied labels (freeform strings)
  * @param rawFile JSONL filename containing the full content
@@ -40,7 +47,7 @@ data class ExchangeMetadata(
     val providerId: String,
     val modelId: String,
     val purpose: ExchangePurpose,
-    val tokensUsed: Int?,
+    val tokenUsage: ExchangeTokenUsage?,
     val flags: MutableSet<String>,
     val labels: MutableSet<String>,
     val rawFile: String,

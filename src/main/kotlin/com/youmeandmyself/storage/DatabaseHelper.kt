@@ -2,6 +2,7 @@ package com.youmeandmyself.storage
 
 import com.intellij.openapi.diagnostic.Logger
 import com.youmeandmyself.dev.Dev
+import com.youmeandmyself.dev.DevMode
 import java.io.File
 import java.sql.Connection
 import java.sql.DriverManager
@@ -259,6 +260,24 @@ class DatabaseHelper(private val dbFile: File) {
     private fun createSchema(conn: Connection) {
         conn.createStatement().use { stmt ->
 
+            // DEV MODE: Wipe and recreate tables when schema is evolving.
+            // This is safe because JSONL is the source of truth — the database
+            // can always be rebuilt. In production, Dev.isEnabled is false and
+            // this block is skipped entirely.
+            if (DevMode.isEnabled()) {
+                Dev.info(log, "db.schema.dev_wipe", "reason" to "dev mode active, ensuring clean schema")
+                stmt.execute("DROP TABLE IF EXISTS bookmark_tags")
+                stmt.execute("DROP TABLE IF EXISTS bookmarks")
+                stmt.execute("DROP TABLE IF EXISTS collections")
+                stmt.execute("DROP TABLE IF EXISTS summary_config")
+                stmt.execute("DROP TABLE IF EXISTS summary_hierarchy")
+                stmt.execute("DROP TABLE IF EXISTS summaries")
+                stmt.execute("DROP TABLE IF EXISTS chat_exchanges")
+                stmt.execute("DROP TABLE IF EXISTS code_elements")
+                stmt.execute("DROP TABLE IF EXISTS storage_config")
+                stmt.execute("DROP TABLE IF EXISTS projects")
+            }
+
             // ── Table 1: projects ──
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS projects (
@@ -272,6 +291,17 @@ class DatabaseHelper(private val dbFile: File) {
             """.trimIndent())
 
             // ── Table 2: chat_exchanges ──
+            // Phase 4: Replaced single `tokens_used INTEGER` with three columns
+            // Phase 4: Token breakdown (prompt, completion, total)
+            // Phase 4A: assistant_text (lazy-cached parsed response)
+            //           derived metadata (code blocks, topics, file paths, duplicate hash)
+            //           IDE context (active file, language, module, branch)
+            //
+            // This enables:
+            // - Per-exchange cost visibility in the UI
+            // - Chat vs summary token aggregation (via GROUP BY purpose)
+            // - Token budget tracking for enterprise customers
+            //
             // Note: flags and labels are stored as comma-separated strings.
             // These columns are not in the original schema doc but are needed
             // to support the existing updateMetadata(flags, labels) API from v1.
@@ -279,22 +309,42 @@ class DatabaseHelper(private val dbFile: File) {
             // a separate join table (unlike bookmark_tags which are user-facing).
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS chat_exchanges (
-                    id            TEXT PRIMARY KEY,
-                    project_id    TEXT NOT NULL REFERENCES projects(id),
-                    provider_id   TEXT NOT NULL,
-                    model_id      TEXT NOT NULL,
-                    purpose       TEXT NOT NULL,
-                    timestamp     TEXT NOT NULL,
-                    tokens_used   INTEGER,
-                    flags         TEXT NOT NULL DEFAULT '',
-                    labels        TEXT NOT NULL DEFAULT '',
-                    raw_file      TEXT NOT NULL,
-                    raw_available INTEGER NOT NULL DEFAULT 1
+                    id                TEXT PRIMARY KEY,
+                    project_id        TEXT NOT NULL REFERENCES projects(id),
+                    provider_id       TEXT NOT NULL,
+                    model_id          TEXT NOT NULL,
+                    purpose           TEXT NOT NULL,
+                    timestamp         TEXT NOT NULL,
+                    prompt_tokens     INTEGER,
+                    completion_tokens INTEGER,
+                    total_tokens      INTEGER,
+                    assistant_text    TEXT,
+                    flags             TEXT NOT NULL DEFAULT '',
+                    labels            TEXT NOT NULL DEFAULT '',
+                    raw_file          TEXT NOT NULL,
+                    raw_available     INTEGER NOT NULL DEFAULT 1,
+                    -- Derived metadata (populated at ingest or lazily)
+                    has_code_block    INTEGER,
+                    code_languages    TEXT,
+                    has_command        INTEGER,
+                    has_stacktrace    INTEGER,
+                    detected_topics   TEXT,
+                    file_paths        TEXT,
+                    duplicate_hash    TEXT,
+                    -- IDE context (captured at chat time)
+                    context_file      TEXT,
+                    context_language  TEXT,
+                    context_module    TEXT,
+                    context_branch    TEXT,
+                    open_files        TEXT
                 )
             """.trimIndent())
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_project ON chat_exchanges(project_id)")
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_timestamp ON chat_exchanges(timestamp)")
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_purpose ON chat_exchanges(purpose)")
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_duplicate ON chat_exchanges(duplicate_hash)")
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_has_code ON chat_exchanges(has_code_block)")
+
 
             // ── Table 3: code_elements ──
             stmt.execute("""

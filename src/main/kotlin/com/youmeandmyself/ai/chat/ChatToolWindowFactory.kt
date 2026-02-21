@@ -1,55 +1,11 @@
-// File: src/main/kotlin/com/youmeandmyself/ai/chat/ChatToolWindowFactory.kt
-// path: src/main/kotlin/com/youmeandmyself/ai/chat/ChatToolWindowFactory.kt — Registers the tool window
-//package com.youmeandmyself.ai.chat
-//
-//import com.intellij.openapi.project.DumbAware
-//import com.intellij.openapi.project.Project
-//import com.intellij.openapi.wm.ToolWindow
-//import com.intellij.openapi.wm.ToolWindowFactory
-//
-//class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
-//    override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
-//        val loadingPanel = createLoadingPanel()
-//        val content = toolWindow.contentManager.factory.createContent(loadingPanel, "", false)
-//        toolWindow.contentManager.addContent(content)
-//
-//        // Initialize chat panel asynchronously
-//        CoroutineScope(Dispatchers.IO).launch {
-//            val chatPanel = ChatPanel(project) { onReady ->
-//                if (onReady) {
-//                    // Swap to real chat UI when ready
-//                    withContext(Dispatchers.Main) {
-//                        content.component = chatPanel.component
-//                        content.revalidate()
-//                        content.repaint()
-//                    }
-//                }
-//            }
-//        }
-//    }
-//
-//    private fun createLoadingPanel(): JComponent {
-//        return JPanel(BorderLayout()).apply {
-//            add(JLabel("Loading chat...", SwingConstants.CENTER))
-//        }
-//    }
-//}
-//
-////class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
-////    override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
-////        val panel = ChatPanel(project)
-////        val content = toolWindow.contentManager.factory.createContent(panel.component, "", false)
-////        toolWindow.contentManager.addContent(content)
-////    }
-////}
-
-// File: src/main/kotlin/com/youmeandmyself/ai/chat/ChatToolWindowFactory.kt
 package com.youmeandmyself.ai.chat
 
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
+import com.youmeandmyself.ai.library.LibraryPanel
+import com.youmeandmyself.ai.library.LibraryPanelHolder
 import com.youmeandmyself.dev.Dev
 import java.awt.BorderLayout
 import javax.swing.*
@@ -61,8 +17,9 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         Dev.info(log, "toolwindow.create", "start" to true)
 
         val loadingPanel = createLoadingPanel()
-        val content = toolWindow.contentManager.factory.createContent(loadingPanel, "", false)
-        toolWindow.contentManager.addContent(content)
+        val chatContent = toolWindow.contentManager.factory.createContent(loadingPanel, "Chat", false)
+        chatContent.isCloseable = false
+        toolWindow.contentManager.addContent(chatContent)
 
         // Initialize chat panel asynchronously using SwingWorker
         val worker = object : SwingWorker<ChatPanel, Void>() {
@@ -93,11 +50,22 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 
             override fun done() {
                 Dev.info(log, "toolwindow.worker", "done" to true)
-                // This will trigger the callback above
             }
         }
         worker.execute()
         Dev.info(log, "toolwindow.create", "worker_executed" to true)
+
+        // Library tab
+        try {
+            val libraryPanel = LibraryPanel(project, toolWindow.disposable)
+            val libraryContent = toolWindow.contentManager.factory.createContent(libraryPanel, "Library", false)
+            libraryContent.isCloseable = false
+            toolWindow.contentManager.addContent(libraryContent)
+            LibraryPanelHolder.set(project, libraryPanel)
+            Dev.info(log, "toolwindow.library", "added" to true)
+        } catch (e: Throwable) {
+            Dev.error(log, "toolwindow.library_failed", e)
+        }
     }
 
     private fun createLoadingPanel(): JPanel {

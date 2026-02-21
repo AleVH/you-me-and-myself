@@ -7,6 +7,7 @@
     <description>Generic multi-provider AI scaffold with connectivity test.</description>
 
     <depends>com.intellij.modules.platform</depends>
+    <depends optional="true" config-file="git-integration.xml">Git4Idea</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <!-- Registers the YMM Chat tool window -->
@@ -41,6 +42,10 @@
 
         <!-- VFS watcher for tracking file changes and summary staleness -->
         <projectService serviceImplementation="com.youmeandmyself.context.orchestrator.VfsSummaryWatcher"/>
+
+        <!-- Phase 4A: Search and bookmark services for Library tab -->
+        <projectService serviceImplementation="com.youmeandmyself.storage.search.SearchService"/>
+        <projectService serviceImplementation="com.youmeandmyself.storage.BookmarkService"/>
     </extensions>
 
     <actions>
@@ -61,8 +66,8 @@
                 text="Send Test Prompt to OpenAI"
                 description="Sends a simple prompt to OpenAI and shows the reply">
             <add-to-group group-id="com.youmeandmyself.ai.toolsGroup"
-                      anchor="last"
-                      action-id="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"/>
+                          anchor="last"
+                          action-id="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"/>
         </action>
 
         <action id="com.youmeandmyself.ai.actions.SendTestPromptToGeminiAction"

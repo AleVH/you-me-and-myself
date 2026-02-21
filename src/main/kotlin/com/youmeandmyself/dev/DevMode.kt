@@ -54,7 +54,9 @@ object DevMode {
         "/dev-summary-test" to "Test summary pipeline on current file (dry-run, no API call)",
         "/dev-summarize" to "Request summary for current file (makes API call if not dry-run)",
         "/dev-summary-status" to "Show summary system status (mode, budget, queue)",
-        "/dev-summary-stop" to "Cancel all queued summaries and disable summarization"
+        "/dev-summary-stop" to "Cancel all queued summaries and disable summarization",
+        "/dev-git-test" to "Test git branch detection step by step",
+        "/dev-context-test" to "Test full IDE context capture (file, tabs, language, module, branch)"
     )
 
     /**

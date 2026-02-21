@@ -1,0 +1,1581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Library</title>
+    <style>
+        /* ========================================================================
+           DESIGN TOKENS — IntelliJ Darcula compatible
+           ======================================================================== */
+        :root {
+            --bg-primary: #1e1e1e;
+            --bg-secondary: #252526;
+            --bg-tertiary: #2d2d2d;
+            --bg-hover: #37373d;
+            --bg-active: #094771;
+            --bg-input: #3c3c3c;
+            --border: #3c3c3c;
+            --border-focus: #007acc;
+            --text-primary: #cccccc;
+            --text-secondary: #969696;
+            --text-muted: #6a6a6a;
+            --text-accent: #4fc1ff;
+            --text-link: #4fc1ff;
+            --accent: #007acc;
+            --accent-hover: #1a8ad4;
+            --bookmark-star: #e8a317;
+            --tag-bg: #2d4a3e;
+            --tag-text: #73c991;
+            --code-bg: #1a1a2e;
+            --code-text: #ce9178;
+            --success: #73c991;
+            --warning: #e8a317;
+            --danger: #f44747;
+            --scrollbar-thumb: #424242;
+            --scrollbar-track: transparent;
+            --chip-bg: #3c3c3c;
+            --chip-active-bg: #094771;
+            --chip-active-border: #007acc;
+            --shadow: 0 2px 8px rgba(0,0,0,0.3);
+            --radius: 6px;
+            --radius-sm: 4px;
+            --transition: 150ms ease;
+        }
+
+        /* ========================================================================
+           RESET & BASE
+           ======================================================================== */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body {
+            height: 100%;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            font-size: 13px;
+            color: var(--text-primary);
+            background: var(--bg-primary);
+            overflow: hidden;
+        }
+
+        /* ========================================================================
+           LAYOUT — 3-column: sidebar | main list | detail preview
+           ======================================================================== */
+        .library-root {
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* --- SIDEBAR (Collections) --- */
+        .sidebar {
+            width: 200px;
+            min-width: 160px;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .sidebar-header {
+            padding: 12px 14px 8px;
+            font-weight: 600;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .sidebar-header button {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 16px;
+            padding: 2px 4px;
+            border-radius: var(--radius-sm);
+            line-height: 1;
+        }
+        .sidebar-header button:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+
+        .sidebar-nav {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px 6px;
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 10px;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            color: var(--text-primary);
+            font-size: 13px;
+            transition: background var(--transition);
+            user-select: none;
+        }
+        .nav-item:hover { background: var(--bg-hover); }
+        .nav-item.active { background: var(--bg-active); color: #fff; }
+        .nav-item .icon { font-size: 15px; width: 20px; text-align: center; flex-shrink: 0; }
+        .nav-item .label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .nav-item .count {
+            font-size: 11px;
+            color: var(--text-muted);
+            background: var(--bg-tertiary);
+            padding: 1px 6px;
+            border-radius: 8px;
+            min-width: 20px;
+            text-align: center;
+        }
+        .nav-item.active .count { background: rgba(255,255,255,0.15); color: rgba(255,255,255,0.8); }
+
+        .nav-divider {
+            height: 1px;
+            background: var(--border);
+            margin: 6px 10px;
+        }
+
+        /* --- MAIN AREA --- */
+        .main-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-width: 0;
+        }
+
+        /* Search bar */
+        .search-bar {
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            background: var(--bg-secondary);
+        }
+
+        .search-input-wrap {
+            flex: 1;
+            position: relative;
+        }
+        .search-input-wrap .search-icon {
+            position: absolute;
+            left: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+            font-size: 14px;
+            pointer-events: none;
+        }
+        .search-input {
+            width: 100%;
+            padding: 7px 10px 7px 32px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--text-primary);
+            font-size: 13px;
+            outline: none;
+            transition: border-color var(--transition);
+        }
+        .search-input::placeholder { color: var(--text-muted); }
+        .search-input:focus { border-color: var(--border-focus); }
+
+        .search-btn {
+            padding: 7px 12px;
+            background: var(--accent);
+            border: none;
+            border-radius: var(--radius);
+            color: #fff;
+            font-size: 12px;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: background var(--transition);
+        }
+        .search-btn:hover { background: var(--accent-hover); }
+
+        /* Filter chips */
+        .filter-bar {
+            padding: 6px 14px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            align-items: center;
+            background: var(--bg-secondary);
+            min-height: 36px;
+        }
+
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 10px;
+            background: var(--chip-bg);
+            border: 1px solid transparent;
+            border-radius: 12px;
+            font-size: 11px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            user-select: none;
+            transition: all var(--transition);
+            white-space: nowrap;
+        }
+        .chip:hover { background: var(--bg-hover); color: var(--text-primary); }
+        .chip.active {
+            background: var(--chip-active-bg);
+            border-color: var(--chip-active-border);
+            color: #fff;
+        }
+        .chip .chip-x {
+            font-size: 10px;
+            margin-left: 2px;
+            opacity: 0.6;
+        }
+        .chip.active .chip-x:hover { opacity: 1; }
+
+        .filter-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-right: 4px;
+        }
+
+        /* Date filter inputs */
+        .date-filter {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            margin-left: 8px;
+            padding-left: 8px;
+            border-left: 1px solid var(--border);
+        }
+        .date-filter label {
+            font-size: 10px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+        .date-filter input[type="date"] {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-secondary);
+            font-size: 10px;
+            padding: 2px 4px;
+            height: 22px;
+            outline: none;
+            font-family: inherit;
+        }
+        .date-filter input[type="date"]:focus {
+            border-color: var(--chip-active-border);
+        }
+        .date-filter input[type="date"]::-webkit-calendar-picker-indicator {
+            filter: invert(0.7);
+            cursor: pointer;
+            font-size: 10px;
+        }
+        .date-clear {
+            font-size: 10px;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 2px 4px;
+            border-radius: 4px;
+            opacity: 0;
+            transition: opacity var(--transition);
+        }
+        .date-clear.visible {
+            opacity: 1;
+        }
+        .date-clear:hover {
+            color: var(--text-primary);
+            background: var(--bg-hover);
+        }
+
+        /* Results info bar */
+        .results-bar {
+            padding: 5px 14px;
+            font-size: 11px;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-primary);
+            display: flex;
+            justify-content: space-between;
+        }
+
+        /* Exchange list */
+        .exchange-list {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+
+        .exchange-item {
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            transition: background var(--transition);
+            display: flex;
+            gap: 10px;
+            align-items: flex-start;
+        }
+        .exchange-item:hover { background: var(--bg-hover); }
+        .exchange-item.selected { background: var(--bg-active); }
+
+        .exchange-bookmark-col {
+            flex-shrink: 0;
+            width: 20px;
+            padding-top: 2px;
+        }
+        .bookmark-star {
+            cursor: pointer;
+            font-size: 16px;
+            color: var(--text-muted);
+            transition: color var(--transition);
+            user-select: none;
+        }
+        .bookmark-star:hover { color: var(--bookmark-star); }
+        .bookmark-star.active { color: var(--bookmark-star); }
+
+        .exchange-content {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .exchange-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 3px;
+        }
+        .exchange-profile {
+            font-size: 11px;
+            color: var(--text-accent);
+            font-weight: 500;
+        }
+        .exchange-time {
+            font-size: 11px;
+            color: var(--text-muted);
+            flex-shrink: 0;
+        }
+
+        .exchange-prompt {
+            font-size: 13px;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-bottom: 3px;
+            font-weight: 500;
+        }
+
+        .exchange-response-preview {
+            font-size: 12px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-bottom: 4px;
+        }
+
+        .exchange-meta {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .meta-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+        }
+        .meta-badge.code { background: var(--code-bg); color: var(--code-text); }
+        .meta-badge.lang { background: #1a2a3e; color: #6cb6ff; }
+        .meta-badge.topic { background: #2d2d1e; color: #dcdcaa; }
+        .meta-badge.tokens { background: var(--bg-tertiary); color: var(--text-muted); }
+
+        .match-reasons {
+            display: flex;
+            gap: 3px;
+        }
+        .match-tag {
+            font-size: 9px;
+            padding: 1px 4px;
+            border-radius: 2px;
+            background: #1e3a1e;
+            color: var(--success);
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        /* --- DETAIL PANEL --- */
+        .detail-panel {
+            width: 380px;
+            min-width: 300px;
+            background: var(--bg-secondary);
+            border-left: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+        .detail-panel.hidden { display: none; }
+
+        .detail-header {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .detail-title {
+            font-weight: 600;
+            font-size: 13px;
+        }
+        .detail-close {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 16px;
+            padding: 2px 6px;
+            border-radius: var(--radius-sm);
+        }
+        .detail-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+        .detail-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 14px;
+        }
+
+        .detail-section {
+            margin-bottom: 16px;
+        }
+        .detail-section-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+            font-weight: 600;
+        }
+
+        .detail-prompt, .detail-response {
+            font-size: 13px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 200px;
+            overflow-y: auto;
+            padding: 8px;
+            background: var(--bg-tertiary);
+            border-radius: var(--radius-sm);
+        }
+        .detail-prompt { color: var(--text-primary); }
+        .detail-response { color: var(--text-secondary); }
+
+        .detail-meta-grid {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 4px 10px;
+            font-size: 12px;
+        }
+        .detail-meta-key { color: var(--text-muted); }
+        .detail-meta-val { color: var(--text-primary); }
+
+        .detail-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 6px;
+        }
+        .detail-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            padding: 2px 8px;
+            background: var(--tag-bg);
+            color: var(--tag-text);
+            border-radius: 10px;
+            font-size: 11px;
+        }
+        .detail-tag .tag-remove {
+            cursor: pointer;
+            opacity: 0.6;
+            font-size: 10px;
+        }
+        .detail-tag .tag-remove:hover { opacity: 1; }
+
+        .tag-add-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            padding: 2px 8px;
+            background: var(--bg-tertiary);
+            border: 1px dashed var(--border);
+            border-radius: 10px;
+            font-size: 11px;
+            color: var(--text-muted);
+            cursor: pointer;
+        }
+        .tag-add-btn:hover { border-color: var(--text-secondary); color: var(--text-secondary); }
+
+        .detail-note {
+            margin-top: 8px;
+        }
+        .detail-note textarea {
+            width: 100%;
+            min-height: 60px;
+            padding: 8px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-size: 12px;
+            resize: vertical;
+            outline: none;
+            font-family: inherit;
+        }
+        .detail-note textarea:focus { border-color: var(--border-focus); }
+
+        /* --- FOOTER --- */
+        .footer {
+            padding: 6px 14px;
+            border-top: 1px solid var(--border);
+            font-size: 11px;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+            background: var(--bg-secondary);
+            flex-shrink: 0;
+        }
+
+        /* Loading / empty states */
+        .state-message {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-muted);
+            gap: 8px;
+            padding: 40px;
+            text-align: center;
+        }
+        .state-message .icon { font-size: 32px; }
+        .state-message .text { font-size: 13px; }
+        .state-message .subtext { font-size: 12px; color: var(--text-muted); }
+
+        .spinner {
+            width: 20px; height: 20px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: var(--scrollbar-track); }
+        ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+
+        /* Utility */
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+
+<div class="library-root">
+    <!-- ============================================================
+         SIDEBAR — Collections navigation
+         ============================================================ -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <span>Collections</span>
+            <button id="newCollectionBtn" title="New collection">+</button>
+        </div>
+        <nav class="sidebar-nav" id="sidebarNav">
+            <div class="nav-item active" data-view="all">
+                <span class="icon">📚</span>
+                <span class="label">All Exchanges</span>
+                <span class="count" id="countAll">—</span>
+            </div>
+            <div class="nav-item" data-view="bookmarked">
+                <span class="icon">⭐</span>
+                <span class="label">Bookmarked</span>
+                <span class="count" id="countBookmarked">—</span>
+            </div>
+            <div class="nav-item" data-view="has-code">
+                <span class="icon">💻</span>
+                <span class="label">Has Code</span>
+                <span class="count" id="countCode">—</span>
+            </div>
+            <div class="nav-divider"></div>
+            <!-- Dynamic collections inserted here -->
+            <div id="collectionsContainer"></div>
+        </nav>
+    </div>
+
+    <!-- ============================================================
+         MAIN AREA — Search + list
+         ============================================================ -->
+    <div class="main-area">
+        <!-- Search bar -->
+        <div class="search-bar">
+            <div class="search-input-wrap">
+                <span class="search-icon">🔍</span>
+                <input type="text" class="search-input" id="searchInput"
+                       placeholder="Search exchanges... (prompts, responses, code, topics)"/>
+            </div>
+            <button class="search-btn" id="searchBtn">Search</button>
+        </div>
+
+        <!-- Filter chips -->
+        <div class="filter-bar" id="filterBar">
+            <span class="filter-label">Filters:</span>
+            <div class="chip" data-filter="has-code">💻 Code</div>
+            <div class="chip" data-filter="bookmarked">⭐ Bookmarked</div>
+            <!-- Language chips added dynamically after first search -->
+            <div id="dynamicChips"></div>
+            <!-- Date range filter -->
+            <div class="date-filter">
+                <label for="dateFrom">From</label>
+                <input type="date" id="dateFrom">
+                <label for="dateTo">To</label>
+                <input type="date" id="dateTo">
+                <span class="date-clear" id="dateClear" title="Clear dates">✕</span>
+            </div>
+        </div>
+
+        <!-- Results info -->
+        <div class="results-bar" id="resultsBar">
+            <span id="resultsInfo">Loading...</span>
+            <span id="resultsSorting">Newest first</span>
+        </div>
+
+        <!-- Exchange list -->
+        <div class="exchange-list" id="exchangeList">
+            <div class="state-message" id="loadingState">
+                <div class="spinner"></div>
+                <div class="text">Loading exchanges...</div>
+            </div>
+            <div class="state-message hidden" id="emptyState">
+                <div class="icon">📭</div>
+                <div class="text">No exchanges found</div>
+                <div class="subtext">Try adjusting your search or filters</div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <span id="footerLeft">—</span>
+            <span id="footerRight">—</span>
+        </div>
+    </div>
+
+    <!-- ============================================================
+         DETAIL PANEL — Exchange preview + bookmark management
+         ============================================================ -->
+    <div class="detail-panel hidden" id="detailPanel">
+        <div class="detail-header">
+            <span class="detail-title">Exchange Detail</span>
+            <button class="detail-close" id="detailClose">✕</button>
+        </div>
+        <div class="detail-body" id="detailBody">
+            <!-- Populated dynamically -->
+        </div>
+    </div>
+</div>
+
+<script>
+    /* ========================================================================
+       LIBRARY APP — State management + bridge communication
+       ======================================================================== */
+
+    const App = {
+        // State
+        currentView: 'all',       // 'all' | 'bookmarked' | 'has-code' | 'collection:name'
+        searchQuery: '',
+        activeFilters: new Set(),  // 'has-code', 'bookmarked', 'lang:kotlin', etc.
+        results: [],
+        selectedExchangeId: null,
+        stats: null,
+        collections: [],
+        offset: 0,
+        limit: 50,
+        isLoading: false,
+
+        // ====================================================================
+        // BRIDGE COMMUNICATION
+        // ====================================================================
+
+        /**
+         * Send a query to the Kotlin bridge and return the parsed JSON response.
+         * Uses the JCEF CefMessageRouter pattern.
+         */
+        query(command, payload = {}) {
+            return new Promise((resolve, reject) => {
+                const payloadStr = typeof payload === 'string' ? payload : JSON.stringify(payload);
+                const request = `library:${command}:${payloadStr}`;
+
+                window.sendToLibrary(
+                    request,
+                    function(response) {
+                        try {
+                            const data = JSON.parse(response);
+                            if (data.error) {
+                                console.error(`Bridge error [${command}]:`, data.error);
+                                reject(new Error(data.error));
+                            } else {
+                                resolve(data);
+                            }
+                        } catch (e) {
+                            console.error(`Parse error [${command}]:`, e);
+                            reject(e);
+                        }
+                    },
+                    function(code, msg) {
+                        console.error(`Bridge failure [${command}]:`, code, msg);
+                        reject(new Error(`Bridge failure: ${msg}`));
+                    }
+                );
+            });
+        },
+
+        // ====================================================================
+        // INITIALIZATION
+        // ====================================================================
+
+        async init() {
+            this.bindEvents();
+            await this.loadStats();
+            await this.loadCollections();
+            await this.loadExchanges();
+        },
+
+        // ====================================================================
+        // DATA LOADING
+        // ====================================================================
+
+        async loadExchanges() {
+            if (this.isLoading) return;
+            this.isLoading = true;
+            this.showLoading(true);
+
+            try {
+                let data;
+
+                // Determine if any filters are active that require the search path
+                const hasDateFilter = document.getElementById('dateFrom').value ||
+                    document.getElementById('dateTo').value;
+                const hasSearchQuery = this.searchQuery.trim().length > 0;
+                const hasChipFilters = this.activeFilters.size > 0;
+                const needsSearch = hasSearchQuery || hasDateFilter || hasChipFilters;
+
+                if (this.currentView.startsWith('collection:')) {
+                    if (needsSearch) {
+                        // Search within a collection — uses collectionId from buildSearchCriteria
+                        data = await this.query('search', this.buildSearchCriteria());
+                    } else {
+                        // Browse collection — fetch all items
+                        const colName = this.currentView.substring(11);
+                        const col = this.collections.find(c => c.name === colName);
+                        if (col) {
+                            const colData = await this.query('getCollectionItems', { collectionId: col.id });
+                            data = {
+                                results: (colData.bookmarks || []).map(bm => ({
+                                    exchangeId: bm.sourceId,
+                                    profileName: null,
+                                    promptPreview: bm.cachedContent?.substring(0, 120),
+                                    responsePreview: bm.cachedContent?.substring(0, 200),
+                                    timestamp: bm.addedAt,
+                                    hasCode: false,
+                                    languages: [],
+                                    topics: [],
+                                    tokensUsed: null,
+                                    isBookmarked: true,
+                                    matchReasons: [],
+                                    bookmarkNote: bm.note,
+                                    bookmarkTags: bm.tags
+                                })),
+                                totalCount: (colData.bookmarks || []).length
+                            };
+                        } else {
+                            data = { results: [], totalCount: 0 };
+                        }
+                    }
+                } else if (needsSearch || this.currentView === 'bookmarked' || this.currentView === 'has-code') {
+                    // Any filter, date, query, or special view → use search with full criteria
+                    data = await this.query('search', this.buildSearchCriteria());
+                } else {
+                    // No filters, "All Exchanges" view → simple recent fetch
+                    data = await this.query('getRecent', {
+                        limit: this.limit,
+                        offset: this.offset
+                    });
+                }
+
+                this.results = data.results || [];
+                this.renderExchangeList();
+                this.updateResultsBar(data.totalCount || this.results.length);
+            } catch (e) {
+                console.error('Failed to load exchanges:', e);
+                this.showEmpty('Error loading exchanges');
+            } finally {
+                this.isLoading = false;
+                this.showLoading(false);
+            }
+        },
+
+        buildSearchCriteria() {
+            const criteria = {
+                query: this.searchQuery,
+                limit: this.limit,
+                offset: this.offset
+            };
+
+            if (this.activeFilters.has('has-code') || this.currentView === 'has-code') {
+                criteria.hasCode = true;
+            }
+            if (this.activeFilters.has('bookmarked') || this.currentView === 'bookmarked') {
+                criteria.isBookmarked = true;
+            }
+
+            // Language filters
+            for (const f of this.activeFilters) {
+                if (f.startsWith('lang:')) {
+                    if (!criteria.languages) criteria.languages = [];
+                    criteria.languages.push(f.substring(5));
+                }
+            }
+
+            // Collection filter (via currentView) — resolve name to ID
+            if (this.currentView.startsWith('collection:')) {
+                const colName = this.currentView.substring(11);
+                const col = this.collections.find(c => c.name === colName);
+                if (col) criteria.collectionId = col.id;
+            }
+
+            // Date range filters — convert to ISO instant strings for the backend
+            const dateFrom = document.getElementById('dateFrom').value;
+            const dateTo = document.getElementById('dateTo').value;
+            if (dateFrom) criteria.dateFrom = new Date(dateFrom).toISOString();
+            if (dateTo) {
+                // Set to end of day so "To: Feb 20" includes all of Feb 20
+                const endOfDay = new Date(dateTo);
+                endOfDay.setHours(23, 59, 59, 999);
+                criteria.dateTo = endOfDay.toISOString();
+            }
+
+            return criteria;
+        },
+
+        updateDateClearVisibility() {
+            const from = document.getElementById('dateFrom').value;
+            const to = document.getElementById('dateTo').value;
+            const clearBtn = document.getElementById('dateClear');
+            if (from || to) {
+                clearBtn.classList.add('visible');
+            } else {
+                clearBtn.classList.remove('visible');
+            }
+        },
+
+        async loadStats() {
+            try {
+                this.stats = await this.query('getStats');
+                this.updateFooter();
+                this.updateSidebarCounts();
+            } catch (e) {
+                console.error('Failed to load stats:', e);
+            }
+        },
+
+        async loadCollections() {
+            try {
+                const data = await this.query('getCollections');
+                this.collections = data.collections || [];
+                this.renderCollections();
+            } catch (e) {
+                console.error('Failed to load collections:', e);
+            }
+        },
+
+        async loadExchangeDetail(exchangeId) {
+            try {
+                const data = await this.query('getExchange', { exchangeId });
+                this.renderDetail(data);
+                this.selectedExchangeId = exchangeId;
+
+                // Highlight selected in list
+                document.querySelectorAll('.exchange-item').forEach(el => {
+                    el.classList.toggle('selected', el.dataset.id === exchangeId);
+                });
+
+                // Show detail panel
+                document.getElementById('detailPanel').classList.remove('hidden');
+            } catch (e) {
+                console.error('Failed to load exchange detail:', e);
+            }
+        },
+
+        // ====================================================================
+        // RENDERING
+        // ====================================================================
+
+        renderExchangeList() {
+            const list = document.getElementById('exchangeList');
+            const loadingEl = document.getElementById('loadingState');
+            const emptyEl = document.getElementById('emptyState');
+
+            // Remove previous items (keep loading/empty states)
+            list.querySelectorAll('.exchange-item').forEach(el => el.remove());
+
+            if (this.results.length === 0) {
+                loadingEl.classList.add('hidden');
+                emptyEl.classList.remove('hidden');
+                return;
+            }
+
+            loadingEl.classList.add('hidden');
+            emptyEl.classList.add('hidden');
+
+            const fragment = document.createDocumentFragment();
+            for (const result of this.results) {
+                fragment.appendChild(this.createExchangeElement(result));
+            }
+            list.appendChild(fragment);
+        },
+
+        createExchangeElement(result) {
+            const el = document.createElement('div');
+            el.className = 'exchange-item';
+            el.dataset.id = result.exchangeId;
+            if (result.exchangeId === this.selectedExchangeId) el.classList.add('selected');
+
+            // Build meta badges
+            let metaHtml = '';
+            if (result.hasCode) {
+                metaHtml += `<span class="meta-badge code">Code</span>`;
+            }
+            if (result.languages && result.languages.length > 0) {
+                for (const lang of result.languages.slice(0, 3)) {
+                    metaHtml += `<span class="meta-badge lang">${this.escapeHtml(lang)}</span>`;
+                }
+            }
+            if (result.topics && result.topics.length > 0) {
+                for (const topic of result.topics.slice(0, 2)) {
+                    metaHtml += `<span class="meta-badge topic">${this.escapeHtml(topic)}</span>`;
+                }
+            }
+            if (result.tokensUsed) {
+                metaHtml += `<span class="meta-badge tokens">${result.tokensUsed} tokens</span>`;
+            }
+
+            // Match reasons (from search scoring)
+            let matchHtml = '';
+            if (result.matchReasons && result.matchReasons.length > 0 && this.searchQuery) {
+                matchHtml = '<span class="match-reasons">';
+                for (const reason of result.matchReasons) {
+                    matchHtml += `<span class="match-tag">${this.escapeHtml(reason)}</span>`;
+                }
+                matchHtml += '</span>';
+            }
+
+            el.innerHTML = `
+            <div class="exchange-bookmark-col">
+                <span class="bookmark-star ${result.isBookmarked ? 'active' : ''}"
+                      data-id="${result.exchangeId}"
+                      title="${result.isBookmarked ? 'Remove bookmark' : 'Bookmark this exchange'}">
+                    ${result.isBookmarked ? '★' : '☆'}
+                </span>
+            </div>
+            <div class="exchange-content">
+                <div class="exchange-header">
+                    <span class="exchange-profile">${this.escapeHtml(result.profileName || 'Unknown')}</span>
+                    <span class="exchange-time">${this.escapeHtml(result.timestamp || '')}</span>
+                </div>
+                <div class="exchange-prompt">${this.escapeHtml(result.promptPreview || '(no prompt)')}</div>
+                <div class="exchange-response-preview">${this.escapeHtml(result.responsePreview || '')}</div>
+                <div class="exchange-meta">
+                    ${metaHtml}
+                    ${matchHtml}
+                </div>
+            </div>
+        `;
+
+            // Click to open detail
+            el.addEventListener('click', (e) => {
+                if (e.target.closest('.bookmark-star')) return; // handled separately
+                this.loadExchangeDetail(result.exchangeId);
+            });
+
+            // Bookmark star click
+            const star = el.querySelector('.bookmark-star');
+            star.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.toggleBookmark(result.exchangeId, !result.isBookmarked, star);
+            });
+
+            return el;
+        },
+
+        renderDetail(data) {
+            const body = document.getElementById('detailBody');
+
+            // Build tags HTML
+            let tagsHtml = '';
+            if (data.bookmarkTags && data.bookmarkTags.length > 0) {
+                for (const tag of data.bookmarkTags) {
+                    tagsHtml += `<span class="detail-tag">
+                    ${this.escapeHtml(tag)}
+                    <span class="tag-remove" data-tag="${this.escapeHtml(tag)}" data-id="${data.exchangeId}">✕</span>
+                </span>`;
+                }
+            }
+            tagsHtml += `<span class="tag-add-btn" id="addTagBtn" data-id="${data.exchangeId}">+ Tag</span>`;
+
+            // Build collections list
+            let collectionsHtml = '';
+            if (data.bookmarkCollections && data.bookmarkCollections.length > 0) {
+                collectionsHtml = data.bookmarkCollections.map(name =>
+                    `<span class="meta-badge" style="background:#1e2a3e; color:#6cb6ff;">📁 ${this.escapeHtml(name)}</span>`
+                ).join(' ');
+            }
+
+            // Build languages
+            const langsHtml = (data.languages || []).map(l =>
+                `<span class="meta-badge lang">${this.escapeHtml(l)}</span>`
+            ).join(' ');
+
+            // Build topics
+            const topicsHtml = (data.topics || []).map(t =>
+                `<span class="meta-badge topic">${this.escapeHtml(t)}</span>`
+            ).join(' ');
+
+            body.innerHTML = `
+            <div class="detail-section">
+                <div class="detail-section-label">Prompt</div>
+                <div class="detail-prompt">${this.escapeHtml(data.prompt || '')}</div>
+            </div>
+
+            <div class="detail-section">
+                <div class="detail-section-label">Response</div>
+                <div class="detail-response">${this.escapeHtml(data.response || '(no response cached)')}</div>
+            </div>
+
+            <div class="detail-section">
+                <div class="detail-section-label">Metadata</div>
+                <div class="detail-meta-grid">
+                    <span class="detail-meta-key">Profile</span>
+                    <span class="detail-meta-val">${this.escapeHtml(data.profileName || '—')}</span>
+
+                    <span class="detail-meta-key">Time</span>
+                    <span class="detail-meta-val">${this.escapeHtml(data.timestamp || '—')}</span>
+
+                    <span class="detail-meta-key">Tokens</span>
+                    <span class="detail-meta-val">${data.tokensUsed || '—'}</span>
+
+                    ${data.ideContext?.activeFile ? `
+                    <span class="detail-meta-key">Active file</span>
+                    <span class="detail-meta-val">${this.escapeHtml(data.ideContext.activeFile)}</span>
+                    ` : ''}
+
+                    ${data.ideContext?.projectName ? `
+                    <span class="detail-meta-key">Project</span>
+                    <span class="detail-meta-val">${this.escapeHtml(data.ideContext.projectName)}</span>
+                    ` : ''}
+                </div>
+            </div>
+
+            ${(data.languages && data.languages.length) || (data.topics && data.topics.length) ? `
+            <div class="detail-section">
+                <div class="detail-section-label">Languages & Topics</div>
+                <div style="display:flex; gap:4px; flex-wrap:wrap;">
+                    ${langsHtml} ${topicsHtml}
+                </div>
+            </div>
+            ` : ''}
+
+            <div class="detail-section">
+                <div class="detail-section-label">Bookmark</div>
+                <div style="margin-bottom: 6px;">
+                    <span class="bookmark-star ${data.isBookmarked ? 'active' : ''}"
+                          id="detailBookmarkStar"
+                          data-id="${data.exchangeId}"
+                          style="font-size: 20px; cursor: pointer;">
+                        ${data.isBookmarked ? '★' : '☆'}
+                    </span>
+                    <span style="margin-left: 6px; color: var(--text-secondary); font-size: 12px;">
+                        ${data.isBookmarked ? 'Bookmarked' : 'Not bookmarked'}
+                    </span>
+                </div>
+                ${collectionsHtml ? `
+                <div style="margin-bottom: 8px;">
+                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">In collections:</div>
+                    <div style="display:flex; gap:4px; flex-wrap:wrap;">${collectionsHtml}</div>
+                </div>
+                ` : ''}
+                <div class="detail-tags">${tagsHtml}</div>
+                <div class="detail-note">
+                    <textarea id="bookmarkNote"
+                              placeholder="Add a note about this exchange..."
+                              data-id="${data.exchangeId}"
+                    >${this.escapeHtml(data.bookmarkNote || '')}</textarea>
+                </div>
+                ${data.isBookmarked ? `
+                <div style="margin-top: 10px; text-align: right;">
+                    <button id="clearAllBookmarksBtn"
+                            data-id="${data.exchangeId}"
+                            style="background: none; border: 1px solid var(--danger); color: var(--danger);
+                                   padding: 4px 10px; border-radius: var(--radius-sm); font-size: 11px;
+                                   cursor: pointer; transition: all var(--transition);">
+                        Remove from all collections
+                    </button>
+                </div>
+                ` : ''}
+            </div>
+        `;
+
+            // Bind detail events
+            this.bindDetailEvents(data.exchangeId, data.isBookmarked);
+        },
+
+        renderCollections() {
+            const container = document.getElementById('collectionsContainer');
+            container.innerHTML = '';
+
+            for (const col of this.collections) {
+                const div = document.createElement('div');
+                div.className = 'nav-item';
+                div.dataset.view = `collection:${col.name}`;
+                div.dataset.collectionId = col.id;
+                div.innerHTML = `
+                <span class="icon">${col.icon || '📁'}</span>
+                <span class="label">${this.escapeHtml(col.name)}</span>
+                <span class="count">${col.count || 0}</span>
+            `;
+                div.addEventListener('click', () => this.switchView(`collection:${col.name}`));
+                container.appendChild(div);
+            }
+        },
+
+        // ====================================================================
+        // UI UPDATES
+        // ====================================================================
+
+        updateResultsBar(totalCount) {
+            const info = document.getElementById('resultsInfo');
+            if (this.searchQuery) {
+                info.textContent = `${totalCount} result${totalCount !== 1 ? 's' : ''} for "${this.searchQuery}"`;
+            } else {
+                info.textContent = `${totalCount} exchange${totalCount !== 1 ? 's' : ''}`;
+            }
+        },
+
+        updateFooter() {
+            if (!this.stats) return;
+            const left = document.getElementById('footerLeft');
+            const right = document.getElementById('footerRight');
+            left.textContent = `${this.stats.totalExchanges || 0} exchanges · ${this.stats.totalBookmarks || 0} bookmarked`;
+            right.textContent = `${this.stats.totalTokens ? this.stats.totalTokens.toLocaleString() : '—'} total tokens`;
+        },
+
+        updateSidebarCounts() {
+            if (!this.stats) return;
+            const countAll = document.getElementById('countAll');
+            const countBookmarked = document.getElementById('countBookmarked');
+            const countCode = document.getElementById('countCode');
+            if (countAll) countAll.textContent = this.stats.totalExchanges || 0;
+            if (countBookmarked) countBookmarked.textContent = this.stats.totalBookmarks || 0;
+            if (countCode) countCode.textContent = this.stats.totalWithCode || 0;
+        },
+
+        showLoading(show) {
+            const el = document.getElementById('loadingState');
+            if (show) {
+                el.classList.remove('hidden');
+                document.getElementById('emptyState').classList.add('hidden');
+            } else {
+                el.classList.add('hidden');
+            }
+        },
+
+        showEmpty(message) {
+            const el = document.getElementById('emptyState');
+            if (message) {
+                el.querySelector('.text').textContent = message;
+            }
+            el.classList.remove('hidden');
+            document.getElementById('loadingState').classList.add('hidden');
+        },
+
+        // ====================================================================
+        // ACTIONS
+        // ====================================================================
+
+        async toggleBookmark(exchangeId, shouldBookmark, starEl) {
+            try {
+                if (shouldBookmark) {
+                    await this.query('bookmark', { exchangeId });
+                } else {
+                    const resp = await this.query('unbookmark', { exchangeId });
+                    // If exchange is still in other collections, keep star lit
+                    if (resp.stillBookmarked) {
+                        shouldBookmark = true;
+                    }
+                }
+
+                // Update star in list
+                if (starEl) {
+                    starEl.classList.toggle('active', shouldBookmark);
+                    starEl.innerHTML = shouldBookmark ? '★' : '☆';
+                }
+
+                // Update in results array
+                const result = this.results.find(r => r.exchangeId === exchangeId);
+                if (result) result.isBookmarked = shouldBookmark;
+
+                // Refresh stats and collections (counts may have changed)
+                await this.loadStats();
+                await this.loadCollections();
+            } catch (e) {
+                console.error('Bookmark toggle failed:', e);
+            }
+        },
+
+        async addTag(exchangeId) {
+            const tag = prompt('Enter tag name:');
+            if (!tag || !tag.trim()) return;
+
+            try {
+                await this.query('setTag', { exchangeId, tag: tag.trim() });
+                // Refresh detail
+                await this.loadExchangeDetail(exchangeId);
+            } catch (e) {
+                console.error('Add tag failed:', e);
+            }
+        },
+
+        async removeTag(exchangeId, tag) {
+            try {
+                await this.query('removeTag', { exchangeId, tag });
+                await this.loadExchangeDetail(exchangeId);
+            } catch (e) {
+                console.error('Remove tag failed:', e);
+            }
+        },
+
+        async createCollection() {
+            const name = prompt('New collection name:');
+            if (!name || !name.trim()) return;
+
+            try {
+                await this.query('createCollection', { name: name.trim() });
+                await this.loadCollections();
+            } catch (e) {
+                console.error('Create collection failed:', e);
+            }
+        },
+
+        switchView(view) {
+            this.currentView = view;
+            this.offset = 0;
+            this.selectedExchangeId = null;
+
+            // Update sidebar active state
+            document.querySelectorAll('.nav-item').forEach(el => {
+                el.classList.toggle('active', el.dataset.view === view);
+            });
+
+            // Update filters based on view
+            if (view === 'bookmarked') {
+                this.activeFilters.add('bookmarked');
+            } else {
+                this.activeFilters.delete('bookmarked');
+            }
+            if (view === 'has-code') {
+                this.activeFilters.add('has-code');
+            } else {
+                this.activeFilters.delete('has-code');
+            }
+
+            this.updateChipStates();
+            this.loadExchanges();
+
+            // Hide detail
+            document.getElementById('detailPanel').classList.add('hidden');
+        },
+
+        doSearch() {
+            this.searchQuery = document.getElementById('searchInput').value.trim();
+            this.offset = 0;
+            this.loadExchanges();
+        },
+
+        toggleFilter(filterName) {
+            if (this.activeFilters.has(filterName)) {
+                this.activeFilters.delete(filterName);
+            } else {
+                this.activeFilters.add(filterName);
+            }
+            this.updateChipStates();
+            this.offset = 0;
+            this.loadExchanges();
+        },
+
+        updateChipStates() {
+            document.querySelectorAll('.chip[data-filter]').forEach(chip => {
+                const filter = chip.dataset.filter;
+                chip.classList.toggle('active', this.activeFilters.has(filter));
+            });
+        },
+
+        // ====================================================================
+        // EVENT BINDING
+        // ====================================================================
+
+        bindEvents() {
+            // Search
+            document.getElementById('searchBtn').addEventListener('click', () => this.doSearch());
+            document.getElementById('searchInput').addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') this.doSearch();
+            });
+
+            // Sidebar navigation
+            document.querySelectorAll('.nav-item[data-view]').forEach(el => {
+                el.addEventListener('click', () => this.switchView(el.dataset.view));
+            });
+
+            // Filter chips
+            document.querySelectorAll('.chip[data-filter]').forEach(chip => {
+                chip.addEventListener('click', () => this.toggleFilter(chip.dataset.filter));
+            });
+
+            // Date filters — trigger search on change
+            document.getElementById('dateFrom').addEventListener('change', () => {
+                this.updateDateClearVisibility();
+                this.doSearch();
+            });
+            document.getElementById('dateTo').addEventListener('change', () => {
+                this.updateDateClearVisibility();
+                this.doSearch();
+            });
+            document.getElementById('dateClear').addEventListener('click', () => {
+                document.getElementById('dateFrom').value = '';
+                document.getElementById('dateTo').value = '';
+                this.updateDateClearVisibility();
+                this.doSearch();
+            });
+
+            // New collection
+            document.getElementById('newCollectionBtn').addEventListener('click', () => this.createCollection());
+
+            // Detail close
+            document.getElementById('detailClose').addEventListener('click', () => {
+                document.getElementById('detailPanel').classList.add('hidden');
+                this.selectedExchangeId = null;
+                document.querySelectorAll('.exchange-item.selected').forEach(el => el.classList.remove('selected'));
+            });
+
+            // Keyboard shortcuts
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    document.getElementById('detailPanel').classList.add('hidden');
+                    this.selectedExchangeId = null;
+                }
+                // Ctrl/Cmd + F → focus search
+                if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+                    e.preventDefault();
+                    document.getElementById('searchInput').focus();
+                }
+            });
+
+            // Infinite scroll
+            document.getElementById('exchangeList').addEventListener('scroll', (e) => {
+                const el = e.target;
+                if (el.scrollTop + el.clientHeight >= el.scrollHeight - 100) {
+                    if (!this.isLoading && this.results.length >= this.limit) {
+                        this.offset += this.limit;
+                        this.loadMoreExchanges();
+                    }
+                }
+            });
+        },
+
+        bindDetailEvents(exchangeId, isBookmarked) {
+            // Detail bookmark star
+            const star = document.getElementById('detailBookmarkStar');
+            if (star) {
+                star.addEventListener('click', async () => {
+                    const newState = !star.classList.contains('active');
+                    await this.toggleBookmark(exchangeId, newState, star);
+                    star.classList.toggle('active', newState);
+                    star.innerHTML = newState ? '★' : '☆';
+                    star.nextElementSibling.textContent = newState ? 'Bookmarked' : 'Not bookmarked';
+                });
+            }
+
+            // Tag remove buttons
+            document.querySelectorAll('.tag-remove').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    this.removeTag(btn.dataset.id, btn.dataset.tag);
+                });
+            });
+
+            // Add tag button
+            const addTagBtn = document.getElementById('addTagBtn');
+            if (addTagBtn) {
+                addTagBtn.addEventListener('click', () => this.addTag(addTagBtn.dataset.id));
+            }
+
+            // Bookmark note save (debounced) — uses updateNote command
+            const noteEl = document.getElementById('bookmarkNote');
+            if (noteEl) {
+                let noteTimeout;
+                noteEl.addEventListener('input', () => {
+                    clearTimeout(noteTimeout);
+                    noteTimeout = setTimeout(async () => {
+                        try {
+                            await this.query('updateNote', {
+                                exchangeId: noteEl.dataset.id,
+                                note: noteEl.value
+                            });
+                        } catch (e) {
+                            console.error('Save note failed:', e);
+                        }
+                    }, 500);
+                });
+            }
+
+            // Clear all bookmarks button — nuclear option with confirmation
+            const clearBtn = document.getElementById('clearAllBookmarksBtn');
+            if (clearBtn) {
+                clearBtn.addEventListener('click', async () => {
+                    const confirmed = confirm(
+                        'Remove this exchange from ALL collections?\n\n' +
+                        'This will delete all bookmarks, tags, and notes for this exchange. This cannot be undone.'
+                    );
+                    if (!confirmed) return;
+
+                    try {
+                        await this.query('clearAllBookmarks', { exchangeId: clearBtn.dataset.id });
+                        // Refresh everything
+                        await this.loadStats();
+                        await this.loadCollections();
+                        // Reload detail to reflect cleared state
+                        await this.loadExchangeDetail(exchangeId);
+                        // Update star in list
+                        const listStar = document.querySelector(`.bookmark-star[data-id="${exchangeId}"]`);
+                        if (listStar) {
+                            listStar.classList.remove('active');
+                            listStar.innerHTML = '☆';
+                        }
+                        const result = this.results.find(r => r.exchangeId === exchangeId);
+                        if (result) result.isBookmarked = false;
+                    } catch (e) {
+                        console.error('Clear all bookmarks failed:', e);
+                    }
+                });
+            }
+        },
+
+        async loadMoreExchanges() {
+            if (this.isLoading) return;
+            this.isLoading = true;
+
+            try {
+                let data;
+                if (this.searchQuery.trim()) {
+                    data = await this.query('search', this.buildSearchCriteria());
+                } else {
+                    data = await this.query('getRecent', {
+                        limit: this.limit,
+                        offset: this.offset
+                    });
+                }
+
+                const newResults = data.results || [];
+                if (newResults.length === 0) return;
+
+                this.results = [...this.results, ...newResults];
+
+                const list = document.getElementById('exchangeList');
+                const fragment = document.createDocumentFragment();
+                for (const result of newResults) {
+                    fragment.appendChild(this.createExchangeElement(result));
+                }
+                list.appendChild(fragment);
+            } catch (e) {
+                console.error('Load more failed:', e);
+            } finally {
+                this.isLoading = false;
+            }
+        },
+
+        // ====================================================================
+        // UTILITIES
+        // ====================================================================
+
+        escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    };
+
+    // ========================================================================
+    // GLOBAL API — Called from Kotlin via executeJavaScript
+    // ========================================================================
+
+    /** Called from LibraryPanel.refresh() after new exchanges are saved */
+    window.libraryRefresh = () => {
+        App.offset = 0;
+        App.loadStats();
+        App.loadExchanges();
+    };
+
+    /** Called from LibraryPanel.showExchange() to navigate to a specific exchange */
+    window.libraryShowExchange = (exchangeId) => {
+        App.loadExchangeDetail(exchangeId);
+    };
+
+    // ========================================================================
+    // STARTUP
+    // ========================================================================
+
+    /** Wait for bridge to be ready, then initialize */
+    function startup() {
+        if (window.__libraryBridgeReady) {
+            App.init();
+        } else {
+            window.__onBridgeReady = () => App.init();
+        }
+    }
+
+    // Start when DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', startup);
+    } else {
+        startup();
+    }
+</script>
+</body>
+</html>
