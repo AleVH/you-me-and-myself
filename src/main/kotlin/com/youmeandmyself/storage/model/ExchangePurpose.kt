@@ -11,5 +11,8 @@ package com.youmeandmyself.storage.model
 enum class ExchangePurpose {
     CHAT,
     FILE_SUMMARY,
-    MODULE_SUMMARY
+    MODULE_SUMMARY;
+
+    /** Whether this exchange is a summary type (routes to summaries/ folder). */
+    val isSummaryType: Boolean get() = this != CHAT
 }

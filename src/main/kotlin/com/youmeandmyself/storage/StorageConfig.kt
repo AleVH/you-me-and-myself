@@ -1,5 +1,6 @@
 package com.youmeandmyself.storage
 
+import com.youmeandmyself.storage.model.ExchangePurpose
 import java.io.File
 import java.time.LocalDate
 import java.time.temporal.IsoFields
@@ -23,6 +24,17 @@ import java.time.temporal.IsoFields
  *     └── {project-id}/
  *         └── summaries-YYYY-Www.jsonl
  * ```
+ *
+ * ## Routing by ExchangePurpose
+ *
+ * The [ExchangePurpose] field determines which folder a JSONL file belongs in:
+ * - CHAT → chat/{projectId}/
+ * - FILE_SUMMARY, MODULE_SUMMARY (and future *_SUMMARY types) → summaries/{projectId}/
+ *
+ * This routing is enforced at both write time ([currentFileForPurpose]) and read time
+ * ([chatFile]). A self-healing fallback checks the alternate folder if the expected
+ * location is empty — this recovers files misrouted by the pre-Phase 4B bug where
+ * all exchanges went to chat/ regardless of purpose.
  *
  * ## Weekly Partitioning
  *
@@ -65,6 +77,68 @@ class StorageConfig(private val rootPath: File) {
     /** The top-level summaries directory containing per-project subfolders. */
     val summariesDir: File get() = File(rootPath, "summaries")
 
+    // ==================== Purpose-Aware File Resolution ====================
+
+    /**
+     * Get the current weekly JSONL file for a given exchange purpose.
+     *
+     * This is the WRITE path — used when saving new exchanges.
+     * Routes summaries to summaries/{projectId}/ and chats to chat/{projectId}/.
+     *
+     * @param projectId The project's unique identifier
+     * @param purpose The exchange purpose (determines which folder to write to)
+     * @return File path for the current week's JSONL file in the correct folder
+     */
+    fun currentFileForPurpose(projectId: String, purpose: ExchangePurpose): File {
+        return if (purpose.isSummaryType) {
+            currentSummaryFile(projectId)
+        } else {
+            currentChatFile(projectId)
+        }
+    }
+
+    /**
+     * Resolve a JSONL file by its stored filename and exchange purpose.
+     *
+     * This is the READ path — used when loading exchanges from disk.
+     * Routes to the correct folder based on purpose, with a self-healing fallback
+     * that checks the alternate folder for files misrouted by the pre-Phase 4B bug.
+     *
+     * ## Self-Healing Behavior
+     *
+     * Before the Phase 4B fix, ALL exchanges (including FILE_SUMMARY) were written
+     * to chat/. This method checks the correct location first, then falls back to
+     * the alternate folder. If found in the wrong location, the caller can migrate
+     * the data to the correct folder.
+     *
+     * @param projectId The project's unique identifier
+     * @param filename The JSONL filename (e.g., "exchanges-2026-W05.jsonl")
+     * @param purpose The exchange purpose (determines expected folder)
+     * @return The resolved file — checks correct location first, then fallback.
+     *         Returns the expected path even if neither location has the file
+     *         (caller handles the "file not found" case).
+     */
+    fun chatFile(projectId: String, filename: String, purpose: ExchangePurpose): File {
+        // Primary: where the file SHOULD be based on purpose
+        val expected = if (purpose.isSummaryType) {
+            File(summariesDirForProject(projectId), filename)
+        } else {
+            File(chatDirForProject(projectId), filename)
+        }
+        if (expected.exists()) return expected
+
+        // Fallback: check the other folder (self-healing for misrouted files)
+        val fallback = if (purpose.isSummaryType) {
+            File(chatDirForProject(projectId), filename)
+        } else {
+            File(summariesDirForProject(projectId), filename)
+        }
+        if (fallback.exists()) return fallback
+
+        // Neither exists — return expected path (caller handles missing file)
+        return expected
+    }
+
     // ==================== Chat Exchange Paths ====================
 
     /**
@@ -90,18 +164,6 @@ class StorageConfig(private val rootPath: File) {
         val filename = weeklyFileName("exchanges")
         return File(chatDirForProject(projectId), filename)
     }
-
-    /**
-     * Resolve a specific chat exchange file by its stored filename.
-     *
-     * Used when loading an exchange whose raw_file column points to a specific JSONL file.
-     *
-     * @param projectId The project's unique identifier
-     * @param filename The JSONL filename (e.g., "exchanges-2026-W05.jsonl")
-     * @return The resolved file path
-     */
-    fun chatFile(projectId: String, filename: String): File =
-        File(chatDirForProject(projectId), filename)
 
     // ==================== Summary Paths ====================
 

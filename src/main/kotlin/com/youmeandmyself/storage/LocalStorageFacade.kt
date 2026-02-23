@@ -316,11 +316,17 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 Dev.info(log, "get.start", "id" to id)
 
                 // Step 1: Look up metadata in SQLite to find which file has this exchange
+                data class ExchangeLocation(val rawFile: String, val rawAvailable: Boolean, val purpose: ExchangePurpose)
+
                 val row = database.queryOne(
-                    "SELECT raw_file, raw_available FROM chat_exchanges WHERE id = ? AND project_id = ?",
+                    "SELECT raw_file, raw_available, purpose FROM chat_exchanges WHERE id = ? AND project_id = ?",
                     id, projectId
                 ) { rs ->
-                    Pair(rs.getString("raw_file"), rs.getInt("raw_available") == 1)
+                    ExchangeLocation(
+                        rs.getString("raw_file"),
+                        rs.getInt("raw_available") == 1,
+                        ExchangePurpose.valueOf(rs.getString("purpose"))
+                    )
                 }
 
                 if (row == null) {
@@ -328,7 +334,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                     return@withContext null
                 }
 
-                val (rawFile, rawAvailable) = row
+                val (rawFile, rawAvailable, purpose) = row
 
                 if (!rawAvailable) {
                     Dev.info(log, "get.notfound", "id" to id, "reason" to "raw_unavailable")
@@ -336,7 +342,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 }
 
                 // Step 2: Read from the JSONL file
-                val exchange = readRawExchange(id, projectId, rawFile, config)
+                val exchange = readRawExchange(id, projectId, rawFile, config, purpose)
 
                 if (exchange != null) {
                     Dev.info(log, "get.complete", "id" to id)
@@ -606,32 +612,34 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                     Dev.info(log, "validate.start", "projectId" to projectId)
 
                     // Get all distinct raw files that we think are still available
-                    val rawFiles = database.query(
+                    data class RawFileRef(val filename: String, val purpose: ExchangePurpose)
+
+                    val rawFileRefs = database.query(
                         """
-                        SELECT DISTINCT raw_file FROM chat_exchanges
-                        WHERE project_id = ? AND raw_available = 1
-                        """.trimIndent(),
+                            SELECT raw_file, purpose FROM chat_exchanges
+                            WHERE project_id = ? AND raw_available = 1
+                            GROUP BY raw_file, purpose
+                            """.trimIndent(),
                         projectId
-                    ) { rs -> rs.getString("raw_file") }
+                    ) { rs -> RawFileRef(rs.getString("raw_file"), ExchangePurpose.valueOf(rs.getString("purpose"))) }
 
                     var markedUnavailable = 0
 
-                    for (rawFile in rawFiles) {
-                        val file = config.chatFile(projectId, rawFile)
+                    for (ref in rawFileRefs) {
+                        val file = config.chatFile(projectId, ref.filename, ref.purpose)
                         if (!file.exists()) {
-                            // Raw file is gone — mark all exchanges pointing to it
                             val affected = database.execute(
                                 """
-                                UPDATE chat_exchanges
-                                SET raw_available = 0
-                                WHERE project_id = ? AND raw_file = ? AND raw_available = 1
-                                """.trimIndent(),
-                                projectId, rawFile
+                                    UPDATE chat_exchanges
+                                    SET raw_available = 0
+                                    WHERE project_id = ? AND raw_file = ? AND raw_available = 1
+                                    """.trimIndent(),
+                                projectId, ref.filename
                             )
                             markedUnavailable += affected
 
                             Dev.info(log, "validate.marked_unavailable",
-                                "rawFile" to rawFile,
+                                "rawFile" to ref.filename,
                                 "affected" to affected
                             )
                         }
@@ -743,6 +751,13 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 // Step 5: Rebuild search index from available exchanges
                 rebuildSearchIndex(projectId, config, database)
 
+                // Step 6: Self-heal misrouted files from pre-Phase 4B bug
+                val healingService = StorageHealingService(database)
+                val healed = healingService.healMisroutedFiles(projectId, config)
+                if (healed > 0) {
+                    Dev.info(log, "init.healed", "files" to healed)
+                }
+
                 Dev.info(log, "init.complete",
                     "project" to project.name,
                     "storageRoot" to config.root.absolutePath,
@@ -787,7 +802,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      * @return The filename used (e.g., "exchanges-2026-W05.jsonl") for metadata linkage
      */
     private fun writeRawExchange(exchange: AiExchange, projectId: String, config: StorageConfig): String {
-        val file = config.currentChatFile(projectId)
+        val file = config.currentFileForPurpose(projectId, exchange.purpose)
         val filename = file.name
 
         // Ensure project directory exists (first write for this project)
@@ -826,15 +841,15 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         id: String,
         projectId: String,
         filename: String,
-        config: StorageConfig
+        config: StorageConfig,
+        purpose: ExchangePurpose
     ): AiExchange? {
-        val file = config.chatFile(projectId, filename)
+        val file = config.chatFile(projectId, filename, purpose)
         if (!file.exists()) {
             Dev.info(log, "raw.read.nofile", "file" to filename)
             return null
         }
 
-        // useLines reads lazily — doesn't load entire file into memory
         file.useLines { lines ->
             for (line in lines) {
                 if (line.isBlank()) continue
@@ -845,7 +860,6 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                         return record.toExchange()
                     }
                 } catch (e: Exception) {
-                    // Log but continue — one bad line shouldn't break the whole file
                     Dev.warn(log, "raw.read.parse_error", e,
                         "file" to filename,
                         "linePreview" to Dev.preview(line, 100)
@@ -1600,17 +1614,19 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
      * - Backfills token usage (unchanged from Phase 4)
      */
     private suspend fun rebuildSearchIndex(projectId: String, config: StorageConfig, database: DatabaseHelper) {
-        val rawFiles = database.query(
+        data class RebuildFileRef(val filename: String, val purpose: ExchangePurpose)
+        val rawFileRefs = database.query(
             """
-        SELECT DISTINCT raw_file FROM chat_exchanges
-        WHERE project_id = ? AND raw_available = 1
-        """.trimIndent(),
+                    SELECT raw_file, purpose FROM chat_exchanges
+                    WHERE project_id = ? AND raw_available = 1
+                    GROUP BY raw_file, purpose
+                    """.trimIndent(),
             projectId
-        ) { rs -> rs.getString("raw_file") }
+        ) { rs -> RebuildFileRef(rs.getString("raw_file"), ExchangePurpose.valueOf(rs.getString("purpose"))) }
 
         val exchanges = mutableListOf<AiExchange>()
-        for (rawFile in rawFiles) {
-            val file = config.chatFile(projectId, rawFile)
+        for (ref in rawFileRefs) {
+            val file = config.chatFile(projectId, ref.filename, ref.purpose)
             if (!file.exists()) continue
 
             file.useLines { lines ->
@@ -1674,7 +1690,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                         exchanges.add(finalExchange)
                     } catch (e: Exception) {
                         Dev.warn(log, "index.rebuild.parse_error", e,
-                            "file" to rawFile,
+                            "file" to ref.filename,
                             "linePreview" to Dev.preview(line, 100)
                         )
                     }
@@ -1684,4 +1700,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
 
         searchEngine.rebuildIndex(exchanges)
     }
+
+    /** Expose storage config for dev/test commands that need direct path access. */
+    fun getStorageConfig(): StorageConfig = requireConfig()
 }
