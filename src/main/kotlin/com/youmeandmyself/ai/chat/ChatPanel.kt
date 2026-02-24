@@ -638,6 +638,28 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                 // Display the response
                 chatService.addAssistantMessage(finalDisplayText, provider.id, finalIsError)
 
+                Dev.info(log, "chat.metrics_debug",
+                    "provider.id" to provider.id,
+                    "modelId" to modelId,
+                    "profiles" to AiProfilesState.getInstance(project).profiles.map { "${it.id} → ${it.model}" }.toString()
+                )
+
+                // Update chat's top bar with the model, tokens usage, etc
+                val tokens = result.tokenUsage
+                if (tokens != null) {
+                    val displayModel = modelId
+                        ?: AiProfilesState.getInstance(project).profiles
+                            .find { it.id == provider.id }?.label
+                        ?: provider.displayName
+                    (chatService as? BrowserChatService)?.updateMetrics(
+                        model = displayModel,
+                        promptTokens = tokens.promptTokens,
+                        completionTokens = tokens.completionTokens,
+                        totalTokens = tokens.effectiveTotal,
+                        estimatedCost = null
+                    )
+                }
+
                 // For Scenario 2: Show hint about correction option
                 if (correctionHelper.hasCorrectableResponse()) {
                     chatService.addSystemMessage(

@@ -295,7 +295,16 @@ class GenericLlmProvider(
             )
         }
 
-        return parsed
+        // Attach token usage to ParsedResponse so callers (ChatPanel) can display it
+        val tokenUsage = parsed.metadata.tokenUsage?.let {
+            ExchangeTokenUsage(
+                promptTokens = it.promptTokens,
+                completionTokens = it.completionTokens,
+                totalTokens = it.totalTokens
+            )
+        }
+
+        return parsed.copy(tokenUsage = tokenUsage)
     }
 
     /**

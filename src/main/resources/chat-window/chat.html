@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- Base chat styles -->
+    <style>
+        {{CHAT_CSS}}
+    </style>
+
+    <!-- highlight.js theme (github-dark) -->
+    <style>
+        {{HIGHLIGHT_CSS}}
+    </style>
+
+    <!-- KaTeX math rendering styles (optional — empty if not available) -->
+    <style>
+        {{KATEX_CSS}}
+    </style>
+
+    <!-- highlight.js library -->
+    <script>
+        {{HIGHLIGHT_JS}}
+    </script>
+
+    <!-- markdown-it library -->
+    <script>
+        {{MARKDOWN_JS}}
+    </script>
+
+    <!-- KaTeX math rendering library (optional — empty if not available) -->
+    <script>
+        {{KATEX_JS}}
+    </script>
+
+    <!-- Mermaid diagram rendering library (optional — empty if not available) -->
+    <script>
+        {{MERMAID_JS}}
+    </script>
+</head>
+<body>
+
+<!-- Metrics widget — sticky bar above chat, hidden until first update -->
+<div id="metricsWidget" class="metrics-widget hidden"></div>
+
+<!-- Toolbar — Expand/Collapse All, hidden until first message -->
+<div id="chatToolbar" class="chat-toolbar hidden">
+    <button id="collapseAllBtn" class="collapse-all-btn" onclick="window.toggleCollapseAll()">
+        ▲ Collapse All
+    </button>
+</div>
+
+<!-- Chat messages container -->
+<div id="chatContainer" class="chat-container">
+    <!-- Empty state — shown when no messages -->
+    <div id="emptyState" class="empty-state">
+        <div class="empty-state-icon">💬</div>
+        <div class="empty-state-text">Start a conversation</div>
+    </div>
+</div>
+
+<!-- Chat logic (init, addMessage, showThinking, bookmarks, etc.) -->
+<script>
+    {{CHAT_JS}}
+</script>
+
+</body>
+</html>

@@ -149,4 +149,18 @@ class BrowserChatService(private val project: Project) : ChatUIService {
     fun hideThinking() {
         browserComponent.hideThinking()
     }
+
+    /**
+     * Updates the metrics widget with token usage from the latest exchange.
+     * Called by ChatPanel after receiving a response.
+     */
+    fun updateMetrics(
+        model: String?,
+        promptTokens: Int?,
+        completionTokens: Int?,
+        totalTokens: Int?,
+        estimatedCost: String?
+    ) {
+        browserComponent.updateMetrics(model, promptTokens, completionTokens, totalTokens, estimatedCost)
+    }
 }

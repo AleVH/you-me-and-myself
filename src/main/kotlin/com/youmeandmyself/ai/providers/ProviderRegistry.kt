@@ -109,7 +109,7 @@ object ProviderRegistry {
         // NOTE: For now, we pass through profile.apiKey (plaintext in state).
         // In phase 2, swap to PasswordSafe via a Secrets helper.
         return GenericLlmProvider(
-            id = (profile.providerId.ifBlank { "generic" }).lowercase(),
+            id = profile.id,
             displayName = profile.label.ifBlank { profile.providerId.ifBlank { "Generic LLM" } },
             baseUrl = profile.baseUrl,
             apiKey = profile.apiKey,

@@ -1,5 +1,7 @@
 package com.youmeandmyself.ai.providers.parsing
 
+import com.youmeandmyself.storage.model.ExchangeTokenUsage
+
 /**
  * The result of parsing an AI provider response.
  *
@@ -46,6 +48,9 @@ data class ParsedResponse(
     // Reference to storage
     val exchangeId: String,
 
+    // Token usage (Phase 4B — for metrics widget)
+    val tokenUsage: ExchangeTokenUsage? = null,
+
     // Metadata
     val metadata: ParseMetadata,
 
@@ -62,7 +67,8 @@ data class ParsedResponse(
             rawText: String,
             exchangeId: String,
             metadata: ParseMetadata,
-            displayText: String? = null
+            displayText: String? = null,
+            tokenUsage: ExchangeTokenUsage? = null
         ): ParsedResponse = ParsedResponse(
             rawText = rawText,
             displayText = displayText ?: rawText,
@@ -81,7 +87,8 @@ data class ParsedResponse(
             errorType: ErrorType,
             exchangeId: String,
             metadata: ParseMetadata,
-            displayText: String? = null
+            displayText: String? = null,
+            tokenUsage: ExchangeTokenUsage? = null
         ): ParsedResponse = ParsedResponse(
             rawText = null,
             displayText = displayText ?: errorType.userMessage,

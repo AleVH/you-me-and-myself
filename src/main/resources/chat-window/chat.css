@@ -1,0 +1,880 @@
+/**
+ * you-me-and-myself — Chat Interface Styles
+ *
+ * Phase 4B restyling. Design philosophy:
+ * - Assistant messages are full-width, borderless (content-first)
+ * - User messages are right-aligned compact bubbles
+ * - Clear visual hierarchy between speakers
+ * - Code blocks stretch full width with header bar
+ * - Bookmark star, turn counter, expand/collapse per exchange
+ * - Prepared for: metrics widget, conversation tabs, rich rendering
+ *
+ * Color palette derived from IntelliJ Darcula with refinements:
+ *   bg-primary:    #1e1e1e  (body)
+ *   bg-surface:    #252526  (assistant messages)
+ *   bg-elevated:   #2d2d2d  (code block headers, hover states)
+ *   bg-user:       #264f78  (user bubbles — muted blue, not iOS blue)
+ *   border-subtle: #333333  (separators, code block borders)
+ *   border-medium: #444444  (interactive element borders)
+ *   text-primary:  #cccccc  (main body text)
+ *   text-secondary:#999999  (timestamps, labels, muted content)
+ *   text-bright:   #e8e8e8  (headings, emphasized content)
+ *   accent-blue:   #4fc1ff  (links, interactive highlights)
+ *   accent-green:  #4ade80  (success states — copied, bookmarked)
+ *   accent-amber:  #f0b429  (bookmark star active)
+ */
+
+/* =========================================================================
+   RESET & BASE
+   ========================================================================= */
+
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+
+html, body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+}
+
+body {
+    background-color: #1e1e1e;
+    color: #cccccc;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans",
+    "Helvetica Neue", sans-serif;
+    font-size: 13px;
+    line-height: 1.6;
+    margin: 0;
+    padding: 0;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* =========================================================================
+   SCROLLBAR — thin, subtle, matches IntelliJ
+   ========================================================================= */
+
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #666;
+}
+
+/* =========================================================================
+   CHAT CONTAINER
+   ========================================================================= */
+
+.chat-container {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow-y: auto;
+    padding: 12px 16px;
+    scrollbar-width: thin;
+    scrollbar-color: #555 transparent;
+}
+
+/* =========================================================================
+   EXCHANGE WRAPPER
+   Each exchange (user prompt + assistant response) is wrapped together.
+   This allows the turn counter, bookmark star, and separator to be
+   scoped per exchange rather than per individual message.
+   ========================================================================= */
+
+.exchange {
+    position: relative;
+    padding: 4px 0 8px 0;
+}
+
+/* Subtle separator between exchanges */
+.exchange + .exchange {
+    border-top: 1px solid #2a2a2a;
+    margin-top: 4px;
+    padding-top: 12px;
+}
+
+/* =========================================================================
+   EXCHANGE HEADER — turn counter + bookmark star
+   Sits above the user message within each exchange.
+   ========================================================================= */
+
+.exchange-header {
+    display: flex;
+    justify-content: flex-start;
+    align-items: center;
+    padding: 0 4px 4px 4px;
+    min-height: 20px;
+}
+
+/* Turn counter: "#4" style, subtle */
+.turn-counter {
+    font-size: 11px;
+    color: #555;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+}
+
+.turn-counter.hidden {
+    display: none;
+}
+
+/* Bookmark star */
+.bookmark-star {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 4px;
+    color: #555;
+    transition: color 0.15s ease, transform 0.15s ease;
+    line-height: 1;
+    user-select: none;
+}
+
+.bookmark-star:hover {
+    color: #f0b429;
+    transform: scale(1.2);
+}
+
+.bookmark-star.bookmarked {
+    color: #f0b429;
+}
+
+/* =========================================================================
+   MESSAGE BASE
+   ========================================================================= */
+
+.message {
+    word-break: break-word;
+    animation: fadeIn 0.2s ease-out;
+}
+
+/* =========================================================================
+   USER MESSAGE — compact right-aligned bubble
+   ========================================================================= */
+
+.message.user {
+    align-self: flex-end;
+    max-width: 80%;
+    margin-left: auto;
+    background-color: #264f78;
+    color: #e8e8e8;
+    padding: 8px 14px;
+    border-radius: 16px 16px 4px 16px;
+    margin-top: 2px;
+    margin-bottom: 4px;
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+}
+
+/* =========================================================================
+   ASSISTANT MESSAGE — full-width, borderless, content-first
+   ========================================================================= */
+
+.message.assistant {
+    align-self: stretch;
+    max-width: 100%;
+    background-color: transparent;
+    color: #cccccc;
+    padding: 8px 4px;
+    margin-top: 2px;
+    margin-bottom: 0;
+    font-size: 13px;
+    line-height: 1.65;
+}
+
+/* ---- Typography inside assistant messages ---- */
+
+.message.assistant p {
+    margin: 0 0 10px 0;
+}
+
+.message.assistant p:last-child {
+    margin-bottom: 0;
+}
+
+.message.assistant h1,
+.message.assistant h2,
+.message.assistant h3,
+.message.assistant h4,
+.message.assistant h5,
+.message.assistant h6 {
+    color: #e8e8e8;
+    margin: 18px 0 8px 0;
+    line-height: 1.3;
+}
+
+.message.assistant h1:first-child,
+.message.assistant h2:first-child,
+.message.assistant h3:first-child {
+    margin-top: 0;
+}
+
+.message.assistant h1 { font-size: 1.4em; }
+.message.assistant h2 { font-size: 1.2em; }
+.message.assistant h3 { font-size: 1.05em; }
+.message.assistant h4 { font-size: 1em; font-weight: 600; }
+
+.message.assistant strong {
+    color: #e0e0e0;
+    font-weight: 600;
+}
+
+.message.assistant em {
+    color: #b0b0b0;
+}
+
+.message.assistant a {
+    color: #4fc1ff;
+    text-decoration: none;
+}
+
+.message.assistant a:hover {
+    text-decoration: underline;
+}
+
+/* ---- Lists ---- */
+
+.message.assistant ul,
+.message.assistant ol {
+    margin: 6px 0 10px 0;
+    padding-left: 24px;
+}
+
+.message.assistant li {
+    margin-bottom: 4px;
+}
+
+.message.assistant li > p {
+    margin: 0;
+}
+
+/* ---- Blockquotes ---- */
+
+.message.assistant blockquote {
+    margin: 8px 0;
+    padding: 6px 12px;
+    border-left: 3px solid #444;
+    color: #aaa;
+    background-color: #252526;
+    border-radius: 0 4px 4px 0;
+}
+
+.message.assistant blockquote p {
+    margin: 0;
+}
+
+/* ---- Horizontal rules ---- */
+
+.message.assistant hr {
+    border: none;
+    border-top: 1px solid #333;
+    margin: 12px 0;
+}
+
+/* ---- Tables (markdown) ---- */
+
+.message.assistant table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 8px 0;
+    font-size: 12px;
+}
+
+.message.assistant th,
+.message.assistant td {
+    padding: 6px 10px;
+    border: 1px solid #333;
+    text-align: left;
+}
+
+.message.assistant th {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+    font-weight: 600;
+}
+
+.message.assistant tr:nth-child(even) {
+    background-color: #252526;
+}
+
+/* =========================================================================
+   TIMESTAMP — shared between user and assistant
+   ========================================================================= */
+
+.timestamp {
+    font-size: 11px;
+    color: #555;
+    margin-top: 4px;
+    text-align: right;
+    user-select: none;
+}
+
+.message.user .timestamp {
+    color: rgba(255, 255, 255, 0.45);
+}
+
+/* =========================================================================
+   EXCHANGE FOOTER — holds bookmark star + collapse toggle for the response
+   Sits below the assistant message.
+   ========================================================================= */
+
+.exchange-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2px 4px 0 4px;
+    min-height: 20px;
+}
+
+.exchange-footer-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* =========================================================================
+   EXPAND / COLLAPSE
+   ========================================================================= */
+
+/* Collapsed state: limit assistant message height, show gradient fade */
+.message.assistant.collapsed {
+    max-height: 4.8em; /* ~3 lines at line-height 1.6 */
+    overflow: hidden;
+    position: relative;
+}
+
+.message.assistant.collapsed::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 2em;
+    background: linear-gradient(transparent, #1e1e1e);
+    pointer-events: none;
+}
+
+/* Toggle button */
+.collapse-toggle {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 11px;
+    color: #666;
+    padding: 2px 6px;
+    border-radius: 3px;
+    transition: color 0.15s ease, background-color 0.15s ease;
+    user-select: none;
+}
+
+.collapse-toggle:hover {
+    color: #999;
+    background-color: #2d2d2d;
+}
+
+/* Expand/Collapse All button — sits in the chat header area */
+.collapse-all-btn {
+    background: none;
+    border: 1px solid #333;
+    cursor: pointer;
+    font-size: 11px;
+    color: #666;
+    padding: 3px 8px;
+    border-radius: 4px;
+    transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+    user-select: none;
+}
+
+.collapse-all-btn:hover {
+    color: #999;
+    border-color: #555;
+    background-color: #2d2d2d;
+}
+
+/* =========================================================================
+   THINKING INDICATOR
+   ========================================================================= */
+
+.message.thinking {
+    color: #888;
+    font-style: italic;
+    padding: 8px 12px;
+    background-color: #252526;
+    border-radius: 8px;
+    align-self: flex-start;
+    max-width: fit-content;
+}
+
+.thinking-dots span {
+    animation: blink 1.4s infinite both;
+}
+
+.thinking-dots span:nth-child(2) {
+    animation-delay: 0.2s;
+}
+
+.thinking-dots span:nth-child(3) {
+    animation-delay: 0.4s;
+}
+
+@keyframes blink {
+    0%, 80%, 100% { opacity: 0; }
+    40% { opacity: 1; }
+}
+
+/* =========================================================================
+   FADE IN ANIMATION
+   ========================================================================= */
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(4px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* =========================================================================
+   CODE — INLINE
+   ========================================================================= */
+
+code {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono",
+    Menlo, Consolas, "Liberation Mono", monospace;
+    background: #2d2d2d;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 0.9em;
+    color: #d4d4d4;
+}
+
+/* =========================================================================
+   CODE — BLOCKS (fenced)
+   ========================================================================= */
+
+pre {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono",
+    Menlo, Consolas, "Liberation Mono", monospace;
+    background: #1b1b1b;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 12px;
+    overflow-x: auto;
+    margin: 8px 0;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+/* Reset code inside pre (don't double-style) */
+pre code {
+    background: transparent;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+    color: inherit;
+}
+
+/* Override highlight.js background to match our code block background.
+   Without this, highlighted lines get #0d1117 (from github-dark.css)
+   while empty lines show #1b1b1b (from our pre), causing visible banding. */
+pre code.hljs {
+    background: transparent;
+}
+
+/* =========================================================================
+   CODE BLOCK CONTAINER — with language label + copy button
+   ========================================================================= */
+
+.code-block {
+    position: relative;
+    margin: 8px 0;
+}
+
+/* Header bar: language label left, copy button right */
+.code-block-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #2d2d2d;
+    border: 1px solid #333;
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    padding: 4px 10px;
+}
+
+/* Language label */
+.lang-label {
+    color: #888;
+    font-size: 11px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 500;
+    user-select: none;
+}
+
+/* Copy button */
+.copy-btn {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background-color: transparent;
+    color: #666;
+    border: none;
+    border-radius: 3px;
+    padding: 2px 6px;
+    font-size: 11px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    cursor: pointer;
+    transition: color 0.15s ease, background-color 0.15s ease;
+    user-select: none;
+}
+
+.copy-btn:hover {
+    color: #ccc;
+    background-color: #3a3a3a;
+}
+
+.copy-btn.copied {
+    color: #4ade80;
+}
+
+.copy-icon {
+    font-size: 13px;
+    line-height: 1;
+}
+
+/* Pre inside code-block: no top rounding (header has it) */
+.code-block pre {
+    margin: 0;
+    border-radius: 0 0 6px 6px;
+    border-top: none;
+}
+
+/* =========================================================================
+   SYSTEM MESSAGES (errors, notifications)
+   ========================================================================= */
+
+.message.system {
+    align-self: center;
+    max-width: 90%;
+    background-color: #2d1f1f;
+    color: #e87979;
+    padding: 8px 14px;
+    border-radius: 6px;
+    border: 1px solid #4a2a2a;
+    font-size: 12px;
+    text-align: center;
+    margin: 8px 0;
+}
+
+/* =========================================================================
+   METRICS WIDGET PLACEHOLDER
+   Compact bar showing current model stats. Injected above chat container
+   or as a sticky element. Styles here, logic in chat.js.
+   ========================================================================= */
+
+.metrics-widget {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 12px;
+    background: #252526;
+    border-bottom: 1px solid #2a2a2a;
+    font-size: 11px;
+    color: #666;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.metrics-widget.hidden {
+    display: none;
+}
+
+.metrics-widget .metric {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.metrics-widget .metric-value {
+    color: #999;
+    font-variant-numeric: tabular-nums;
+}
+
+.metrics-widget .metric-label {
+    color: #555;
+}
+
+/* =========================================================================
+   CHAT TOOLBAR — holds "Expand/Collapse All" and future actions
+   Sits between metrics widget and chat messages.
+   ========================================================================= */
+
+.chat-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    padding: 4px 12px;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.chat-toolbar.hidden {
+    display: none;
+}
+
+/* =========================================================================
+   EMPTY STATE — shown when no messages yet
+   ========================================================================= */
+
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    color: #555;
+    padding: 40px;
+    text-align: center;
+}
+
+.empty-state-icon {
+    font-size: 32px;
+    margin-bottom: 12px;
+    opacity: 0.5;
+}
+
+.empty-state-text {
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+/* =========================================================================
+   UTILITY
+   ========================================================================= */
+
+.hidden {
+    display: none !important;
+}
+
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    border: 0;
+}
+
+/* =========================================================================
+   KATEX — Math rendering overrides
+   Base styles come from katex-bundled.css / katex.min.css.
+   These are tweaks for our dark theme.
+   ========================================================================= */
+
+.katex-block {
+    display: block;
+    text-align: center;
+    margin: 12px 0;
+    overflow-x: auto;
+    padding: 8px 0;
+}
+
+.katex-block .katex {
+    font-size: 1.1em;
+}
+
+.katex-error {
+    color: #e87979;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    background: #2d1f1f;
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+/* Override KaTeX colors for dark theme */
+.katex .mord,
+.katex .mbin,
+.katex .mrel,
+.katex .mopen,
+.katex .mclose,
+.katex .mpunct,
+.katex .minner {
+    color: #cccccc;
+}
+
+/* =========================================================================
+   MERMAID — Diagram rendering
+   ========================================================================= */
+
+.mermaid-container {
+    margin: 12px 0;
+    overflow-x: auto;
+}
+
+.mermaid-diagram {
+    background: #252526;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 16px;
+    text-align: center;
+    min-height: 60px;
+}
+
+.mermaid-diagram.mermaid-rendered {
+    background: transparent;
+    border: none;
+    padding: 8px;
+}
+
+.mermaid-diagram svg {
+    max-width: 100%;
+    height: auto;
+}
+
+.mermaid-error {
+    color: #e87979;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    text-align: left;
+    background: #2d1f1f;
+    padding: 8px;
+    border-radius: 4px;
+    margin: 0;
+}
+
+.mermaid-error-msg {
+    color: #e87979;
+    font-size: 11px;
+    margin-top: 4px;
+    text-align: left;
+}
+
+/* =========================================================================
+   FOOTNOTES
+   ========================================================================= */
+
+.footnotes-sep {
+    border: none;
+    border-top: 1px solid #333;
+    margin: 16px 0 8px 0;
+}
+
+.footnotes {
+    font-size: 12px;
+    color: #999;
+}
+
+.footnotes-list {
+    padding-left: 20px;
+    margin: 0;
+}
+
+.footnote-item {
+    margin-bottom: 4px;
+}
+
+.footnote-item p {
+    margin: 0;
+    display: inline;
+}
+
+.footnote-ref a,
+.footnote-backref {
+    color: #4fc1ff;
+    text-decoration: none;
+    font-size: 11px;
+}
+
+.footnote-ref a:hover,
+.footnote-backref:hover {
+    text-decoration: underline;
+}
+
+sup.footnote-ref {
+    font-size: 0.75em;
+    line-height: 0;
+    vertical-align: super;
+}
+
+/* =========================================================================
+   COLLAPSIBLE SECTIONS — <details>/<summary>
+   ========================================================================= */
+
+.collapsible-section,
+details {
+    margin: 8px 0;
+    border: 1px solid #333;
+    border-radius: 6px;
+    background: #252526;
+    overflow: hidden;
+}
+
+.collapsible-section summary,
+details summary {
+    padding: 8px 12px;
+    cursor: pointer;
+    font-weight: 500;
+    color: #e0e0e0;
+    user-select: none;
+    list-style: none;
+}
+
+.collapsible-section summary::-webkit-details-marker,
+details summary::-webkit-details-marker {
+    display: none;
+}
+
+.collapsible-section summary::before,
+details summary::before {
+    content: "▶ ";
+    font-size: 10px;
+    color: #666;
+    margin-right: 4px;
+    transition: transform 0.15s ease;
+    display: inline-block;
+}
+
+.collapsible-section[open] summary::before,
+details[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.collapsible-section summary:hover,
+details summary:hover {
+    background: #2d2d2d;
+}
+
+.collapsible-section > *:not(summary),
+details > *:not(summary) {
+    padding: 0 12px;
+}
+
+.collapsible-section > *:last-child,
+details > *:last-child {
+    padding-bottom: 8px;
+}

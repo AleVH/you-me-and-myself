@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YMM Chat Preview — Phase 4B</title>
+
+    <!-- Base chat styles (inlined from chat.css) -->
+    <style>
+        /**
+         * you-me-and-myself — Chat Interface Styles
+         * Phase 4B restyling — preview build
+         */
+
+        *, *::before, *::after { box-sizing: border-box; }
+
+        html, body {
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        body {
+            background-color: #1e1e1e;
+            color: #cccccc;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+            Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans",
+            "Helvetica Neue", sans-serif;
+            font-size: 13px;
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #555; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #666; }
+
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow-y: auto;
+            padding: 12px 16px;
+            scrollbar-width: thin;
+            scrollbar-color: #555 transparent;
+        }
+
+        .exchange {
+            position: relative;
+            padding: 4px 0 8px 0;
+        }
+
+        .exchange + .exchange {
+            border-top: 1px solid #2a2a2a;
+            margin-top: 4px;
+            padding-top: 12px;
+        }
+
+        .exchange-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 4px 4px 4px;
+            min-height: 20px;
+        }
+
+        .turn-counter {
+            font-size: 11px;
+            color: #555;
+            font-weight: 500;
+            font-variant-numeric: tabular-nums;
+            user-select: none;
+        }
+        .turn-counter.hidden { display: none; }
+
+        .bookmark-star {
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 2px 4px;
+            color: #555;
+            transition: color 0.15s ease, transform 0.15s ease;
+            line-height: 1;
+            user-select: none;
+        }
+        .bookmark-star:hover { color: #f0b429; transform: scale(1.2); }
+        .bookmark-star.bookmarked { color: #f0b429; }
+
+        .message {
+            word-break: break-word;
+            animation: fadeIn 0.2s ease-out;
+        }
+
+        .message.user {
+            align-self: flex-end;
+            max-width: 80%;
+            margin-left: auto;
+            background-color: #264f78;
+            color: #e8e8e8;
+            padding: 8px 14px;
+            border-radius: 16px 16px 4px 16px;
+            margin-top: 2px;
+            margin-bottom: 4px;
+            font-size: 13px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+        }
+
+        .message.assistant {
+            align-self: stretch;
+            max-width: 100%;
+            background-color: transparent;
+            color: #cccccc;
+            padding: 8px 4px;
+            margin-top: 2px;
+            margin-bottom: 0;
+            font-size: 13px;
+            line-height: 1.65;
+        }
+
+        .message.assistant p { margin: 0 0 10px 0; }
+        .message.assistant p:last-child { margin-bottom: 0; }
+
+        .message.assistant h1, .message.assistant h2, .message.assistant h3,
+        .message.assistant h4, .message.assistant h5, .message.assistant h6 {
+            color: #e8e8e8; margin: 18px 0 8px 0; line-height: 1.3;
+        }
+        .message.assistant h1:first-child, .message.assistant h2:first-child,
+        .message.assistant h3:first-child { margin-top: 0; }
+        .message.assistant h1 { font-size: 1.4em; }
+        .message.assistant h2 { font-size: 1.2em; }
+        .message.assistant h3 { font-size: 1.05em; }
+        .message.assistant h4 { font-size: 1em; font-weight: 600; }
+        .message.assistant strong { color: #e0e0e0; font-weight: 600; }
+        .message.assistant em { color: #b0b0b0; }
+        .message.assistant a { color: #4fc1ff; text-decoration: none; }
+        .message.assistant a:hover { text-decoration: underline; }
+
+        .message.assistant ul, .message.assistant ol {
+            margin: 6px 0 10px 0; padding-left: 24px;
+        }
+        .message.assistant li { margin-bottom: 4px; }
+        .message.assistant li > p { margin: 0; }
+
+        .message.assistant blockquote {
+            margin: 8px 0; padding: 6px 12px;
+            border-left: 3px solid #444; color: #aaa;
+            background-color: #252526; border-radius: 0 4px 4px 0;
+        }
+        .message.assistant blockquote p { margin: 0; }
+        .message.assistant hr { border: none; border-top: 1px solid #333; margin: 12px 0; }
+
+        .message.assistant table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 12px; }
+        .message.assistant th, .message.assistant td { padding: 6px 10px; border: 1px solid #333; text-align: left; }
+        .message.assistant th { background-color: #2d2d2d; color: #e0e0e0; font-weight: 600; }
+        .message.assistant tr:nth-child(even) { background-color: #252526; }
+
+        .timestamp {
+            font-size: 11px; color: #555;
+            margin-top: 4px; text-align: right; user-select: none;
+        }
+        .message.user .timestamp { color: rgba(255, 255, 255, 0.45); }
+
+        .exchange-footer {
+            display: flex; justify-content: space-between;
+            align-items: center; padding: 2px 4px 0 4px; min-height: 20px;
+        }
+        .exchange-footer-right { display: flex; align-items: center; gap: 8px; }
+
+        .message.assistant.collapsed {
+            max-height: 4.8em; overflow: hidden; position: relative;
+        }
+        .message.assistant.collapsed::after {
+            content: ''; position: absolute; bottom: 0; left: 0; right: 0;
+            height: 2em; background: linear-gradient(transparent, #1e1e1e);
+            pointer-events: none;
+        }
+
+        .collapse-toggle {
+            background: none; border: none; cursor: pointer;
+            font-size: 11px; color: #666; padding: 2px 6px;
+            border-radius: 3px; transition: color 0.15s ease, background-color 0.15s ease;
+            user-select: none;
+        }
+        .collapse-toggle:hover { color: #999; background-color: #2d2d2d; }
+
+        .collapse-all-btn {
+            background: none; border: 1px solid #333; cursor: pointer;
+            font-size: 11px; color: #666; padding: 3px 8px; border-radius: 4px;
+            transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+            user-select: none;
+        }
+        .collapse-all-btn:hover { color: #999; border-color: #555; background-color: #2d2d2d; }
+
+        .message.thinking { color: #888; font-style: italic; padding: 8px 12px; background-color: #252526; border-radius: 8px; align-self: flex-start; max-width: fit-content; }
+        .thinking-dots span { animation: blink 1.4s infinite both; }
+        .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+        .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes blink { 0%, 80%, 100% { opacity: 0; } 40% { opacity: 1; } }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+        code {
+            font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono",
+            Menlo, Consolas, "Liberation Mono", monospace;
+            background: #2d2d2d; padding: 1px 5px; border-radius: 3px;
+            font-size: 0.9em; color: #d4d4d4;
+        }
+
+        pre {
+            font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono",
+            Menlo, Consolas, "Liberation Mono", monospace;
+            background: #1b1b1b; border: 1px solid #333; border-radius: 6px;
+            padding: 12px; overflow-x: auto; margin: 8px 0;
+            font-size: 12px; line-height: 1.5;
+        }
+        pre code { background: transparent; padding: 0; border-radius: 0; font-size: inherit; color: inherit; }
+
+        .code-block { position: relative; margin: 8px 0; }
+        .code-block-header {
+            display: flex; justify-content: space-between; align-items: center;
+            background: #2d2d2d; border: 1px solid #333; border-bottom: none;
+            border-radius: 6px 6px 0 0; padding: 4px 10px;
+        }
+        .lang-label {
+            color: #888; font-size: 11px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            text-transform: uppercase; letter-spacing: 0.05em; font-weight: 500; user-select: none;
+        }
+        .copy-btn {
+            display: flex; align-items: center; gap: 4px;
+            background-color: transparent; color: #666; border: none; border-radius: 3px;
+            padding: 2px 6px; font-size: 11px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            cursor: pointer; transition: color 0.15s ease, background-color 0.15s ease;
+            user-select: none;
+        }
+        .copy-btn:hover { color: #ccc; background-color: #3a3a3a; }
+        .copy-btn.copied { color: #4ade80; }
+        .copy-icon { font-size: 13px; line-height: 1; }
+        .code-block pre { margin: 0; border-radius: 0 0 6px 6px; border-top: none; }
+
+        .message.system {
+            align-self: center; max-width: 90%;
+            background-color: #2d1f1f; color: #e87979;
+            padding: 8px 14px; border-radius: 6px;
+            border: 1px solid #4a2a2a; font-size: 12px;
+            text-align: center; margin: 8px 0;
+        }
+
+        .metrics-widget {
+            display: flex; align-items: center; gap: 12px;
+            padding: 4px 12px; background: #252526;
+            border-bottom: 1px solid #2a2a2a;
+            font-size: 11px; color: #666; user-select: none; flex-shrink: 0;
+        }
+        .metrics-widget.hidden { display: none; }
+        .metrics-widget .metric { display: flex; align-items: center; gap: 4px; }
+        .metrics-widget .metric-value { color: #999; font-variant-numeric: tabular-nums; }
+        .metrics-widget .metric-label { color: #555; }
+
+        .chat-toolbar {
+            display: flex; justify-content: flex-end; align-items: center;
+            padding: 4px 12px; gap: 8px; flex-shrink: 0;
+        }
+        .chat-toolbar.hidden { display: none; }
+
+        .empty-state {
+            display: flex; flex-direction: column; align-items: center;
+            justify-content: center; flex: 1; color: #555; padding: 40px; text-align: center;
+        }
+        .empty-state-icon { font-size: 32px; margin-bottom: 12px; opacity: 0.5; }
+        .empty-state-text { font-size: 13px; line-height: 1.5; }
+
+        .hidden { display: none !important; }
+    </style>
+
+    <!-- highlight.js GitHub Dark theme (minimal subset for preview) -->
+    <style>
+        .hljs{color:#c9d1d9;background:#0d1117}
+        .hljs-keyword,.hljs-type{color:#ff7b72}
+        .hljs-title,.hljs-title.function_{color:#d2a8ff}
+        .hljs-attr,.hljs-number,.hljs-variable{color:#79c0ff}
+        .hljs-string{color:#a5d6ff}
+        .hljs-built_in{color:#ffa657}
+        .hljs-comment{color:#8b949e}
+        .hljs-name,.hljs-selector-tag{color:#7ee787}
+    </style>
+</head>
+<body>
+
+<!-- Metrics widget -->
+<div id="metricsWidget" class="metrics-widget">
+    <span class="metric"><span class="metric-label">Model:</span> <span class="metric-value">GPT-4o</span></span>
+    <span class="metric"><span class="metric-value">1.2k</span><span class="metric-label">→</span><span class="metric-value">543</span><span class="metric-label">(1.7k)</span></span>
+    <span class="metric"><span class="metric-label">~$</span><span class="metric-value">0.03</span></span>
+</div>
+
+<!-- Toolbar -->
+<div id="chatToolbar" class="chat-toolbar">
+    <button id="collapseAllBtn" class="collapse-all-btn" onclick="window.toggleCollapseAll()">▲ Collapse All</button>
+</div>
+
+<!-- Chat container -->
+<div id="chatContainer" class="chat-container">
+
+    <!-- Exchange 1 -->
+    <div class="exchange" data-exchange-id="ex-001" data-turn="1">
+        <div class="exchange-header">
+            <span class="turn-counter">#1</span>
+        </div>
+        <div class="message user">How do I implement a singleton in Kotlin?<div class="timestamp">14:22</div></div>
+        <div class="message assistant" id="assistant-msg-1">
+            <p>In Kotlin, the idiomatic way to create a singleton is with the <code>object</code> declaration:</p>
+            <div class="code-block" id="code-block-0" data-code="b2JqZWN0IERhdGFiYXNlQ29ubmVjdGlvbiB7CiAgICB2YWwgdXJsID0gImpkYmM6cG9zdGdyZXNxbDovL2xvY2FsaG9zdC9teWRiIgogICAgCiAgICBmdW4gY29ubmVjdCgpIHsKICAgICAgICBwcmludGxuKCJDb25uZWN0aW5nIHRvICR1cmwiKQogICAgfQp9">
+                <div class="code-block-header">
+                    <span class="lang-label">KOTLIN</span>
+                    <button class="copy-btn" onclick="window.copyCodeBlock('code-block-0')" title="Copy code">
+                        <span class="copy-icon">⧉</span><span class="copy-text">Copy</span>
+                    </button>
+                </div>
+                <pre><code class="hljs kotlin"><span class="hljs-keyword">object</span> DatabaseConnection {
+    <span class="hljs-keyword">val</span> url = <span class="hljs-string">"jdbc:postgresql://localhost/mydb"</span>
+
+    <span class="hljs-keyword">fun</span> <span class="hljs-title function_">connect</span>() {
+        println(<span class="hljs-string">"Connecting to <span class="hljs-variable">$url</span>"</span>)
+    }
+}</code></pre>
+            </div>
+            <p>The <code>object</code> keyword creates a <strong>thread-safe singleton</strong> that is lazily initialized on first access. You use it directly:</p>
+            <div class="code-block" id="code-block-1" data-code="RGF0YWJhc2VDb25uZWN0aW9uLmNvbm5lY3QoKQ==">
+                <div class="code-block-header">
+                    <span class="lang-label">KOTLIN</span>
+                    <button class="copy-btn" onclick="window.copyCodeBlock('code-block-1')" title="Copy code">
+                        <span class="copy-icon">⧉</span><span class="copy-text">Copy</span>
+                    </button>
+                </div>
+                <pre><code class="hljs kotlin">DatabaseConnection.<span class="hljs-title function_">connect</span>()</code></pre>
+            </div>
+            <p>If you need a singleton <em>within</em> a class (companion singleton), use <code>companion object</code>:</p>
+            <div class="code-block" id="code-block-2" data-code="Y2xhc3MgTXlDbGFzcyB7CiAgICBjb21wYW5pb24gb2JqZWN0IHsKICAgICAgICBjb25zdCB2YWwgTUFYX1JFVFJJRVMgPSAzCiAgICAgICAgZnVuIGNyZWF0ZSgpOiBNeUNsYXNzID0gTXlDbGFzcygpCiAgICB9Cn0=">
+                <div class="code-block-header">
+                    <span class="lang-label">KOTLIN</span>
+                    <button class="copy-btn" onclick="window.copyCodeBlock('code-block-2')" title="Copy code">
+                        <span class="copy-icon">⧉</span><span class="copy-text">Copy</span>
+                    </button>
+                </div>
+                <pre><code class="hljs kotlin"><span class="hljs-keyword">class</span> <span class="hljs-title class_">MyClass</span> {
+    <span class="hljs-keyword">companion</span> <span class="hljs-keyword">object</span> {
+        <span class="hljs-keyword">const</span> <span class="hljs-keyword">val</span> MAX_RETRIES = <span class="hljs-number">3</span>
+        <span class="hljs-keyword">fun</span> <span class="hljs-title function_">create</span>(): MyClass = MyClass()
+    }
+}</code></pre>
+            </div>
+            <p>Key differences from Java:</p>
+            <ul>
+                <li>No private constructor boilerplate</li>
+                <li>Thread-safe by default (JVM guarantees)</li>
+                <li>Can implement interfaces and extend classes</li>
+            </ul>
+        </div>
+        <div class="exchange-footer">
+            <div class="timestamp">14:22</div>
+            <div class="exchange-footer-right">
+                <button class="bookmark-star" title="Bookmark this exchange">☆</button>
+                <button class="collapse-toggle" onclick="toggleMsg('assistant-msg-1', this)">▲ Collapse</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Exchange 2 -->
+    <div class="exchange" data-exchange-id="ex-002" data-turn="2">
+        <div class="exchange-header">
+            <span class="turn-counter">#2</span>
+        </div>
+        <div class="message user">Can you show me a table of Kotlin vs Java singleton approaches?<div class="timestamp">14:24</div></div>
+        <div class="message assistant" id="assistant-msg-2">
+            <p>Here's a comparison of common singleton approaches:</p>
+            <table>
+                <thead>
+                <tr><th>Approach</th><th>Kotlin</th><th>Java</th><th>Thread-safe?</th></tr>
+                </thead>
+                <tbody>
+                <tr><td>Basic singleton</td><td><code>object MyObj</code></td><td>Enum singleton or double-checked locking</td><td>✅ / Depends</td></tr>
+                <tr><td>Lazy init</td><td><code>by lazy { }</code></td><td><code>synchronized + volatile</code></td><td>✅ / ✅</td></tr>
+                <tr><td>Companion</td><td><code>companion object</code></td><td><code>static</code> methods</td><td>✅ / N/A</td></tr>
+                <tr><td>Parameterized</td><td>Custom with <code>@Volatile</code></td><td>Bill Pugh pattern</td><td>✅ / ✅</td></tr>
+                </tbody>
+            </table>
+            <blockquote><p><strong>Recommendation:</strong> Prefer <code>object</code> for simple singletons. Use <code>by lazy</code> when you need deferred initialization with parameters.</p></blockquote>
+        </div>
+        <div class="exchange-footer">
+            <div class="timestamp">14:24</div>
+            <div class="exchange-footer-right">
+                <button class="bookmark-star bookmarked" title="Bookmark this exchange">★</button>
+                <button class="collapse-toggle" onclick="toggleMsg('assistant-msg-2', this)">▲ Collapse</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Exchange 3 — short answer, shows thinking first -->
+    <div class="exchange" data-exchange-id="ex-003" data-turn="3">
+        <div class="exchange-header">
+            <span class="turn-counter">#3</span>
+        </div>
+        <div class="message user">What about testing singletons?<div class="timestamp">14:25</div></div>
+        <div class="message assistant" id="assistant-msg-3">
+            <p>Singletons are notoriously hard to test because they carry state across tests. Two practical approaches:</p>
+            <p><strong>1. Interface extraction</strong> — have the singleton implement an interface, then inject a mock in tests:</p>
+            <div class="code-block" id="code-block-3" data-code="aW50ZXJmYWNlIERiQ29ubmVjdGlvbiB7CiAgICBmdW4gY29ubmVjdCgpCn0KCm9iamVjdCBSZWFsRGIgOiBEYkNvbm5lY3Rpb24gewogICAgb3ZlcnJpZGUgZnVuIGNvbm5lY3QoKSB7IC8qIC4uLiAqLyB9Cn0=">
+                <div class="code-block-header">
+                    <span class="lang-label">KOTLIN</span>
+                    <button class="copy-btn" title="Copy code"><span class="copy-icon">⧉</span><span class="copy-text">Copy</span></button>
+                </div>
+                <pre><code class="hljs kotlin"><span class="hljs-keyword">interface</span> <span class="hljs-title class_">DbConnection</span> {
+    <span class="hljs-keyword">fun</span> <span class="hljs-title function_">connect</span>()
+}
+
+<span class="hljs-keyword">object</span> RealDb : DbConnection {
+    <span class="hljs-keyword">override</span> <span class="hljs-keyword">fun</span> <span class="hljs-title function_">connect</span>() { <span class="hljs-comment">/* ... */</span> }
+}</code></pre>
+            </div>
+            <p><strong>2. Reset method</strong> — add a <code>@VisibleForTesting</code> reset function (use sparingly).</p>
+        </div>
+        <div class="exchange-footer">
+            <div class="timestamp">14:25</div>
+            <div class="exchange-footer-right">
+                <button class="bookmark-star" title="Bookmark this exchange">☆</button>
+                <button class="collapse-toggle" onclick="toggleMsg('assistant-msg-3', this)">▲ Collapse</button>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<!-- Preview-only JS (mock bridge + collapse toggles) -->
+<script>
+    // Mock bridge for preview
+    window.sendToKotlin = function(msg) { console.log("[MOCK BRIDGE]", msg); };
+
+    // Collapse toggle for preview
+    function toggleMsg(msgId, btn) {
+        var msg = document.getElementById(msgId);
+        if (!msg) return;
+        if (msg.classList.contains("collapsed")) {
+            msg.classList.remove("collapsed");
+            btn.textContent = "▲ Collapse";
+        } else {
+            msg.classList.add("collapsed");
+            btn.textContent = "▼ Expand";
+        }
+    }
+
+    // Collapse All toggle
+    var allCollapsed = false;
+    window.toggleCollapseAll = function() {
+        allCollapsed = !allCollapsed;
+        var messages = document.querySelectorAll(".message.assistant");
+        var buttons = document.querySelectorAll(".collapse-toggle");
+        messages.forEach(function(m) {
+            if (allCollapsed) m.classList.add("collapsed");
+            else m.classList.remove("collapsed");
+        });
+        buttons.forEach(function(b) {
+            b.textContent = allCollapsed ? "▼ Expand" : "▲ Collapse";
+        });
+        document.getElementById("collapseAllBtn").textContent = allCollapsed ? "▼ Expand All" : "▲ Collapse All";
+    };
+
+    // Bookmark toggle for preview
+    document.querySelectorAll(".bookmark-star").forEach(function(star) {
+        star.addEventListener("click", function() {
+            var isBookmarked = star.classList.contains("bookmarked");
+            if (isBookmarked) {
+                star.textContent = "☆";
+                star.classList.remove("bookmarked");
+            } else {
+                star.textContent = "★";
+                star.classList.add("bookmarked");
+            }
+        });
+    });
+
+    // Copy mock
+    window.copyCodeBlock = function(blockId) {
+        var block = document.getElementById(blockId);
+        if (!block) return;
+        var btn = block.querySelector(".copy-btn");
+        if (btn) {
+            var orig = btn.innerHTML;
+            btn.innerHTML = '<span class="copy-icon">✓</span><span class="copy-text">Copied!</span>';
+            btn.classList.add("copied");
+            setTimeout(function() { btn.innerHTML = orig; btn.classList.remove("copied"); }, 2000);
+        }
+    };
+</script>
+</body>
+</html>
