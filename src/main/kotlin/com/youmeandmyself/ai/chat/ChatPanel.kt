@@ -23,6 +23,7 @@ import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.application.ReadAction
+import com.youmeandmyself.ai.chat.conversation.ConversationManager
 import com.youmeandmyself.context.orchestrator.ContextOrchestrator
 import com.youmeandmyself.context.orchestrator.ContextRequest
 import com.youmeandmyself.context.orchestrator.DetectorRegistry
@@ -151,7 +152,10 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
     private var isRefreshing = false
     private var chatProfileItems: List<Pair<String, String>> = emptyList()
     private var summaryProfileItems: List<Pair<String, String>> = emptyList()
-
+    private var currentConversationId: String? = null
+    private val conversationManager: ConversationManager by lazy {
+        ConversationManager.getInstance(project)
+    }
     // ── Initialization ───────────────────────────────────────────────────
 
     init {
@@ -676,6 +680,33 @@ class ChatPanel(private val project: Project, private val onReady: ((Boolean) ->
                     "exchangeId" to result.exchangeId,
                     "wasHeuristic" to result.metadata.wasHeuristicUsed
                 )
+
+                // ── Conversation bookkeeping (passive, failures don't affect chat) ──
+                try {
+                    if (currentConversationId == null) {
+                        val conversation = conversationManager.createConversation(
+                            firstPrompt = userInput,
+                            providerId = provider.id,
+                            modelId = AiProfilesState.getInstance(project).profiles
+                                .find { it.id == provider.id }?.model ?: "unknown"
+                        )
+                        if (conversation != null) {
+                            currentConversationId = conversation.id
+                        }
+                    }
+
+                    // Link the exchange to the conversation
+                    if (currentConversationId != null && result.exchangeId != null) {
+                        conversationManager.linkExchange(result.exchangeId!!, currentConversationId!!)
+                        conversationManager.onExchangeAdded(
+                            currentConversationId, provider.id,
+                            AiProfilesState.getInstance(project).profiles
+                                .find { it.id == provider.id }?.model ?: "unknown"
+                        )
+                    }
+                } catch (e: Exception) {
+                    Dev.warn(log, "conversation.bookkeeping_failed", e, "reason" to (e.message ?: "unknown"))
+                }
 
                 LibraryPanelHolder.get(project)?.refresh()
             } catch (t: Throwable) {

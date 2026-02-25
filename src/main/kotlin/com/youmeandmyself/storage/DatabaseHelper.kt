@@ -273,6 +273,7 @@ class DatabaseHelper(private val dbFile: File) {
                 stmt.execute("DROP TABLE IF EXISTS summary_hierarchy")
                 stmt.execute("DROP TABLE IF EXISTS summaries")
                 stmt.execute("DROP TABLE IF EXISTS chat_exchanges")
+                stmt.execute("DROP TABLE IF EXISTS conversations")
                 stmt.execute("DROP TABLE IF EXISTS code_elements")
                 stmt.execute("DROP TABLE IF EXISTS storage_config")
                 stmt.execute("DROP TABLE IF EXISTS projects")
@@ -289,6 +290,27 @@ class DatabaseHelper(private val dbFile: File) {
                     is_active      INTEGER NOT NULL DEFAULT 1
                 )
             """.trimIndent())
+
+            // ── Table: conversations ──
+            // Groups exchanges into named multi-turn dialogues.
+            // Enables chat tabs, Library conversation view, and history replay.
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id                          TEXT PRIMARY KEY,
+                    project_id                  TEXT NOT NULL REFERENCES projects(id),
+                    title                       TEXT,
+                    created_at                  TEXT NOT NULL,
+                    updated_at                  TEXT NOT NULL,
+                    provider_id                 TEXT,
+                    model_id                    TEXT,
+                    turn_count                  INTEGER NOT NULL DEFAULT 0,
+                    is_active                   INTEGER NOT NULL DEFAULT 1,
+                    max_history_tokens_override INTEGER
+                )
+            """.trimIndent())
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_id)")
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at)")
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_active ON conversations(is_active)")
 
             // ── Table 2: chat_exchanges ──
             // Phase 4: Replaced single `tokens_used INTEGER` with three columns
@@ -311,6 +333,7 @@ class DatabaseHelper(private val dbFile: File) {
                 CREATE TABLE IF NOT EXISTS chat_exchanges (
                     id                TEXT PRIMARY KEY,
                     project_id        TEXT NOT NULL REFERENCES projects(id),
+                    conversation_id   TEXT REFERENCES conversations(id),
                     provider_id       TEXT NOT NULL,
                     model_id          TEXT NOT NULL,
                     purpose           TEXT NOT NULL,
@@ -318,6 +341,7 @@ class DatabaseHelper(private val dbFile: File) {
                     prompt_tokens     INTEGER,
                     completion_tokens INTEGER,
                     total_tokens      INTEGER,
+                    user_prompt       TEXT,
                     assistant_text    TEXT,
                     flags             TEXT NOT NULL DEFAULT '',
                     labels            TEXT NOT NULL DEFAULT '',
@@ -340,6 +364,7 @@ class DatabaseHelper(private val dbFile: File) {
                 )
             """.trimIndent())
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_project ON chat_exchanges(project_id)")
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_conversation ON chat_exchanges(conversation_id)")
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_timestamp ON chat_exchanges(timestamp)")
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_purpose ON chat_exchanges(purpose)")
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_duplicate ON chat_exchanges(duplicate_hash)")

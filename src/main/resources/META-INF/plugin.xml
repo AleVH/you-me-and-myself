@@ -46,6 +46,8 @@
         <!-- Phase 4A: Search and bookmark services for Library tab -->
         <projectService serviceImplementation="com.youmeandmyself.storage.search.SearchService"/>
         <projectService serviceImplementation="com.youmeandmyself.storage.BookmarkService"/>
+
+        <projectService serviceImplementation="com.youmeandmyself.ai.chat.conversation.ConversationManager"/>
     </extensions>
 
     <actions>

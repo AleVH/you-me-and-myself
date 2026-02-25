@@ -27,7 +27,6 @@ import com.youmeandmyself.context.orchestrator.config.SummaryConfig
 import com.youmeandmyself.context.orchestrator.config.SummaryMode
 import com.youmeandmyself.storage.model.DerivedMetadata
 import com.youmeandmyself.storage.model.IdeContext
-import com.youmeandmyself.storage.JsonlRebuildService
 
 /**
  * LOCAL mode implementation of [StorageFacade].
@@ -201,20 +200,22 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                     database.execute(
                         """
                         INSERT INTO chat_exchanges 
-                            (id, project_id, provider_id, model_id, purpose, timestamp,
-                             prompt_tokens, completion_tokens, total_tokens,
+                            (id, project_id, provider_id, model_id, conversation_id, purpose, timestamp,
+                             prompt_tokens, completion_tokens, total_tokens, user_prompt, 
                              raw_file, raw_available)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                         """.trimIndent(),
                         exchange.id,
                         projectId,
                         exchange.providerId,
                         exchange.modelId,
+                        exchange.conversationId,
                         exchange.purpose.name,
                         exchange.timestamp.toString(),
                         exchange.tokenUsage?.promptTokens,
                         exchange.tokenUsage?.completionTokens,
                         exchange.tokenUsage?.effectiveTotal,
+                        exchange.request.input,
                         rawFile
                     )
 
@@ -992,6 +993,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         val timestamp: String,
         val providerId: String,
         val modelId: String,
+        val conversationId: String?,
         val purpose: String,
         val request: JsonlRequest,
         val rawResponse: JsonlRawResponse,
@@ -1095,6 +1097,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         timestamp = timestamp.toString(),
         providerId = providerId,
         modelId = modelId,
+        conversationId = conversationId,
         purpose = purpose.name,
         request = JsonlRequest(
             input = request.input,
@@ -1200,7 +1203,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             val database = db ?: return null
             database.queryOne(
                 """
-                SELECT id, model_id, assistant_text, timestamp, total_tokens,
+                SELECT id, model_id, assistant_text, user_prompt, timestamp, total_tokens,
                        has_code_block, code_languages, detected_topics, file_paths,
                        context_file, context_branch, open_files
                 FROM chat_exchanges WHERE id = ?
@@ -1210,7 +1213,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 FullExchange(
                     id = rs.getString("id"),
                     profileName = rs.getString("model_id"),
-                    userPrompt = null, // user prompt is in JSONL, not cached in SQLite
+                    userPrompt = rs.getString("user_prompt"),
                     assistantText = rs.getString("assistant_text"),
                     timestamp = Instant.parse(rs.getString("timestamp")),
                     tokensUsed = rs.getInt("total_tokens").takeIf { !rs.wasNull() },

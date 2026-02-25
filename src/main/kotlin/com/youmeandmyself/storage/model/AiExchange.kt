@@ -25,7 +25,8 @@ data class AiExchange(
     val purpose: ExchangePurpose,
     val request: ExchangeRequest,
     val rawResponse: ExchangeRawResponse,
-    val tokenUsage: ExchangeTokenUsage? = null
+    val tokenUsage: ExchangeTokenUsage? = null,
+    val conversationId: String? = null
 )
 
 /**
