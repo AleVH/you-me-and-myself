@@ -268,6 +268,41 @@ class ChatOrchestrator(
     }
 
     /**
+     * Confirm that the heuristic guess was correct — "Looks right" button.
+     *
+     * When the parser used heuristics (Scenario 2), the UI shows two buttons:
+     * - "✓ Looks right" → calls this method
+     * - "✗ Not right" → calls [handleCorrection]
+     *
+     * Confirming does two things:
+     * 1. Saves a format hint so future responses from this provider/model
+     *    are parsed the same way without guessing (skips Scenario 2 next time)
+     * 2. Clears the correction context (buttons disappear)
+     *
+     * @return True if confirmation was processed, false if no correctable response was available
+     */
+    suspend fun confirmCorrection(): Boolean {
+        val context = correctionHelper.lastCorrectionContext
+        if (context == null) {
+            Dev.info(log, "orchestrator.confirm_correction", "result" to "no_context")
+            return false
+        }
+
+        // Save the format hint so this provider/model's format is recognized next time.
+        // The hint tells the parser: "when you see this response shape from this
+        // provider/model, the best-guess extraction path was correct."
+        correctionHelper.confirmAndSaveHint(context)
+
+        Dev.info(log, "orchestrator.confirm_correction",
+            "result" to "confirmed",
+            "providerId" to context.providerId,
+            "modelId" to context.modelId
+        )
+
+        return true
+    }
+
+    /**
      * Handle the /raw command — shows raw JSON of the last response.
      *
      * Delegates to [CorrectionFlowHelper.showRawResponse]. The UI should call this

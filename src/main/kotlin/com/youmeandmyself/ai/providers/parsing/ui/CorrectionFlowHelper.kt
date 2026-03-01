@@ -309,6 +309,55 @@ class CorrectionFlowHelper(
     }
 
     /**
+     * Confirm the heuristic guess was correct and save a format hint.
+     *
+     * Called when the user clicks "✓ Looks right" on a Scenario 2 response.
+     * This does two things:
+     *
+     * 1. **Saves a format hint**: Tells the parser that for this provider/model
+     *    combination, the best-guess extraction path is correct. Next time the
+     *    parser sees a response with the same shape, it can use the hint to
+     *    skip heuristic guessing and go straight to the correct extraction —
+     *    upgrading from Scenario 2 (MEDIUM confidence) to Scenario 1 (HIGH).
+     *
+     * 2. **Clears correction context**: The response is confirmed, no further
+     *    correction is possible or needed. This causes the UI buttons to disappear.
+     *
+     * ## What Is a Format Hint?
+     *
+     * A format hint records which JSON path in the raw response contained the
+     * correct content for a specific provider + model. For example:
+     * - OpenAI: `choices[0].message.content` (known schema, no hint needed)
+     * - Custom provider: `result.output.text` (heuristic found it, hint remembers)
+     *
+     * Hints are persisted across IDE restarts via [FormatHintStorage].
+     *
+     * @param context The correction context from the Scenario 2 response
+     */
+    suspend fun confirmAndSaveHint(context: CorrectionContext) {
+        // The first candidate in the list is always the "best guess" —
+        // the one that was displayed to the user. If they confirmed it,
+        // that candidate's content path is the correct extraction path.
+        val bestGuess = context.candidates.firstOrNull()
+
+        if (bestGuess != null) {
+            // Build a hint from the best guess candidate.
+            // The hint associates (providerId + modelId) → contentPath
+            // so the parser can use it for future responses.
+            val hint = FormatHint(
+                providerId = context.providerId,
+                modelId = context.modelId,
+                contentPath = bestGuess.path
+            )
+            hintStorage.saveHint(hint)
+            log.info("Saved confirmed format hint for ${context.providerId}/${context.modelId ?: "all"}: ${bestGuess.path}")
+        }
+
+        // Clear context — confirmation is final, no further correction available
+        clearCorrectionContext()
+    }
+
+    /**
      * Store raw JSON for dev mode testing.
      *
      * Test responses don't persist to real storage, so this allows
