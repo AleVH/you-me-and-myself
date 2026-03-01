@@ -1,130 +1,70 @@
 package com.youmeandmyself.ai.providers
 
-import com.youmeandmyself.ai.providers.parsing.ParsedResponse
-
 /**
- * Core contract every AI provider must implement.
+ * Interface for AI providers — the HTTP abstraction layer.
  *
- * ## Purpose
+ * ## Post-Refactoring Contract
  *
- * This interface abstracts the specifics of different LLM providers (OpenAI, Gemini,
- * local models, etc.) behind a common API. The rest of the plugin doesn't need to know
- * which provider is being used — it just calls these methods.
+ * Implementations of this interface are **pure HTTP clients**. They:
+ * 1. Build protocol-specific requests
+ * 2. Send them to the API
+ * 3. Parse the response
+ * 4. Return [ProviderResponse] — done.
  *
- * ## Methods
+ * They do NOT:
+ * - Save to storage (orchestrator does this)
+ * - Index metadata (orchestrator does this)
+ * - Capture IDE context (orchestrator does this)
+ * - Manage conversations (orchestrator does this)
  *
- * - **ping()**: Health check, verifies connectivity and credentials
- * - **chat()**: Send a prompt, get a response (for conversations)
- * - **summarize()**: Send code, get a summary (for code summarization)
- * - **listModels()**: Optional enumeration of available models
+ * ## Return Type Change
  *
- * ## Chat vs Summarize
+ * Previously returned [ParsedResponse]. Now returns [ProviderResponse] which
+ * wraps ParsedResponse + raw JSON + HTTP status + prompt. The orchestrator
+ * needs all of these to persist the complete exchange.
  *
- * Both methods make LLM requests, but they differ in:
+ * ## Implementations
  *
- * | Aspect | chat() | summarize() |
- * |--------|--------|-------------|
- * | Purpose | Conversations | Code summaries |
- * | Settings | chatSettings from profile | summarySettings from profile |
- * | Storage | ExchangePurpose.CHAT | ExchangePurpose.SUMMARY |
- * | Temperature | Higher (creative) | Lower (factual) |
- * | Response use | Rendered with markdown/code highlighting | Stored as plain text |
- *
- * ## Implementation Notes
- *
- * Implementations should:
- * - Be side-effect free (no hidden state changes)
- * - Throw exceptions with useful messages on failure
- * - Save raw responses to storage before parsing (never lose data)
- * - Use the appropriate settings (chat vs summary) for each method
+ * - [GenericLlmProvider]: Vendor-agnostic provider supporting OpenAI, Gemini, and Custom protocols
+ * - Future: Streaming provider, batch provider, etc.
  */
 interface AiProvider {
-    /**
-     * A short, unique identifier for this provider instance.
-     *
-     * Examples: "openai", "gemini", "ollama-local", "my-gemini"
-     *
-     * Used for:
-     * - Logging and debugging
-     * - Storage (providerId in chat_exchanges table)
-     * - Format hints (different providers may need different parsing)
-     */
+    /** Unique identifier for this provider instance (matches AiProfile.id). */
     val id: String
 
-    /**
-     * Human-friendly name displayed in the UI.
-     *
-     * Examples: "OpenAI GPT-4", "Google Gemini", "Local Ollama"
-     *
-     * This comes from the profile label, so users can name it whatever they want.
-     */
+    /** Human-friendly name for logging and UI display. */
     val displayName: String
 
     /**
-     * Quick health check to verify connectivity and credentials.
+     * Quick health check — verify connectivity and credentials.
      *
-     * Should be:
-     * - Fast (< 2 seconds)
-     * - Low cost (minimal or no token usage)
-     * - Non-destructive (read-only operation)
+     * Calls a lightweight endpoint (e.g., /v1/models) to check if the
+     * API key is valid and the service is reachable.
      *
-     * Typical implementation: call the provider's "list models" endpoint.
-     *
-     * @return Brief success message (e.g., "200" or "OK")
-     * @throws Exception on failure with descriptive message
+     * @return HTTP status code as string (e.g., "200")
+     * @throws Exception if the network request fails
      */
     suspend fun ping(): String
 
     /**
-     * Send a chat prompt and get a response.
+     * Send a chat message to the AI provider.
      *
-     * Used for interactive conversations in the chat UI.
+     * Uses chat-specific request settings (higher temperature, longer responses).
+     * The prompt may include IDE context assembled by [ContextAssembler].
      *
-     * Flow:
-     * 1. Apply chatSettings from profile (temperature, maxTokens, etc.)
-     * 2. Make HTTP request to provider
-     * 3. Save raw response to storage with ExchangePurpose.CHAT
-     * 4. Parse response using ResponseParser
-     * 5. Return ParsedResponse
-     *
-     * The response may need markdown rendering, code highlighting, etc.
-     * for display in the chat UI.
-     *
-     * @param prompt The user's message/question
-     * @return ParsedResponse containing extracted text, error info, and metadata
+     * @param prompt The complete prompt to send (user input + any context)
+     * @return [ProviderResponse] with raw JSON, HTTP status, and parsed content
      */
-    suspend fun chat(prompt: String): ParsedResponse
+    suspend fun chat(prompt: String): ProviderResponse
 
     /**
-     * Send code for summarization and get a concise summary.
+     * Send a summarization request to the AI provider.
      *
-     * Used for generating code summaries in the background.
+     * Uses summary-specific request settings (lower temperature, shorter responses).
+     * Called by [SummarizationService] for both code and conversation summarization.
      *
-     * Flow:
-     * 1. Apply summarySettings from profile (lower temperature, smaller maxTokens, etc.)
-     * 2. Make HTTP request to provider
-     * 3. Save raw response to storage with ExchangePurpose.SUMMARY
-     * 4. Parse response using ResponseParser
-     * 5. Return ParsedResponse
-     *
-     * The response should be plain text (the prompt instructs the model not to use
-     * markdown formatting). It will be stored directly without rendering.
-     *
-     * @param prompt The summarization prompt (built by SummaryExtractor.buildPrompt())
-     * @return ParsedResponse containing extracted summary text or error info
+     * @param prompt The summarization prompt (content + template)
+     * @return [ProviderResponse] with raw JSON, HTTP status, and parsed content
      */
-    suspend fun summarize(prompt: String): ParsedResponse
-
-    /**
-     * List available models from this provider.
-     *
-     * Optional — providers that cannot enumerate models should return emptyList().
-     *
-     * Useful for:
-     * - Auto-completing model names in settings UI
-     * - Validating that a configured model exists
-     *
-     * @return List of model identifiers, or empty list if enumeration not supported
-     */
-    suspend fun listModels(): List<String> = emptyList()
+    suspend fun summarize(prompt: String): ProviderResponse
 }

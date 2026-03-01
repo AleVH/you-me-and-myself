@@ -118,7 +118,6 @@ object ProviderRegistry {
             custom = profile.custom,
             chatSettings = profile.chatSettings,
             summarySettings = profile.summarySettings,
-            project = project
         )
     }
 

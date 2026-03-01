@@ -203,7 +203,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                             (id, project_id, provider_id, model_id, conversation_id, purpose, timestamp,
                              prompt_tokens, completion_tokens, total_tokens, user_prompt, 
                              raw_file, raw_available)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                         """.trimIndent(),
                         exchange.id,
                         projectId,

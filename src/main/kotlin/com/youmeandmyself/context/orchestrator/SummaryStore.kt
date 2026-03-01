@@ -447,7 +447,7 @@ class SummaryStore(private val project: Project) : Disposable {
             val response = provider.summarize(prompt)
 
             // Extract the summary text
-            val extraction = SummaryExtractor.extract(response, response.rawText)
+            val extraction = SummaryExtractor.extract(response.parsed, response.parsed.rawText)
 
             when (extraction) {
                 is SummaryExtractor.ExtractionResult.Success -> {
