@@ -10,9 +10,11 @@ import com.intellij.ui.jcef.JBCefJSQuery
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.BookmarkService
 import com.youmeandmyself.storage.LocalStorageFacade
+import com.youmeandmyself.storage.StorageReadyListener
 import com.youmeandmyself.storage.search.SearchCriteria
 import com.youmeandmyself.storage.search.SearchResults
 import com.youmeandmyself.storage.search.SearchService
+import com.youmeandmyself.ai.bridge.CrossPanelBridge
 import java.awt.BorderLayout
 import java.time.Instant
 import java.time.ZoneId
@@ -30,6 +32,19 @@ import javax.swing.JPanel
  *   JS: window.sendToLibrary("library:command:jsonPayload")
  *   →  JBCefJSQuery handler routes to the appropriate method
  *   →  Returns JSON response string
+ *
+ * ## Storage readiness
+ *
+ * The Library subscribes to [StorageReadyListener.TOPIC] to handle the race
+ * condition where JCEF loads before storage initialization completes. Two paths:
+ *
+ * 1. **Storage already ready** (normal startup): isInitialized check passes
+ *    immediately after HTML loads, refresh fires right away.
+ * 2. **Storage still initializing** (dev-mode wipe, slow rebuild): the
+ *    StorageReadyListener callback fires when init completes and triggers refresh.
+ *
+ * This replaces the previous Thread.sleep polling loop which was fragile and
+ * could leave the Library permanently empty if init took > 10 seconds.
  *
  * ## Bookmark model
  *
@@ -95,6 +110,15 @@ class LibraryPanel(
             }
         }
 
+        // Subscribe to storage readiness notification BEFORE loading HTML.
+        // This ensures we don't miss the event if init completes between
+        // HTML load and subscription.
+        project.messageBus.connect(this).subscribe(StorageReadyListener.TOPIC, StorageReadyListener {
+            Dev.info(log, "library.storage_ready_received")
+            isLoaded = true
+            refresh()
+        })
+
         add(browser.component, BorderLayout.CENTER)
         loadLibraryHtml()
         Dev.info(log, "library.panel.init", "project" to project.name)
@@ -123,17 +147,17 @@ class LibraryPanel(
 
             browser.loadHTML(injectedHtml)
 
-            // Wait for storage before signaling readiness
-            Thread {
-                val facade = LocalStorageFacade.getInstance(project)
-                var attempts = 0
-                while (!facade.isInitialized && attempts < 100) {
-                    Thread.sleep(100)
-                    attempts++
-                }
+            // If storage is already initialized (normal startup order),
+            // mark ready immediately. The StorageReadyListener subscription
+            // above handles the race case where init hasn't completed yet.
+            if (storageFacade.isInitialized) {
+                Dev.info(log, "library.storage_already_ready")
                 isLoaded = true
                 refresh()
-            }.start()
+            }
+            // Otherwise: isLoaded stays false, queries return empty gracefully,
+            // and the StorageReadyListener callback will fire refresh() when
+            // init completes. No polling, no Thread.sleep, no retry loops.
         } else {
             browser.loadHTML("""
                 <!DOCTYPE html>
@@ -160,6 +184,13 @@ class LibraryPanel(
         } else {
             command = afterPrefix
             payload = ""
+        }
+
+        // StorageReadyListener will call refresh() when init completes,
+        // which re-triggers all queries from the JS side.
+        if (!isLoaded) {
+            Dev.info(log, "library.bridge.storage_not_ready", "command" to command)
+            return """{"error": "Storage not ready yet", "retry": true}"""
         }
 
         return try {
@@ -196,6 +227,13 @@ class LibraryPanel(
                 "getStats"            -> handleGetStats()
                 "getExchange"         -> handleGetExchange(payload)
 
+                // Chat sessions for sidebar
+                "getChatSessions"     -> handleGetChatSessions()
+
+                // Cross-panel navigation (TEMPORARY — remove when Library migrates to React)
+                "continueChat"        -> handleContinueChat(payload)
+                "switchToChat"        -> handleSwitchToChat()
+
                 else -> """{"error": "Unknown command: $command"}"""
             }
         } catch (e: Exception) {
@@ -219,7 +257,9 @@ class LibraryPanel(
             dateFrom = req.dateFrom?.let { Instant.parse(it) },
             dateTo = req.dateTo?.let { Instant.parse(it) },
             limit = req.limit ?: 50,
-            offset = req.offset ?: 0
+            offset = req.offset ?: 0,
+            isStarred = req.isStarred,
+            conversationId = req.conversationId,
         )
         val results = searchService.search(criteria)
         return gson.toJson(enrichWithBookmarkStatus(results).toTransport())
@@ -514,12 +554,18 @@ class LibraryPanel(
     private fun handleGetStats(): String {
         val stats = storageFacade.getLibraryStats()
 
-        // Override bookmark count with the real count from the bookmarks table
-        val bookmarkCount = bookmarkService.getTotalBookmarkCount()
+        val starredCount = try {
+            storageFacade.withReadableDatabase { db ->
+                db.queryScalar(
+                    "SELECT COUNT(*) FROM chat_exchanges WHERE is_starred = 1 AND project_id = ?",
+                    storageFacade.resolveProjectId()
+                )
+            }
+        } catch (e: Exception) { 0 }
 
         return gson.toJson(mapOf(
             "totalExchanges" to stats.totalExchanges,
-            "totalBookmarks" to bookmarkCount,
+            "totalStarred" to starredCount,
             "totalWithCode" to stats.totalWithCode,
             "totalTokens" to stats.totalTokens
         ))
@@ -574,6 +620,75 @@ class LibraryPanel(
             // Per-bookmark detail for future collection-aware UI
             "bookmarks" to bookmarkDetails
         ))
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // CHAT SESSIONS & CROSS-PANEL NAVIGATION
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Return chat sessions for the Library sidebar "Chats" section.
+     * Queries the conversations table directly.
+     */
+    private fun handleGetChatSessions(): String {
+        return try {
+            val projectId = storageFacade.resolveProjectId()
+            val sessions = storageFacade.withReadableDatabase { db ->
+                db.query(
+                    """SELECT id, title, updated_at, turn_count
+                   FROM conversations
+                   WHERE project_id = ? AND is_active = 1
+                   ORDER BY updated_at DESC""",
+                    projectId
+                ) { rs ->
+                    mapOf(
+                        "conversationId" to rs.getString("id"),
+                        "title" to rs.getString("title"),
+                        "updatedAt" to rs.getString("updated_at"),
+                        "turnCount" to rs.getInt("turn_count")
+                    )
+                }
+            }
+            gson.toJson(mapOf("sessions" to sessions))
+        } catch (e: Exception) {
+            Dev.warn(log, "library.get_chat_sessions_failed", e)
+            gson.toJson(mapOf("sessions" to emptyList<Any>()))
+        }
+    }
+
+    /**
+     * Open a conversation in the Chat tab via CrossPanelBridge.
+     *
+     * TEMPORARY: Remove when Library migrates to React.
+     */
+    private fun handleContinueChat(payload: String): String {
+        val req = gson.fromJson(payload, ContinueChatRequest::class.java)
+        val bridge = CrossPanelBridge.getInstance(project)
+        val dispatched = bridge.openConversation(req.conversationId)
+        return gson.toJson(mapOf("success" to dispatched))
+    }
+
+    /**
+     * Switch the tool window to show the Chat tab.
+     *
+     * TEMPORARY: Remove when Library migrates to React.
+     */
+    private fun handleSwitchToChat(): String {
+        return try {
+            com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                val toolWindow = com.intellij.openapi.wm.ToolWindowManager
+                    .getInstance(project)
+                    .getToolWindow("YMM Assistant")
+                toolWindow?.contentManager?.let { cm ->
+                    val chatContent = cm.contents.find { it.displayName == "Chat" }
+                    if (chatContent != null) cm.setSelectedContent(chatContent)
+                }
+            }
+            gson.toJson(mapOf("success" to true))
+        } catch (e: Exception) {
+            Dev.warn(log, "library.switch_to_chat_failed", e)
+            gson.toJson(mapOf("success" to false, "error" to e.message))
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -702,7 +817,9 @@ class LibraryPanel(
         val dateFrom: String? = null,
         val dateTo: String? = null,
         val limit: Int? = null,
-        val offset: Int? = null
+        val offset: Int? = null,
+        val isStarred: Boolean? = null,
+        val conversationId: String? = null
     )
     private data class RecentRequest(
         val limit: Int? = null,
@@ -751,5 +868,10 @@ class LibraryPanel(
     // Detail
     private data class ExchangeRequest(
         val exchangeId: String = ""
+    )
+
+    // Cross-panel navigation (TEMPORARY)
+    private data class ContinueChatRequest(
+        val conversationId: String = ""
     )
 }

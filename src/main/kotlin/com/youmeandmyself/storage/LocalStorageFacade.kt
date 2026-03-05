@@ -25,6 +25,7 @@ import java.io.File
 import java.time.Instant
 import com.youmeandmyself.context.orchestrator.config.SummaryConfig
 import com.youmeandmyself.context.orchestrator.config.SummaryMode
+import com.youmeandmyself.storage.model.ConversationExchange
 import com.youmeandmyself.storage.model.DerivedMetadata
 import com.youmeandmyself.storage.model.IdeContext
 
@@ -993,7 +994,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         val timestamp: String,
         val providerId: String,
         val modelId: String,
-        val conversationId: String?,
+        val conversationId: String? = null,
         val purpose: String,
         val request: JsonlRequest,
         val rawResponse: JsonlRawResponse,
@@ -1706,4 +1707,81 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
 
     /** Expose storage config for dev/test commands that need direct path access. */
     fun getStorageConfig(): StorageConfig = requireConfig()
+
+    /**
+     * Toggle the star (favourite) state on an exchange.
+     *
+     * Reads the current is_starred value, flips it, and writes back.
+     * Returns the new state so the caller can confirm to the frontend.
+     *
+     * @param exchangeId The exchange to toggle
+     * @return The new star state (true = starred, false = unstarred)
+     */
+    fun toggleStar(exchangeId: String): Boolean {
+        return withDatabase { db ->
+            val currentlyStarred = db.queryOne(
+                "SELECT is_starred FROM chat_exchanges WHERE id = ?",
+                exchangeId
+            ) { rs -> rs.getInt("is_starred") == 1 } ?: false
+
+            val newState = !currentlyStarred
+            db.execute(
+                "UPDATE chat_exchanges SET is_starred = ? WHERE id = ?",
+                newState, exchangeId
+            )
+
+            Dev.info(log, "storage.star_toggled",
+                "exchangeId" to exchangeId,
+                "isStarred" to newState
+            )
+            newState
+        }
+    }
+
+    /**
+     * Load all exchanges for a conversation, ordered chronologically.
+     *
+     * Used by ChatOrchestrator.loadConversationHistory() to populate
+     * restored tabs. Only reads CHAT-purpose exchanges (not summaries).
+     *
+     * @param conversationId The conversation to load
+     * @return Exchanges in chronological order
+     */
+    fun getExchangesForConversation(conversationId: String): List<ConversationExchange> {
+        return withReadableDatabase { db ->
+            db.query(
+                """SELECT id, user_prompt, assistant_text, timestamp, is_starred
+                   FROM chat_exchanges
+                   WHERE conversation_id = ? AND purpose = 'CHAT'
+                   ORDER BY timestamp ASC""",
+                conversationId
+            ) { rs ->
+                ConversationExchange(
+                    id = rs.getString("id"),
+                    userPrompt = rs.getString("user_prompt"),
+                    assistantText = rs.getString("assistant_text"),
+                    timestamp = rs.getString("timestamp"),
+                    isStarred = rs.getInt("is_starred") == 1
+                )
+            }
+        }
+    }
+
+    /**
+     * Get the title for a conversation from the conversations table.
+     * Returns null if the conversation doesn't exist.
+     *
+     * Used by BridgeDispatcher when opening a conversation from the Library
+     * to set the tab title in the React frontend.
+     */
+    fun getConversationTitle(conversationId: String): String? {
+        return withReadableDatabase { db ->
+            db.query(
+                "SELECT title FROM conversations WHERE id = ?",
+                conversationId
+            ) { rs ->
+                rs.getString("title")
+            }.firstOrNull()
+        }
+    }
 }

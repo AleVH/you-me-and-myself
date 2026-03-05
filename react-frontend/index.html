@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YMM Chat</title>
+</head>
+<body>
+<!--
+  Root element for the React app. React mounts here via main.tsx.
+  The dark background prevents a white flash while React initializes
+  inside JCEF (which can take 100-300ms after loadHTML).
+-->
+<div id="root" style="background: #1e1e1e; min-height: 100vh;"></div>
+<script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

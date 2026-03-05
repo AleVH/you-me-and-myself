@@ -238,17 +238,37 @@ class JsonlRebuildService(
                     }
 
                     // Step 6: INSERT into SQLite
+                    // Extract conversation_id from JSONL record
+                    val conversationId = json.stringAt("conversationId")
+
                     try {
+                        // Ensure conversation exists in the conversations table (FK constraint)
+                        if (conversationId != null && projectId != null) {
+                            db.execute(
+                                """INSERT OR IGNORE INTO conversations
+                                    (id, project_id, title, created_at, updated_at, provider_id, model_id, turn_count, is_active)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)""".trimIndent(),
+                                conversationId,
+                                projectId,
+                                prompt?.take(60) ?: "Imported conversation",
+                                timestamp.toString(),
+                                timestamp.toString(),
+                                providerId,
+                                modelId
+                            )
+                        }
+
                         db.execute(
                             """
                             INSERT OR IGNORE INTO chat_exchanges
-                                (id, project_id, provider_id, model_id, purpose, timestamp,
+                                (id, project_id, conversation_id, provider_id, model_id, purpose, timestamp,
                                  prompt_tokens, completion_tokens, total_tokens,
-                                 assistant_text, raw_file, raw_available)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                                 user_prompt, assistant_text, raw_file, raw_available)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                             """.trimIndent(),
                             id,
                             projectId,
+                            conversationId,
                             providerId,
                             modelId,
                             purposeStr,
@@ -256,6 +276,7 @@ class JsonlRebuildService(
                             promptTokens,
                             completionTokens,
                             totalTokens,
+                            prompt,
                             assistantText,
                             file.name
                         )
@@ -317,6 +338,18 @@ class JsonlRebuildService(
                     }
                 }
             }
+        }
+
+        // Step 9: Update conversation turn counts from imported exchanges
+        try {
+            db.execute(
+                """UPDATE conversations SET
+                    turn_count = (SELECT COUNT(*) FROM chat_exchanges WHERE conversation_id = conversations.id),
+                    updated_at = (SELECT MAX(timestamp) FROM chat_exchanges WHERE conversation_id = conversations.id)
+                WHERE id IN (SELECT DISTINCT conversation_id FROM chat_exchanges WHERE conversation_id IS NOT NULL)"""
+            )
+        } catch (e: Exception) {
+            Dev.warn(log, "rebuild.turn_count_update_failed", e)
         }
 
         val stats = RebuildStats(

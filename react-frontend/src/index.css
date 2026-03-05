@@ -1,0 +1,932 @@
+/**
+ * you-me-and-myself — React Chat UI Stylesheet
+ *
+ * Design system:
+ * - Dark theme matching IntelliJ Darcula (bg: #1e1e1e, text: #d4d4d4)
+ * - BEM-ish class naming: .ymm-{block}__{element}--{modifier}
+ * - All dimensions in px for JCEF consistency (no rem — JCEF root font varies)
+ * - No external fonts — system-ui stack for maximum compatibility
+ *
+ * Color palette:
+ * - Background:     #1e1e1e (main), #252526 (surfaces), #2d2d2d (elevated)
+ * - Text:           #d4d4d4 (primary), #808080 (muted), #569cd6 (accent)
+ * - User bubble:    #264f78 (background), #d4d4d4 (text)
+ * - Assistant:      transparent (full width), #d4d4d4 (text)
+ * - System:         transparent, #808080 (muted text)
+ * - Error:          #f44747 (text), rgba(244,71,71,0.1) (background)
+ * - Correction:     #569cd6 (confirm), #f44747 (reject)
+ * - R4 tabs:        #2d2d2d (tab bg), #569cd6 (active border), #dcdcaa (star active)
+ */
+
+/* ═══════════════════════════════════════════════════════════════════════
+   RESET & BASE
+   ═══════════════════════════════════════════════════════════════════════ */
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body {
+    height: 100%;
+    overflow: hidden;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+#root {
+    height: 100%;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   APP LAYOUT
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-chat-app {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: #1e1e1e;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   METRICS BAR
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-metrics-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 12px;
+    background: #252526;
+    border-bottom: 1px solid #333;
+    font-size: 11px;
+    color: #808080;
+    flex-shrink: 0;
+}
+
+.ymm-metrics-bar__model {
+    color: #569cd6;
+    font-weight: 600;
+    margin-right: 4px;
+}
+
+.ymm-metrics-bar__item--total {
+    color: #d4d4d4;
+    font-weight: 600;
+}
+
+.ymm-metrics-bar__cost {
+    margin-left: auto;
+    color: #dcdcaa;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   PROVIDER BAR
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-provider-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: #252526;
+    border-bottom: 1px solid #333;
+    flex-shrink: 0;
+}
+
+.ymm-provider-bar__select {
+    flex: 1;
+    padding: 4px 8px;
+    background: #3c3c3c;
+    color: #d4d4d4;
+    border: 1px solid #555;
+    border-radius: 3px;
+    font-size: 12px;
+    outline: none;
+    cursor: pointer;
+}
+
+.ymm-provider-bar__select:focus {
+    border-color: #569cd6;
+}
+
+.ymm-provider-bar__empty {
+    flex: 1;
+    font-size: 12px;
+    color: #808080;
+    font-style: italic;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   TAB BAR (R4)
+   Horizontal tab bar for switching between conversations.
+   Sits between the provider bar and the message list.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-tab-bar {
+    display: flex;
+    align-items: stretch;
+    background: #1e1e1e;
+    border-bottom: 1px solid #333;
+    flex-shrink: 0;
+    min-height: 32px;
+}
+
+/* Scrollable tab container — hides overflow, scrolls horizontally */
+.ymm-tab-bar__tabs {
+    display: flex;
+    align-items: stretch;
+    flex: 1;
+    overflow-x: auto;
+    overflow-y: hidden;
+    /* Hide scrollbar — tabs scroll via wheel and the bar is thin enough */
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+
+.ymm-tab-bar__tabs::-webkit-scrollbar {
+    display: none;
+}
+
+/* Individual tab button */
+.ymm-tab-bar__tab {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    background: transparent;
+    color: #808080;
+    border: none;
+    border-bottom: 2px solid transparent;
+    font-size: 11px;
+    font-family: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 160px;
+    min-width: 60px;
+    flex-shrink: 0;
+    transition: color 0.15s ease, background 0.15s ease;
+}
+
+.ymm-tab-bar__tab:hover {
+    background: #2d2d2d;
+    color: #d4d4d4;
+}
+
+/* Active tab — accent bottom border + brighter text */
+.ymm-tab-bar__tab--active {
+    color: #d4d4d4;
+    border-bottom-color: #569cd6;
+    background: #252526;
+}
+
+/* Thinking indicator — subtle pulse on the tab while AI is generating */
+.ymm-tab-bar__tab--thinking {
+    animation: ymm-tab-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes ymm-tab-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
+/* Tab title — truncated with ellipsis */
+.ymm-tab-bar__title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Close button — subtle, more visible on hover */
+.ymm-tab-bar__close {
+    font-size: 14px;
+    line-height: 1;
+    color: #666;
+    cursor: pointer;
+    padding: 0 2px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+.ymm-tab-bar__close:hover {
+    color: #f44747;
+    background: rgba(244, 71, 71, 0.15);
+}
+
+/* New tab button — fixed on the right */
+.ymm-tab-bar__new {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    background: transparent;
+    color: #808080;
+    border: none;
+    border-left: 1px solid #333;
+    font-size: 16px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.ymm-tab-bar__new:hover {
+    background: #2d2d2d;
+    color: #d4d4d4;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MESSAGE LIST
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-message-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    /* R4: position relative for the scroll-to-bottom button */
+    position: relative;
+}
+
+.ymm-message-list--empty {
+    justify-content: center;
+    align-items: center;
+}
+
+.ymm-empty-state {
+    text-align: center;
+    color: #808080;
+}
+
+.ymm-empty-state__title {
+    font-size: 16px;
+    margin-bottom: 4px;
+    color: #999;
+}
+
+.ymm-empty-state__subtitle {
+    font-size: 12px;
+}
+
+/* ── Individual Messages ──────────────────────────────────────────── */
+
+.ymm-message {
+    padding: 8px 12px;
+    border-radius: 6px;
+    max-width: 100%;
+    word-wrap: break-word;
+    white-space: pre-wrap;
+}
+
+.ymm-message--user {
+    background: #264f78;
+    align-self: flex-end;
+    max-width: 85%;
+    border-radius: 6px 6px 2px 6px;
+}
+
+.ymm-message--assistant {
+    background: #2d2d2d;
+    border-radius: 6px;
+}
+
+.ymm-message--error {
+    background: rgba(244, 71, 71, 0.1);
+    border-left: 3px solid #f44747;
+}
+
+/* R4: Message header — row with role label and star button */
+.ymm-message__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 2px;
+}
+
+.ymm-message__role {
+    font-size: 11px;
+    font-weight: 600;
+    color: #808080;
+}
+
+.ymm-message--user .ymm-message__role {
+    color: #9cdcfe;
+}
+
+.ymm-message__content {
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+.ymm-message__content.ymm-markdown {
+    white-space: normal;
+}
+
+.ymm-message__timestamp {
+    font-size: 10px;
+    color: #666;
+    margin-top: 4px;
+    text-align: right;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   EXCHANGE STAR (R4)
+   Star/favourite toggle on assistant messages.
+   Independent of code block bookmarks (R5).
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-exchange-star {
+    background: transparent;
+    border: none;
+    color: #666;
+    font-size: 14px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+    transition: color 0.15s ease;
+}
+
+.ymm-exchange-star:hover {
+    color: #dcdcaa;
+}
+
+/* Active (starred) state — filled star in gold */
+.ymm-exchange-star--active {
+    color: #dcdcaa;
+}
+
+.ymm-exchange-star--active:hover {
+    color: #f44747;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCROLL TO BOTTOM BUTTON (R4)
+   Floating button that appears when user scrolls up in the message list.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-scroll-to-bottom {
+    position: sticky;
+    bottom: 8px;
+    align-self: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: #3c3c3c;
+    color: #d4d4d4;
+    border: 1px solid #555;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    transition: background 0.15s ease;
+    z-index: 10;
+    flex-shrink: 0;
+}
+
+.ymm-scroll-to-bottom:hover {
+    background: #505050;
+}
+
+/* ── Correction Buttons ───────────────────────────────────────────── */
+
+.ymm-message__correction {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #444;
+}
+
+.ymm-correction-btn {
+    padding: 3px 10px;
+    border: 1px solid #555;
+    border-radius: 3px;
+    font-size: 11px;
+    cursor: pointer;
+    background: #3c3c3c;
+}
+
+.ymm-correction-btn--confirm {
+    color: #4ec9b0;
+    border-color: #4ec9b0;
+}
+
+.ymm-correction-btn--confirm:hover {
+    background: rgba(78, 201, 176, 0.15);
+}
+
+.ymm-correction-btn--reject {
+    color: #f44747;
+    border-color: #f44747;
+}
+
+.ymm-correction-btn--reject:hover {
+    background: rgba(244, 71, 71, 0.15);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SYSTEM MESSAGES
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-system-message {
+    text-align: center;
+    font-size: 11px;
+    color: #808080;
+    padding: 4px 12px;
+    font-style: italic;
+}
+
+.ymm-system-message--error {
+    color: #f44747;
+    font-style: normal;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   THINKING INDICATOR
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-thinking {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 8px 24px;
+    color: #808080;
+    font-size: 13px;
+    flex-shrink: 0;
+}
+
+.ymm-thinking__label {
+    margin-right: 2px;
+}
+
+.ymm-thinking__dot {
+    animation: ymm-pulse 1s infinite;
+    font-size: 18px;
+    line-height: 1;
+}
+
+@keyframes ymm-pulse {
+    0%,
+    100% {
+        opacity: 0.3;
+    }
+    50% {
+        opacity: 1;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   INPUT BAR
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-input-bar {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    padding: 8px 12px;
+    background: #252526;
+    border-top: 1px solid #333;
+    flex-shrink: 0;
+}
+
+.ymm-input-bar__textarea {
+    flex: 1;
+    padding: 8px 10px;
+    background: #3c3c3c;
+    color: #d4d4d4;
+    border: 1px solid #555;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.4;
+    resize: none;
+    outline: none;
+    min-height: 36px;
+    max-height: 120px;
+}
+
+.ymm-input-bar__textarea:focus {
+    border-color: #569cd6;
+}
+
+.ymm-input-bar__textarea:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.ymm-input-bar__textarea::placeholder {
+    color: #808080;
+}
+
+.ymm-input-bar__send {
+    padding: 8px 16px;
+    background: #569cd6;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.ymm-input-bar__send:hover:not(:disabled) {
+    background: #6db3f2;
+}
+
+.ymm-input-bar__send:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   DEV MODE BANNER
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-dev-banner {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 2px 8px;
+    background: #dcdcaa;
+    color: #1e1e1e;
+    font-size: 10px;
+    font-weight: 600;
+    text-align: center;
+    z-index: 1000;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MARKDOWN PROSE (R2)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-markdown p {
+    margin: 0 0 8px 0;
+}
+
+.ymm-markdown p:last-child {
+    margin-bottom: 0;
+}
+
+.ymm-markdown h1,
+.ymm-markdown h2,
+.ymm-markdown h3,
+.ymm-markdown h4 {
+    margin: 12px 0 6px 0;
+    color: #e0e0e0;
+    line-height: 1.3;
+}
+
+.ymm-markdown h1 { font-size: 18px; }
+.ymm-markdown h2 { font-size: 16px; }
+.ymm-markdown h3 { font-size: 14px; }
+.ymm-markdown h4 { font-size: 13px; }
+
+.ymm-markdown strong {
+    color: #e0e0e0;
+    font-weight: 600;
+}
+
+.ymm-markdown em {
+    font-style: italic;
+}
+
+.ymm-markdown a {
+    color: #569cd6;
+    text-decoration: none;
+}
+
+.ymm-markdown a:hover {
+    text-decoration: underline;
+}
+
+.ymm-markdown code {
+    background: #383838;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
+    font-size: 12px;
+}
+
+.ymm-markdown pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: 12px;
+}
+
+.ymm-markdown ul,
+.ymm-markdown ol {
+    margin: 4px 0 8px 0;
+    padding-left: 24px;
+}
+
+.ymm-markdown li {
+    margin: 2px 0;
+}
+
+.ymm-markdown li > ul,
+.ymm-markdown li > ol {
+    margin: 2px 0 2px 0;
+}
+
+.ymm-markdown blockquote {
+    border-left: 3px solid #555;
+    padding: 4px 12px;
+    margin: 8px 0;
+    color: #999;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.ymm-markdown hr {
+    border: none;
+    border-top: 1px solid #444;
+    margin: 12px 0;
+}
+
+.ymm-markdown table {
+    border-collapse: collapse;
+    margin: 8px 0;
+    width: 100%;
+    font-size: 12px;
+}
+
+.ymm-markdown th,
+.ymm-markdown td {
+    border: 1px solid #444;
+    padding: 4px 8px;
+    text-align: left;
+}
+
+.ymm-markdown th {
+    background: #333;
+    font-weight: 600;
+    color: #e0e0e0;
+}
+
+.ymm-markdown tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CODE BLOCKS (R2)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-code-block {
+    position: relative;
+    margin: 8px 0;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #161b22;
+    border: 1px solid #2a2a2a;
+}
+
+.ymm-code-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 8px;
+    background: #1c2129;
+    border-bottom: 1px solid #2a2a2a;
+    min-height: 26px;
+}
+
+.ymm-code-lang {
+    font-size: 11px;
+    color: #8b949e;
+    font-family: system-ui, sans-serif;
+    text-transform: lowercase;
+    font-weight: 500;
+}
+
+.ymm-code-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    /* R5: Always push actions to the right, even when no language label exists.
+       Without this, actions float left when .ymm-code-lang is absent. */
+    margin-left: auto;
+}
+
+.ymm-code-block pre {
+    margin: 0;
+    padding: 12px;
+    overflow-x: auto;
+}
+
+.ymm-code-block code {
+    font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    tab-size: 4;
+}
+
+.ymm-code-btn {
+    padding: 2px 8px;
+    background: transparent;
+    color: #8b949e;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    font-size: 11px;
+    cursor: pointer;
+    font-family: system-ui, sans-serif;
+    transition: color 0.15s ease, background 0.15s ease;
+}
+
+.ymm-code-btn:hover {
+    background: #30363d;
+    color: #d4d4d4;
+    border-color: #444;
+}
+
+.ymm-code-copy--success {
+    color: #4ec9b0 !important;
+}
+
+.ymm-code-copy--failed {
+    color: #f44747 !important;
+}
+
+/* R5: Bookmark ribbon on code blocks — bookmarks the entire exchange */
+.ymm-code-bookmark {
+    display: flex;
+    align-items: center;
+}
+
+.ymm-code-bookmark svg {
+    width: 14px;
+    height: 14px;
+}
+
+.ymm-code-bookmark:hover {
+    color: #dcdcaa;
+}
+
+.ymm-code-bookmark--active {
+    color: #dcdcaa;
+}
+
+.ymm-code-bookmark--active svg {
+    fill: #dcdcaa;
+}
+
+.ymm-code-bookmark--pending {
+    font-size: 10px;
+    color: #888;
+    pointer-events: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MATH / KATEX (R3)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-math-block {
+    margin: 12px 0;
+    text-align: center;
+    overflow-x: auto;
+}
+
+.ymm-math-error {
+    color: #f44747;
+    background: rgba(244, 71, 71, 0.1);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
+    font-size: 12px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MERMAID DIAGRAMS (R3)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-mermaid-diagram {
+    padding: 12px;
+    text-align: center;
+    overflow-x: auto;
+}
+
+.ymm-mermaid-diagram svg {
+    max-width: 100%;
+    height: auto;
+}
+
+.ymm-mermaid-error {
+    padding: 4px 12px;
+    font-size: 11px;
+    color: #f44747;
+    background: rgba(244, 71, 71, 0.08);
+    border-top: 1px solid #2a2a2a;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   COLLAPSIBLE SECTIONS (R3)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-collapsible {
+    margin: 8px 0;
+    border: 1px solid #333;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.ymm-collapsible__summary {
+    padding: 6px 12px;
+    background: #252526;
+    cursor: pointer;
+    font-weight: 500;
+    color: #d4d4d4;
+    list-style: none;
+    user-select: none;
+}
+
+.ymm-collapsible__summary::before {
+    content: "▶ ";
+    font-size: 10px;
+    color: #808080;
+    transition: transform 0.15s ease;
+    display: inline-block;
+}
+
+.ymm-collapsible[open] > .ymm-collapsible__summary::before {
+    transform: rotate(90deg);
+}
+
+.ymm-collapsible__summary:hover {
+    background: #2d2d2d;
+}
+
+.ymm-collapsible__body {
+    padding: 8px 12px;
+    border-top: 1px solid #333;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   FOOTNOTES (R3)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.footnote-ref a {
+    color: #569cd6;
+    text-decoration: none;
+    font-size: 11px;
+    vertical-align: super;
+}
+
+.footnote-ref a:hover {
+    text-decoration: underline;
+}
+
+.footnotes-sep {
+    border: none;
+    border-top: 1px solid #444;
+    margin: 16px 0 8px 0;
+}
+
+.footnotes-list {
+    font-size: 12px;
+    color: #999;
+    padding-left: 20px;
+}
+
+.footnotes-list li {
+    margin: 4px 0;
+}
+
+.footnote-backref {
+    color: #569cd6;
+    text-decoration: none;
+    font-size: 10px;
+    margin-left: 4px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCROLLBAR (match IntelliJ Darcula)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+::-webkit-scrollbar {
+    width: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1e1e1e;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #424242;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #555;
+}

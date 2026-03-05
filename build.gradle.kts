@@ -67,7 +67,7 @@ tasks {
     // Default runIde; let the plugin/IDE pick the right runtime (no JBR overrides)
     runIde {
         // Disable Gradle plugin in the sandbox no matter what
-        jvmArgs("-Didea.plugins.disabled=com.intellij.gradle", "-Dymm.devMode=true")
+        jvmArgs("-Didea.plugins.disabled=com.intellij.gradle", "-Dymm.devMode=true", "-Dymm.reactChat=true") // add  -Dymm.reactChat=false to enable old html frontend
 
         // (Optional) print sandbox for log inspection
         doFirst {

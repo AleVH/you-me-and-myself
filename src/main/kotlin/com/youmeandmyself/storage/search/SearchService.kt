@@ -82,6 +82,19 @@ class SearchService(private val project: Project) {
                     appliedFilters.add("provider: $it")
                 }
 
+                // Starred filter — uses is_starred column directly
+                if (criteria.isStarred == true) {
+                    conditions.add("ce.is_starred = 1")
+                    appliedFilters.add("starred")
+                }
+
+                // Conversation filter — show only exchanges from a specific chat session
+                if (criteria.conversationId != null) {
+                    conditions.add("ce.conversation_id = ?")
+                    params.add(criteria.conversationId)
+                    appliedFilters.add("conversation: ${criteria.conversationId}")
+                }
+
                 val fromClause = if (needsBookmarkJoin) {
                     "FROM chat_exchanges ce JOIN bookmarks b ON b.source_id = ce.id"
                 } else {

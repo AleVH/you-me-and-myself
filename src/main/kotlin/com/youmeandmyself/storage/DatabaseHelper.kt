@@ -20,7 +20,7 @@ import java.sql.ResultSet
  *
  * If the database is ever lost or corrupted, it can be fully rebuilt from JSONL.
  *
- * ## Schema: 10 Tables
+ * ## Schema: 12 Tables
  *
  * Created on first run, all tables exist from day one even if some features
  * (summaries, bookmarks) haven't been built yet. This avoids future migrations.
@@ -35,6 +35,8 @@ import java.sql.ResultSet
  * 8.  bookmarks         — saved items (chat or summary) with cached content
  * 9.  bookmark_tags     — tags on bookmarks for filtering
  * 10. storage_config    — global plugin settings (retention, cleanup thresholds)
+ * 11. open_tabs         — persisted chat tab state for restore on IDE restart
+ * 12. code_bookmarks    — saved code blocks from chat responses
  *
  * ## Thread Safety
  *
@@ -258,29 +260,33 @@ class DatabaseHelper(private val dbFile: File) {
      * The schema matches Storage_schema_complete.md v3 exactly.
      */
     private fun createSchema(conn: Connection) {
-        conn.createStatement().use { stmt ->
+        try {
+            conn.createStatement().use { stmt ->
 
-            // DEV MODE: Wipe and recreate tables when schema is evolving.
-            // This is safe because JSONL is the source of truth — the database
-            // can always be rebuilt. In production, Dev.isEnabled is false and
-            // this block is skipped entirely.
-            if (DevMode.isEnabled()) {
-                Dev.info(log, "db.schema.dev_wipe", "reason" to "dev mode active, ensuring clean schema")
-                stmt.execute("DROP TABLE IF EXISTS bookmark_tags")
-                stmt.execute("DROP TABLE IF EXISTS bookmarks")
-                stmt.execute("DROP TABLE IF EXISTS collections")
-                stmt.execute("DROP TABLE IF EXISTS summary_config")
-                stmt.execute("DROP TABLE IF EXISTS summary_hierarchy")
-                stmt.execute("DROP TABLE IF EXISTS summaries")
-                stmt.execute("DROP TABLE IF EXISTS chat_exchanges")
-                stmt.execute("DROP TABLE IF EXISTS conversations")
-                stmt.execute("DROP TABLE IF EXISTS code_elements")
-                stmt.execute("DROP TABLE IF EXISTS storage_config")
-                stmt.execute("DROP TABLE IF EXISTS projects")
-            }
+                // DEV MODE: Wipe and recreate tables when schema is evolving.
+                // This is safe because JSONL is the source of truth — the database
+                // can always be rebuilt. In production, Dev.isEnabled is false and
+                // this block is skipped entirely.
+                if (DevMode.isEnabled()) {
+                    Dev.info(log, "db.schema.dev_wipe", "reason" to "dev mode active, ensuring clean schema")
+                    stmt.execute("PRAGMA foreign_keys = OFF")
+                    stmt.execute("DROP TABLE IF EXISTS bookmark_tags")
+                    stmt.execute("DROP TABLE IF EXISTS bookmarks")
+                    stmt.execute("DROP TABLE IF EXISTS collections")
+                    stmt.execute("DROP TABLE IF EXISTS summary_config")
+                    stmt.execute("DROP TABLE IF EXISTS summary_hierarchy")
+                    stmt.execute("DROP TABLE IF EXISTS summaries")
+                    stmt.execute("DROP TABLE IF EXISTS code_bookmarks")
+                    stmt.execute("DROP TABLE IF EXISTS chat_exchanges")
+                    stmt.execute("DROP TABLE IF EXISTS conversations")
+                    stmt.execute("DROP TABLE IF EXISTS code_elements")
+                    stmt.execute("DROP TABLE IF EXISTS storage_config")
+                    stmt.execute("DROP TABLE IF EXISTS projects")
+                    stmt.execute("DROP TABLE IF EXISTS open_tabs")
+                }
 
-            // ── Table 1: projects ──
-            stmt.execute("""
+                // ── Table 1: projects ──
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS projects (
                     id             TEXT PRIMARY KEY,
                     name           TEXT NOT NULL,
@@ -291,10 +297,10 @@ class DatabaseHelper(private val dbFile: File) {
                 )
             """.trimIndent())
 
-            // ── Table: conversations ──
-            // Groups exchanges into named multi-turn dialogues.
-            // Enables chat tabs, Library conversation view, and history replay.
-            stmt.execute("""
+                // ── Table: conversations ──
+                // Groups exchanges into named multi-turn dialogues.
+                // Enables chat tabs, Library conversation view, and history replay.
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS conversations (
                     id                          TEXT PRIMARY KEY,
                     project_id                  TEXT NOT NULL REFERENCES projects(id),
@@ -308,28 +314,28 @@ class DatabaseHelper(private val dbFile: File) {
                     max_history_tokens_override INTEGER
                 )
             """.trimIndent())
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_active ON conversations(is_active)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_active ON conversations(is_active)")
 
-            // ── Table 2: chat_exchanges ──
-            // Phase 4: Replaced single `tokens_used INTEGER` with three columns
-            // Phase 4: Token breakdown (prompt, completion, total)
-            // Phase 4A: assistant_text (lazy-cached parsed response)
-            //           derived metadata (code blocks, topics, file paths, duplicate hash)
-            //           IDE context (active file, language, module, branch)
-            //
-            // This enables:
-            // - Per-exchange cost visibility in the UI
-            // - Chat vs summary token aggregation (via GROUP BY purpose)
-            // - Token budget tracking for enterprise customers
-            //
-            // Note: flags and labels are stored as comma-separated strings.
-            // These columns are not in the original schema doc but are needed
-            // to support the existing updateMetadata(flags, labels) API from v1.
-            // They're lightweight enough to keep as CSV strings rather than
-            // a separate join table (unlike bookmark_tags which are user-facing).
-            stmt.execute("""
+                // ── Table 2: chat_exchanges ──
+                // Phase 4: Replaced single `tokens_used INTEGER` with three columns
+                // Phase 4: Token breakdown (prompt, completion, total)
+                // Phase 4A: assistant_text (lazy-cached parsed response)
+                //           derived metadata (code blocks, topics, file paths, duplicate hash)
+                //           IDE context (active file, language, module, branch)
+                //
+                // This enables:
+                // - Per-exchange cost visibility in the UI
+                // - Chat vs summary token aggregation (via GROUP BY purpose)
+                // - Token budget tracking for enterprise customers
+                //
+                // Note: flags and labels are stored as comma-separated strings.
+                // These columns are not in the original schema doc but are needed
+                // to support the existing updateMetadata(flags, labels) API from v1.
+                // They're lightweight enough to keep as CSV strings rather than
+                // a separate join table (unlike bookmark_tags which are user-facing).
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS chat_exchanges (
                     id                TEXT PRIMARY KEY,
                     project_id        TEXT NOT NULL REFERENCES projects(id),
@@ -360,19 +366,21 @@ class DatabaseHelper(private val dbFile: File) {
                     context_language  TEXT,
                     context_module    TEXT,
                     context_branch    TEXT,
-                    open_files        TEXT
+                    open_files        TEXT,
+                    -- Exchange-level starring (favourites)
+                    is_starred        INTEGER NOT NULL DEFAULT 0
                 )
             """.trimIndent())
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_project ON chat_exchanges(project_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_conversation ON chat_exchanges(conversation_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_timestamp ON chat_exchanges(timestamp)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_purpose ON chat_exchanges(purpose)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_duplicate ON chat_exchanges(duplicate_hash)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_has_code ON chat_exchanges(has_code_block)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_project ON chat_exchanges(project_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_conversation ON chat_exchanges(conversation_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_timestamp ON chat_exchanges(timestamp)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_purpose ON chat_exchanges(purpose)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_duplicate ON chat_exchanges(duplicate_hash)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_has_code ON chat_exchanges(has_code_block)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_starred ON chat_exchanges(is_starred)")
 
-
-            // ── Table 3: code_elements ──
-            stmt.execute("""
+                // ── Table 3: code_elements ──
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS code_elements (
                     id           TEXT PRIMARY KEY,
                     project_id   TEXT NOT NULL REFERENCES projects(id),
@@ -384,13 +392,13 @@ class DatabaseHelper(private val dbFile: File) {
                     last_seen_at TEXT NOT NULL
                 )
             """.trimIndent())
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_ce_project ON code_elements(project_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_ce_file ON code_elements(file_path)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_ce_parent ON code_elements(parent_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_ce_hash ON code_elements(content_hash)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_ce_project ON code_elements(project_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_ce_file ON code_elements(file_path)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_ce_parent ON code_elements(parent_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_ce_hash ON code_elements(content_hash)")
 
-            // ── Table 4: summaries ──
-            stmt.execute("""
+                // ── Table 4: summaries ──
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS summaries (
                     id                  TEXT PRIMARY KEY,
                     code_element_id     TEXT NOT NULL REFERENCES code_elements(id),
@@ -406,13 +414,13 @@ class DatabaseHelper(private val dbFile: File) {
                     raw_available       INTEGER NOT NULL DEFAULT 1
                 )
             """.trimIndent())
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_project ON summaries(project_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_element ON summaries(code_element_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_stale ON summaries(is_stale)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_hash ON summaries(content_hash_at_gen)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_project ON summaries(project_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_element ON summaries(code_element_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_stale ON summaries(is_stale)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_hash ON summaries(content_hash_at_gen)")
 
-            // ── Table 5: summary_hierarchy ──
-            stmt.execute("""
+                // ── Table 5: summary_hierarchy ──
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS summary_hierarchy (
                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
                     parent_summary_id TEXT NOT NULL REFERENCES summaries(id),
@@ -420,11 +428,11 @@ class DatabaseHelper(private val dbFile: File) {
                     UNIQUE(parent_summary_id, child_summary_id)
                 )
             """.trimIndent())
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_sh_parent ON summary_hierarchy(parent_summary_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_sh_child ON summary_hierarchy(child_summary_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sh_parent ON summary_hierarchy(parent_summary_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sh_child ON summary_hierarchy(child_summary_id)")
 
-            // ── Table 6: summary_config ──
-            stmt.execute("""
+                // ── Table 6: summary_config ──
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS summary_config (
                     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id             TEXT NOT NULL UNIQUE REFERENCES projects(id),
@@ -439,8 +447,8 @@ class DatabaseHelper(private val dbFile: File) {
                 )
             """.trimIndent())
 
-            // ── Table 7: collections ──
-            stmt.execute("""
+                // ── Table 7: collections ──
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS collections (
                     id         TEXT PRIMARY KEY,
                     project_id TEXT REFERENCES projects(id),
@@ -450,10 +458,10 @@ class DatabaseHelper(private val dbFile: File) {
                     sort_order INTEGER NOT NULL DEFAULT 0
                 )
             """.trimIndent())
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_coll_project ON collections(project_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_coll_project ON collections(project_id)")
 
-            // ── Table 8: bookmarks ──
-            stmt.execute("""
+                // ── Table 8: bookmarks ──
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS bookmarks (
                     id             TEXT PRIMARY KEY,
                     collection_id  TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
@@ -465,11 +473,11 @@ class DatabaseHelper(private val dbFile: File) {
                     sort_order     INTEGER NOT NULL DEFAULT 0
                 )
             """.trimIndent())
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_bm_collection ON bookmarks(collection_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_bm_source ON bookmarks(source_type, source_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_bm_collection ON bookmarks(collection_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_bm_source ON bookmarks(source_type, source_id)")
 
-            // ── Table 9: bookmark_tags ──
-            stmt.execute("""
+                // ── Table 9: bookmark_tags ──
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS bookmark_tags (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     bookmark_id TEXT NOT NULL REFERENCES bookmarks(id) ON DELETE CASCADE,
@@ -477,11 +485,11 @@ class DatabaseHelper(private val dbFile: File) {
                     UNIQUE(bookmark_id, tag)
                 )
             """.trimIndent())
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_bt_bookmark ON bookmark_tags(bookmark_id)")
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_bt_tag ON bookmark_tags(tag)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_bt_bookmark ON bookmark_tags(bookmark_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_bt_tag ON bookmark_tags(tag)")
 
-            // ── Table 10: storage_config ──
-            stmt.execute("""
+                // ── Table 10: storage_config ──
+                stmt.execute("""
                 CREATE TABLE IF NOT EXISTS storage_config (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
                     config_key   TEXT NOT NULL UNIQUE,
@@ -489,26 +497,72 @@ class DatabaseHelper(private val dbFile: File) {
                 )
             """.trimIndent())
 
-            // Insert default config values if they don't exist yet.
-            // Using INSERT OR IGNORE so this is safe on every startup.
-            val defaults = listOf(
-                "retention_policy" to "FOREVER",
-                "cleanup_suggestion_threshold_mb" to "2048",
-                "last_cleanup_suggestion" to null,
-                "storage_root_path" to StorageConfig.DEFAULT_ROOT.absolutePath
-            )
-            val insertConfig = conn.prepareStatement(
-                "INSERT OR IGNORE INTO storage_config (config_key, config_value) VALUES (?, ?)"
-            )
-            for ((key, value) in defaults) {
-                insertConfig.setString(1, key)
-                if (value != null) insertConfig.setString(2, value) else insertConfig.setNull(2, java.sql.Types.VARCHAR)
-                insertConfig.executeUpdate()
-            }
-            insertConfig.close()
-        }
+                // ── Table 11: open_tabs (R4) ──
+                // Persists the frontend's open tab state for restore on IDE restart.
+                // Controlled by the `keep_tabs` setting in storage_config.
+                // Uses full-replace strategy: TabStateService deletes all rows for
+                // the project and re-inserts on every save.
+                stmt.execute("""
+                CREATE TABLE IF NOT EXISTS open_tabs (
+                    id              TEXT PRIMARY KEY,
+                    project_id      TEXT NOT NULL REFERENCES projects(id),
+                    conversation_id TEXT REFERENCES conversations(id),
+                    title           TEXT NOT NULL DEFAULT 'New Chat',
+                    tab_order       INTEGER NOT NULL DEFAULT 0,
+                    is_active       INTEGER NOT NULL DEFAULT 0,
+                    scroll_position INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT NOT NULL
+                )
+            """.trimIndent())
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_ot_project ON open_tabs(project_id)")
 
-        Dev.info(log, "db.schema.created", "tables" to 10)
+                // ── Table 12: code_bookmarks ──
+                stmt.execute("""
+                CREATE TABLE IF NOT EXISTS code_bookmarks (
+                    id              TEXT PRIMARY KEY,
+                    project_id      TEXT NOT NULL REFERENCES projects(id),
+                    exchange_id     TEXT NOT NULL REFERENCES chat_exchanges(id),
+                    block_index     INTEGER NOT NULL,
+                    language        TEXT,
+                    content         TEXT NOT NULL,
+                    title           TEXT,
+                    tags            TEXT,
+                    created_at      TEXT NOT NULL,
+                    UNIQUE(exchange_id, block_index)
+                )
+            """.trimIndent())
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_project ON code_bookmarks(project_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_exchange ON code_bookmarks(exchange_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_language ON code_bookmarks(language)")
+
+                // Insert default config values if they don't exist yet.
+                // Using INSERT OR IGNORE so this is safe on every startup.
+                val defaults = listOf(
+                    "retention_policy" to "FOREVER",
+                    "cleanup_suggestion_threshold_mb" to "2048",
+                    "last_cleanup_suggestion" to null,
+                    "storage_root_path" to StorageConfig.DEFAULT_ROOT.absolutePath,
+                    "keep_tabs" to "true"
+                )
+                val insertConfig = conn.prepareStatement(
+                    "INSERT OR IGNORE INTO storage_config (config_key, config_value) VALUES (?, ?)"
+                )
+                for ((key, value) in defaults) {
+                    insertConfig.setString(1, key)
+                    if (value != null) insertConfig.setString(2, value) else insertConfig.setNull(2, java.sql.Types.VARCHAR)
+                    insertConfig.executeUpdate()
+                }
+                insertConfig.close()
+            }
+
+            Dev.info(log, "db.schema.created", "tables" to 11)
+        } catch (e: org.sqlite.SQLiteException) {
+            if (e.message?.contains("FOREIGN KEY") == true) {
+                Dev.error(log, "db.schema.fk_error", e, "line" to "createSchema")
+                diagnoseForeignKeyViolations(conn)
+            }
+            throw e
+        }
     }
 
     // ==================== Internal ====================
@@ -545,6 +599,48 @@ class DatabaseHelper(private val dbFile: File) {
                 is Double -> stmt.setDouble(jdbcIndex, param)
                 else -> stmt.setString(jdbcIndex, param.toString())
             }
+        }
+    }
+
+    /**
+     * Diagnose foreign key violations with full detail.
+     *
+     * SQLite's default FK error message is useless ("FOREIGN KEY constraint failed").
+     * This runs PRAGMA foreign_key_check which returns:
+     *   - table: the child table with the bad reference
+     *   - rowid: the offending row
+     *   - parent: the parent table it tried to reference
+     *   - fkid: the FK constraint index
+     *
+     * Call this in catch blocks when you get SQLITE_CONSTRAINT_FOREIGNKEY.
+     */
+    private fun diagnoseForeignKeyViolations(conn: Connection) {
+        try {
+            conn.createStatement().use { stmt ->
+                val rs = stmt.executeQuery("PRAGMA foreign_key_check")
+                val violations = mutableListOf<String>()
+                while (rs.next()) {
+                    val table = rs.getString(1)
+                    val rowid = rs.getLong(2)
+                    val parent = rs.getString(3)
+                    val fkid = rs.getInt(4)
+                    violations.add("table=$table rowid=$rowid parent=$parent fkid=$fkid")
+                }
+                rs.close()
+
+                if (violations.isEmpty()) {
+                    Dev.error(
+                        log, "db.fk_check.no_violations_found", null,
+                        "note" to "FK error thrown but PRAGMA check found nothing — possibly a DROP order issue"
+                    )
+                } else {
+                    for (v in violations) {
+                        Dev.error(log, "db.fk_violation", null, "detail" to v)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Dev.error(log, "db.fk_check.failed", e)
         }
     }
 }

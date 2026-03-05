@@ -328,6 +328,32 @@
         .exchange-item:hover { background: var(--bg-hover); }
         .exchange-item.selected { background: var(--bg-active); }
 
+        /* R5: Continue chat banner — shown at top of exchange list in chat view */
+        .chat-continue-banner {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 12px;
+            margin-bottom: 4px;
+            background: var(--bg-active);
+            border-radius: var(--radius);
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        .chat-continue-btn {
+            background: var(--accent);
+            border: none;
+            border-radius: var(--radius);
+            color: #fff;
+            padding: 6px 14px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background var(--transition);
+        }
+        .chat-continue-btn:hover {
+            filter: brightness(1.15);
+        }
+
         .exchange-bookmark-col {
             flex-shrink: 0;
             width: 20px;
@@ -616,15 +642,28 @@
                 <span class="label">All Exchanges</span>
                 <span class="count" id="countAll">—</span>
             </div>
-            <div class="nav-item" data-view="bookmarked">
+            <div class="nav-item" data-view="starred">
                 <span class="icon">⭐</span>
-                <span class="label">Bookmarked</span>
-                <span class="count" id="countBookmarked">—</span>
+                <span class="label">Starred</span>
+                <span class="count" id="countStarred">—</span>
             </div>
             <div class="nav-item" data-view="has-code">
                 <span class="icon">💻</span>
                 <span class="label">Has Code</span>
                 <span class="count" id="countCode">—</span>
+            </div>
+            <div class="nav-item" data-view="bookmarked" style="opacity:0.5;cursor:default;" title="Coming soon — save code blocks from chat">
+                <span class="icon">🔖</span>
+                <span class="label">Bookmarked</span>
+                <span class="count" id="countBookmarked">—</span>
+            </div>
+            <div class="nav-divider"></div>
+            <!-- R5: Chat sessions — adaptive grouping -->
+            <div class="sidebar-header" style="padding-top:6px;">
+                <span>Chats</span>
+            </div>
+            <div id="chatsContainer" class="sidebar-nav" style="padding-top:0;max-height:40vh;overflow-y:auto;">
+                <!-- Populated dynamically by App.loadChatSessions() -->
             </div>
             <div class="nav-divider"></div>
             <!-- Dynamic collections inserted here -->
@@ -650,7 +689,7 @@
         <div class="filter-bar" id="filterBar">
             <span class="filter-label">Filters:</span>
             <div class="chip" data-filter="has-code">💻 Code</div>
-            <div class="chip" data-filter="bookmarked">⭐ Bookmarked</div>
+            <div class="chip" data-filter="starred">⭐ Starred</div>
             <!-- Language chips added dynamically after first search -->
             <div id="dynamicChips"></div>
             <!-- Date range filter -->
@@ -710,13 +749,14 @@
 
     const App = {
         // State
-        currentView: 'all',       // 'all' | 'bookmarked' | 'has-code' | 'collection:name'
+        currentView: 'all',       // 'all' | 'starred' | 'has-code' | 'collection:name' | 'chat:conversationId'
         searchQuery: '',
-        activeFilters: new Set(),  // 'has-code', 'bookmarked', 'lang:kotlin', etc.
+        activeFilters: new Set(),  // 'has-code', 'starred', 'lang:kotlin', etc.
         results: [],
         selectedExchangeId: null,
         stats: null,
         collections: [],
+        chatSessions: [],         // R5: { conversationId, title, updatedAt, turnCount }
         offset: 0,
         limit: 50,
         isLoading: false,
@@ -766,6 +806,7 @@
             this.bindEvents();
             await this.loadStats();
             await this.loadCollections();
+            await this.loadChatSessions();
             await this.loadExchanges();
         },
 
@@ -788,7 +829,19 @@
                 const hasChipFilters = this.activeFilters.size > 0;
                 const needsSearch = hasSearchQuery || hasDateFilter || hasChipFilters;
 
-                if (this.currentView.startsWith('collection:')) {
+                if (this.currentView.startsWith('chat:')) {
+                    // R5: Chat session view — show only exchanges from this conversation
+                    const conversationId = this.currentView.substring(5);
+                    data = await this.query('search', {
+                        query: '',
+                        conversationId: conversationId,
+                        limit: this.limit,
+                        offset: this.offset
+                    });
+                } else if (this.currentView === 'bookmarked') {
+                    // R5: Bookmarked code blocks — coming soon
+                    data = { results: [], totalCount: 0 };
+                } else if (this.currentView.startsWith('collection:')) {
                     if (needsSearch) {
                         // Search within a collection — uses collectionId from buildSearchCriteria
                         data = await this.query('search', this.buildSearchCriteria());
@@ -820,7 +873,7 @@
                             data = { results: [], totalCount: 0 };
                         }
                     }
-                } else if (needsSearch || this.currentView === 'bookmarked' || this.currentView === 'has-code') {
+                } else if (needsSearch || this.currentView === 'starred' || this.currentView === 'has-code') {
                     // Any filter, date, query, or special view → use search with full criteria
                     data = await this.query('search', this.buildSearchCriteria());
                 } else {
@@ -853,8 +906,13 @@
             if (this.activeFilters.has('has-code') || this.currentView === 'has-code') {
                 criteria.hasCode = true;
             }
-            if (this.activeFilters.has('bookmarked') || this.currentView === 'bookmarked') {
-                criteria.isBookmarked = true;
+            if (this.activeFilters.has('starred') || this.currentView === 'starred') {
+                criteria.isStarred = true;
+            }
+
+            // R5: Conversation filter (via chat:conversationId view)
+            if (this.currentView.startsWith('chat:')) {
+                criteria.conversationId = this.currentView.substring(5);
             }
 
             // Language filters
@@ -944,8 +1002,9 @@
             const loadingEl = document.getElementById('loadingState');
             const emptyEl = document.getElementById('emptyState');
 
-            // Remove previous items (keep loading/empty states)
+            // Remove previous items and chat banners (keep loading/empty states)
             list.querySelectorAll('.exchange-item').forEach(el => el.remove());
+            list.querySelectorAll('.chat-continue-banner').forEach(el => el.remove());
 
             if (this.results.length === 0) {
                 loadingEl.classList.add('hidden');
@@ -957,6 +1016,22 @@
             emptyEl.classList.add('hidden');
 
             const fragment = document.createDocumentFragment();
+
+            // R5: Show "Continue chat" banner when viewing a chat session
+            if (this.currentView.startsWith('chat:')) {
+                const conversationId = this.currentView.substring(5);
+                const banner = document.createElement('div');
+                banner.className = 'chat-continue-banner';
+                banner.innerHTML = `
+                    <span>Viewing conversation</span>
+                    <button class="chat-continue-btn" id="chatContinueBtn">💬 Continue chat</button>
+                `;
+                banner.querySelector('.chat-continue-btn').addEventListener('click', () => {
+                    this.continueChat(conversationId);
+                });
+                fragment.appendChild(banner);
+            }
+
             for (const result of this.results) {
                 fragment.appendChild(this.createExchangeElement(result));
             }
@@ -1114,7 +1189,7 @@
             ` : ''}
 
             <div class="detail-section">
-                <div class="detail-section-label">Bookmark</div>
+                <div class="detail-section-label">Star</div>
                 <div style="margin-bottom: 6px;">
                     <span class="bookmark-star ${data.isBookmarked ? 'active' : ''}"
                           id="detailBookmarkStar"
@@ -1123,7 +1198,7 @@
                         ${data.isBookmarked ? '★' : '☆'}
                     </span>
                     <span style="margin-left: 6px; color: var(--text-secondary); font-size: 12px;">
-                        ${data.isBookmarked ? 'Bookmarked' : 'Not bookmarked'}
+                        ${data.isBookmarked ? 'Starred' : 'Not starred'}
                     </span>
                 </div>
                 ${collectionsHtml ? `
@@ -1151,10 +1226,32 @@
                 </div>
                 ` : ''}
             </div>
+
+            ${data.conversationId ? `
+            <div class="detail-section">
+                <div class="detail-section-label">Conversation</div>
+                <button id="continueChatBtn"
+                        data-conversation-id="${data.conversationId}"
+                        style="width: 100%; padding: 8px 12px; background: var(--accent);
+                               border: none; border-radius: var(--radius); color: #fff;
+                               font-size: 12px; cursor: pointer; transition: background var(--transition);
+                               display: flex; align-items: center; justify-content: center; gap: 6px;">
+                    💬 Continue chat
+                </button>
+            </div>
+            ` : ''}
         `;
 
             // Bind detail events
             this.bindDetailEvents(data.exchangeId, data.isBookmarked);
+
+            // R5: Bind "Continue chat" button
+            const continueBtn = document.getElementById('continueChatBtn');
+            if (continueBtn) {
+                continueBtn.addEventListener('click', () => {
+                    this.continueChat(continueBtn.dataset.conversationId);
+                });
+            }
         },
 
         renderCollections() {
@@ -1193,17 +1290,17 @@
             if (!this.stats) return;
             const left = document.getElementById('footerLeft');
             const right = document.getElementById('footerRight');
-            left.textContent = `${this.stats.totalExchanges || 0} exchanges · ${this.stats.totalBookmarks || 0} bookmarked`;
+            left.textContent = `${this.stats.totalExchanges || 0} exchanges · ${this.stats.totalStarred || 0} starred`;
             right.textContent = `${this.stats.totalTokens ? this.stats.totalTokens.toLocaleString() : '—'} total tokens`;
         },
 
         updateSidebarCounts() {
             if (!this.stats) return;
             const countAll = document.getElementById('countAll');
-            const countBookmarked = document.getElementById('countBookmarked');
+            const countStarred = document.getElementById('countStarred');
             const countCode = document.getElementById('countCode');
             if (countAll) countAll.textContent = this.stats.totalExchanges || 0;
-            if (countBookmarked) countBookmarked.textContent = this.stats.totalBookmarks || 0;
+            if (countStarred) countStarred.textContent = this.stats.totalStarred || 0;
             if (countCode) countCode.textContent = this.stats.totalWithCode || 0;
         },
 
@@ -1305,10 +1402,10 @@
             });
 
             // Update filters based on view
-            if (view === 'bookmarked') {
-                this.activeFilters.add('bookmarked');
+            if (view === 'starred') {
+                this.activeFilters.add('starred');
             } else {
-                this.activeFilters.delete('bookmarked');
+                this.activeFilters.delete('starred');
             }
             if (view === 'has-code') {
                 this.activeFilters.add('has-code');
@@ -1428,7 +1525,7 @@
                     await this.toggleBookmark(exchangeId, newState, star);
                     star.classList.toggle('active', newState);
                     star.innerHTML = newState ? '★' : '☆';
-                    star.nextElementSibling.textContent = newState ? 'Bookmarked' : 'Not bookmarked';
+                    star.nextElementSibling.textContent = newState ? 'Starred' : 'Not starred';
                 });
             }
 
@@ -1530,6 +1627,104 @@
         },
 
         // ====================================================================
+        // R5: CHAT SESSIONS
+        // ====================================================================
+
+        /**
+         * Load chat sessions from the backend for the sidebar "Chats" section.
+         * Uses the 'getChatSessions' bridge command.
+         */
+        async loadChatSessions() {
+            try {
+                const data = await this.query('getChatSessions');
+                this.chatSessions = data.sessions || [];
+                this.renderChatSessions();
+            } catch (e) {
+                console.error('Failed to load chat sessions:', e);
+            }
+        },
+
+        /**
+         * Render chat sessions in the sidebar with adaptive grouping.
+         *
+         * Grouping strategy:
+         * - ≤ 10 sessions total → flat list, no grouping
+         * - > 10 sessions → group by month
+         *
+         * Each session shows title (truncated) and turn count.
+         * Click opens the conversation in read-only mode in the exchange list.
+         * "Continue" button opens the conversation in the Chat tab.
+         */
+        renderChatSessions() {
+            const container = document.getElementById('chatsContainer');
+            container.innerHTML = '';
+
+            if (this.chatSessions.length === 0) {
+                container.innerHTML = '<div style="padding:6px 10px;color:var(--text-muted);font-size:11px;">No chat sessions yet</div>';
+                return;
+            }
+
+            const useGrouping = this.chatSessions.length > 10;
+            let lastGroup = '';
+
+            for (const session of this.chatSessions) {
+                // Adaptive grouping header
+                if (useGrouping) {
+                    const date = new Date(session.updatedAt);
+                    const group = date.toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
+                    if (group !== lastGroup) {
+                        lastGroup = group;
+                        const header = document.createElement('div');
+                        header.style.cssText = 'padding:6px 10px 2px;font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;';
+                        header.textContent = group;
+                        container.appendChild(header);
+                    }
+                }
+
+                const div = document.createElement('div');
+                div.className = 'nav-item';
+                div.dataset.view = `chat:${session.conversationId}`;
+
+                const title = session.title || 'Untitled';
+                const truncTitle = title.length > 22 ? title.slice(0, 21) + '…' : title;
+
+                div.innerHTML = `
+                    <span class="icon">💬</span>
+                    <span class="label" title="${this.escapeHtml(title)}">${this.escapeHtml(truncTitle)}</span>
+                    <span class="count">${session.turnCount || 0}</span>
+                `;
+
+                div.addEventListener('click', () => this.switchView(`chat:${session.conversationId}`));
+                container.appendChild(div);
+            }
+        },
+
+        /**
+         * R5: Open a conversation in the Chat tab via CrossPanelBridge.
+         *
+         * TEMPORARY: Uses the 'continueChat' bridge command which routes
+         * through CrossPanelBridge.kt to the Chat's BridgeDispatcher.
+         * Remove when Library migrates to React.
+         *
+         * @param conversationId The conversation to open/continue
+         */
+        async continueChat(conversationId) {
+            try {
+                const result = await this.query('continueChat', { conversationId });
+                if (result.success) {
+                    // Switch the tool window to the Chat tab.
+                    // The switchToChat bridge command asks the Kotlin side to
+                    // activate the Chat content in the tool window.
+                    await this.query('switchToChat');
+                } else {
+                    console.error('Continue chat failed:', result.error);
+                }
+            } catch (e) {
+                console.error('Continue chat failed:', e);
+            }
+        },
+
+        // ====================================================================
         // UTILITIES
         // ====================================================================
 
@@ -1549,6 +1744,7 @@
     window.libraryRefresh = () => {
         App.offset = 0;
         App.loadStats();
+        App.loadChatSessions();
         App.loadExchanges();
     };
 

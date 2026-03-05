@@ -1,6 +1,7 @@
 package com.youmeandmyself.ai.chat.orchestrator
 
 import com.intellij.openapi.project.Project
+import com.youmeandmyself.ai.chat.bridge.BridgeMessage
 import com.youmeandmyself.ai.chat.context.ContextAssembler
 import com.youmeandmyself.ai.chat.conversation.ConversationManager
 import com.youmeandmyself.ai.providers.AiProvider
@@ -135,7 +136,7 @@ class ChatOrchestrator(
      * @param scope Coroutine scope for context gathering and provider calls
      * @return ChatResult that the UI renders. Never null, never throws.
      */
-    suspend fun send(userInput: String, scope: CoroutineScope): ChatResult {
+    suspend fun send(userInput: String, scope: CoroutineScope, conversationId: String? = null): ChatResult {
         // ── Step 1: Resolve provider ──────────────────────────────────
         val provider = ProviderRegistry.selectedChatProvider(project)
         if (provider == null) {
@@ -179,12 +180,15 @@ class ChatOrchestrator(
                 "rawLength" to (response.rawJson?.length ?: 0)
             )
 
-            // ── Step 5: Persist exchange to storage ──────────────────
+            // ── Step 5: Conversation bookkeeping ─────────────────────
+            val conversationId = updateConversation(userInput, response, provider.id, modelId)
+
+            // ── Step 6: Persist exchange to storage ──────────────────
             // Raw data is saved IMMEDIATELY — before any further processing.
             // If anything else fails, the raw response is still safe in JSONL.
-            persistExchange(response, provider, ExchangePurpose.CHAT)
+            persistExchange(response, provider, ExchangePurpose.CHAT, conversationId)
 
-            // ── Step 6: Index metadata ───────────────────────────────
+            // ── Step 7: Index metadata ───────────────────────────────
             // Each step is independent — failure in one doesn't block others.
             // All are wrapped in try/catch because they're "nice to have" indexing,
             // not critical path.
@@ -200,8 +204,7 @@ class ChatOrchestrator(
             val (finalDisplayText, finalIsError, correctionAvailable) =
                 runCorrectionFlow(response, provider.id, modelId)
 
-            // ── Step 8: Conversation bookkeeping ─────────────────────
-            val conversationId = updateConversation(userInput, response, provider.id, modelId)
+
 
             // ── Step 9: Build and return ChatResult ──────────────────
             val tokenUsage = response.parsed.tokenUsage?.let {
@@ -346,6 +349,58 @@ class ChatOrchestrator(
      */
     fun getConversationId(): String? = currentConversationId
 
+    /**
+     * Load the message history for a conversation.
+     *
+     * Reads exchanges from SQLite (user_prompt + assistant_text) for the
+     * given conversation, ordered chronologically. Used by BridgeDispatcher
+     * to populate restored tabs after IDE restart.
+     *
+     * Returns HistoryMessageDto list — each exchange produces up to two
+     * messages (user prompt + assistant response). System messages are
+     * not persisted and therefore not returned.
+     *
+     * @param conversationId The conversation to load
+     * @return Messages in chronological order, or empty list if not found
+     */
+    fun loadConversationHistory(conversationId: String): List<BridgeMessage.HistoryMessageDto> {
+        return try {
+            val exchanges = storage.getExchangesForConversation(conversationId)
+
+            exchanges.flatMap { exchange ->
+                val messages = mutableListOf<BridgeMessage.HistoryMessageDto>()
+
+                // User prompt (if stored)
+                if (!exchange.userPrompt.isNullOrBlank()) {
+                    messages.add(BridgeMessage.HistoryMessageDto(
+                        role = "user",
+                        content = exchange.userPrompt,
+                        timestamp = exchange.timestamp,
+                        exchangeId = null,
+                        isStarred = false
+                    ))
+                }
+
+                // Assistant response
+                val assistantContent = exchange.assistantText ?: "[Response not cached]"
+                messages.add(BridgeMessage.HistoryMessageDto(
+                    role = "assistant",
+                    content = assistantContent,
+                    timestamp = exchange.timestamp,
+                    exchangeId = exchange.id,
+                    isStarred = exchange.isStarred
+                ))
+
+                messages
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "orchestrator.load_history_failed", e,
+                "conversationId" to conversationId
+            )
+            emptyList()
+        }
+    }
+
     // ── Private: Storage Persistence ─────────────────────────────────────
 
     /**
@@ -362,7 +417,8 @@ class ChatOrchestrator(
     private suspend fun persistExchange(
         response: ProviderResponse,
         provider: AiProvider,
-        purpose: ExchangePurpose
+        purpose: ExchangePurpose,
+        conversationId: String? = null
     ) {
         try {
             val exchange = AiExchange(
@@ -379,7 +435,8 @@ class ChatOrchestrator(
                     json = response.rawJson ?: "",
                     httpStatus = response.httpStatus
                 ),
-                tokenUsage = null // Filled in by indexTokenUsage() after parsing
+                tokenUsage = null, // Filled in by indexTokenUsage() after parsing
+                conversationId = conversationId
             )
 
             val projectId = storage.resolveProjectId()

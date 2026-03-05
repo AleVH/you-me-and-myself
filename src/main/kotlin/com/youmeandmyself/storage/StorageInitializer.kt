@@ -15,11 +15,13 @@ import com.youmeandmyself.dev.Dev
  * 1. Gets the [LocalStorageFacade] service for the project
  * 2. Calls [LocalStorageFacade.initialize] which:
  *    - Creates the storage root directory structure
- *    - Opens the SQLite database and creates all 10 tables
+ *    - Opens the SQLite database and creates all 11 tables
  *    - Registers the project in the projects table
  *    - Rebuilds the search index from existing JSONL files
  * 3. Validates raw data availability (checks for deleted JSONL files)
  * 4. Registers a dispose handler to close the database on project close
+ * 5. Publishes [StorageReadyListener.TOPIC] so UI components (LibraryPanel)
+ *    know it's safe to query storage
  *
  * ## Registration
  *
@@ -33,6 +35,10 @@ import com.youmeandmyself.dev.Dev
  * If initialization fails, the error is logged but the IDE continues normally.
  * The user can still use the plugin — they just won't have storage persistence
  * until the issue is resolved and the IDE is restarted.
+ *
+ * The [StorageReadyListener.TOPIC] is only published on successful init.
+ * If init fails, subscribers are never notified — this is intentional since
+ * there's nothing useful they could do with a broken storage layer.
  */
 class StorageInitializer : ProjectActivity {
 
@@ -73,7 +79,18 @@ class StorageInitializer : ProjectActivity {
             })
 
             Dev.info(log, "storage.init.complete", "project" to project.name)
+
+            // ── Notify subscribers that storage is ready ──
+            // This unblocks UI components (LibraryPanel, future panels) that
+            // need storage for their initial data load. Published AFTER
+            // init.complete so subscribers see fully-initialized state.
+            project.messageBus.syncPublisher(StorageReadyListener.TOPIC).onStorageReady()
+            Dev.info(log, "storage.init.notified", "project" to project.name)
+
         } catch (e: Exception) {
+            // StorageReadyListener.TOPIC is NOT published on failure — intentional.
+            // UI components that depend on storage will remain in their empty/loading
+            // state, which is the correct behavior when storage is broken.
             Dev.error(log, "storage.init.failed", e, "project" to project.name)
         }
     }

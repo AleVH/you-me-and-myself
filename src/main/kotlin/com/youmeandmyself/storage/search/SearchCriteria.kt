@@ -26,5 +26,7 @@ data class SearchCriteria(
     val dateFrom: Instant? = null,
     val dateTo: Instant? = null,
     val limit: Int = 50,
-    val offset: Int = 0
+    val offset: Int = 0,
+    val isStarred: Boolean? = null,
+    val conversationId: String? = null
 )
