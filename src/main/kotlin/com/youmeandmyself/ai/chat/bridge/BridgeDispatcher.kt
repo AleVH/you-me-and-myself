@@ -32,6 +32,13 @@ import kotlinx.coroutines.launch
  * - SwitchTab, CloseTab, SaveTabState, RequestTabState
  * - LoadConversation, ToggleStar
  *
+ * ## Per-Tab Provider Changes
+ *
+ * - handleSendMessage: passes command.providerId to orchestrator.send() so
+ *   each tab uses its own provider rather than the global selection.
+ * - handleSwitchTabProvider: updates a single tab's provider_id in the
+ *   open_tabs table without touching the global AiProfilesState selection.
+ *
  * @param project The IntelliJ project context
  * @param orchestrator The chat orchestrator that processes all business logic
  * @param sendEvent Callback to send events back to the frontend
@@ -48,8 +55,6 @@ class BridgeDispatcher(
 
     /**
      * Dispatch a command from the frontend.
-     *
-     * R5: Added routing for bookmark and cross-panel conversation open commands.
      */
     fun dispatch(command: BridgeMessage.Command) {
         Dev.info(log, "bridge.dispatch", "type" to command.type)
@@ -63,6 +68,8 @@ class BridgeDispatcher(
             is BridgeMessage.NewConversation -> handleNewConversation()
             is BridgeMessage.SwitchProvider -> handleSwitchProvider(command)
             is BridgeMessage.RequestProviders -> handleRequestProviders()
+            // Per-tab provider
+            is BridgeMessage.SwitchTabProvider -> handleSwitchTabProvider(command)
             // R4: Tab management
             is BridgeMessage.SwitchTab -> handleSwitchTab(command)
             is BridgeMessage.CloseTab -> handleCloseTab(command)
@@ -79,14 +86,27 @@ class BridgeDispatcher(
         }
     }
 
-    // ── Pre-R4 Command Handlers (unchanged) ──────────────────────────
+    // ── Pre-R4 Command Handlers ──────────────────────────────────────
 
+    /**
+     * Handle SEND_MESSAGE — process a user chat message through the pipeline.
+     *
+     * Passes command.providerId to orchestrator.send() so the pipeline uses
+     * the tab's selected provider rather than the global selection.
+     * If providerId is null (old clients, or tab with no per-tab provider set),
+     * the orchestrator falls back to the globally selected chat provider.
+     */
     private fun handleSendMessage(command: BridgeMessage.SendMessage) {
         emit(BridgeMessage.ShowThinkingEvent())
 
         scope.launch {
             try {
-                val result = orchestrator.send(command.text, this, command.conversationId)
+                val result = orchestrator.send(
+                    userInput = command.text,
+                    scope = this,
+                    conversationId = command.conversationId,
+                    providerId = command.providerId
+                )
 
                 if (result.contextSummary != null) {
                     emit(BridgeMessage.SystemMessageEvent(
@@ -195,6 +215,13 @@ class BridgeDispatcher(
         emit(BridgeMessage.ConversationClearedEvent())
     }
 
+    /**
+     * Handle SWITCH_PROVIDER — update the global chat provider selection.
+     *
+     * This updates AiProfilesState.selectedChatProfileId, which is the
+     * fallback provider for tabs that have no per-tab provider set.
+     * For per-tab provider changes, see handleSwitchTabProvider().
+     */
     private fun handleSwitchProvider(command: BridgeMessage.SwitchProvider) {
         try {
             val ps = AiProfilesState.getInstance(project)
@@ -234,6 +261,47 @@ class BridgeDispatcher(
             ))
         } catch (t: Throwable) {
             Dev.error(log, "bridge.request_providers_failed", t)
+        }
+    }
+
+    // ── Per-Tab Provider Handler ─────────────────────────────────────
+
+    /**
+     * Handle SWITCH_TAB_PROVIDER — update the provider for a specific tab.
+     *
+     * Unlike handleSwitchProvider (which updates the global fallback),
+     * this updates only the provider_id column for the given tab in
+     * open_tabs. The global AiProfilesState.selectedChatProfileId is
+     * NOT touched.
+     *
+     * The updated providerId is then used by handleSendMessage when the
+     * next SEND_MESSAGE arrives with this tab's conversationId — the
+     * frontend always includes the active tab's providerId in SendMessage.
+     *
+     * Persistence: the tab's providerId is already included in TabStateDto
+     * (sent via SAVE_TAB_STATE), so it survives IDE restarts through the
+     * normal tab persistence path. This handler updates the in-DB record
+     * immediately so it's correct even if the IDE crashes before the next
+     * SAVE_TAB_STATE.
+     */
+    private fun handleSwitchTabProvider(command: BridgeMessage.SwitchTabProvider) {
+        Dev.info(log, "bridge.switch_tab_provider",
+            "tabId" to command.tabId,
+            "providerId" to command.providerId
+        )
+        scope.launch {
+            try {
+                tabStateService.updateTabProvider(command.tabId, command.providerId)
+            } catch (t: Throwable) {
+                Dev.error(log, "bridge.switch_tab_provider_failed", t,
+                    "tabId" to command.tabId,
+                    "providerId" to command.providerId
+                )
+                emit(BridgeMessage.SystemMessageEvent(
+                    content = "Failed to update tab provider: ${t.message}",
+                    level = "ERROR"
+                ))
+            }
         }
     }
 
@@ -287,6 +355,7 @@ class BridgeDispatcher(
      *
      * Receives the complete tab state and writes it to the open_tabs table.
      * Uses full replace strategy (delete all + insert) to avoid sync issues.
+     * Each TabStateDto now includes providerId for per-tab provider persistence.
      */
     private fun handleSaveTabState(command: BridgeMessage.SaveTabState) {
         scope.launch {
@@ -308,6 +377,9 @@ class BridgeDispatcher(
      * Checks the keep_tabs setting in storage_config. If enabled, reads
      * open_tabs and sends them back. If disabled, sends empty list so
      * the frontend creates a single fresh tab.
+     *
+     * Each returned TabStateDto includes the tab's providerId so the
+     * frontend can restore the per-tab provider selection.
      */
     private fun handleRequestTabState() {
         scope.launch {
@@ -493,7 +565,7 @@ class BridgeDispatcher(
         }
     }
 
-    // ── Helpers (unchanged) ──────────────────────────────────────────
+    // ── Helpers ──────────────────────────────────────────────────────
 
     private fun chatResultToEvent(result: ChatResult): BridgeMessage.ChatResultEvent {
         return BridgeMessage.ChatResultEvent(

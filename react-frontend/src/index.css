@@ -91,7 +91,7 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   PROVIDER BAR
+   PROVIDER BAR (Global provider selector — top of window)
    ═══════════════════════════════════════════════════════════════════════ */
 
 .ymm-provider-bar {
@@ -131,6 +131,22 @@ body {
    TAB BAR (R4)
    Horizontal tab bar for switching between conversations.
    Sits between the provider bar and the message list.
+
+   Tabs are always single-line. Titles truncate with ellipsis.
+   The tab strip never wraps — it scrolls horizontally if needed.
+
+   Class mapping (JSX → CSS):
+     .ymm-tab-bar             → outer container (flex row)
+     .ymm-tab-bar__tabs       → scrollable tab strip
+     .ymm-tab                 → individual tab
+     .ymm-tab--active         → active tab highlight
+     .ymm-tab--thinking       → pulsing while AI generates
+     .ymm-tab__title          → truncated title text
+     .ymm-tab__close          → close button (×)
+     .ymm-tab__loading        → spinner for restoring tabs
+     .ymm-tab__rename-input   → inline rename input [PLACEHOLDER]
+     .ymm-tab__context-chip   → context usage indicator [PLACEHOLDER]
+     .ymm-tab-bar__add        → "+" new tab button
    ═══════════════════════════════════════════════════════════════════════ */
 
 .ymm-tab-bar {
@@ -140,16 +156,19 @@ body {
     border-bottom: 1px solid #333;
     flex-shrink: 0;
     min-height: 32px;
+    /* Never wrap to multiple lines */
+    overflow: hidden;
 }
 
-/* Scrollable tab container — hides overflow, scrolls horizontally */
+/* Scrollable tab container — single line, horizontal scroll only */
 .ymm-tab-bar__tabs {
     display: flex;
     align-items: stretch;
     flex: 1;
     overflow-x: auto;
     overflow-y: hidden;
-    /* Hide scrollbar — tabs scroll via wheel and the bar is thin enough */
+    white-space: nowrap;
+    /* Hide scrollbar — tabs scroll via mouse wheel */
     scrollbar-width: none;
     -ms-overflow-style: none;
 }
@@ -158,8 +177,8 @@ body {
     display: none;
 }
 
-/* Individual tab button */
-.ymm-tab-bar__tab {
+/* Individual tab */
+.ymm-tab {
     display: flex;
     align-items: center;
     gap: 4px;
@@ -173,25 +192,26 @@ body {
     cursor: pointer;
     white-space: nowrap;
     max-width: 160px;
-    min-width: 60px;
-    flex-shrink: 0;
+    min-width: 40px;
+    flex-shrink: 1;
+    overflow: hidden;
     transition: color 0.15s ease, background 0.15s ease;
 }
 
-.ymm-tab-bar__tab:hover {
+.ymm-tab:hover {
     background: #2d2d2d;
     color: #d4d4d4;
 }
 
 /* Active tab — accent bottom border + brighter text */
-.ymm-tab-bar__tab--active {
+.ymm-tab--active {
     color: #d4d4d4;
     border-bottom-color: #569cd6;
     background: #252526;
 }
 
 /* Thinking indicator — subtle pulse on the tab while AI is generating */
-.ymm-tab-bar__tab--thinking {
+.ymm-tab--thinking {
     animation: ymm-tab-pulse 1.5s ease-in-out infinite;
 }
 
@@ -200,30 +220,81 @@ body {
     50% { opacity: 0.6; }
 }
 
-/* Tab title — truncated with ellipsis */
-.ymm-tab-bar__title {
+/* Tab title — truncated with ellipsis when space is tight */
+.ymm-tab__title {
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Let the title shrink so close button always stays visible */
+    min-width: 0;
+    flex: 1;
+}
+
+/* Loading spinner for tabs restoring conversation history */
+.ymm-tab__loading {
+    font-size: 12px;
+    color: #808080;
+    flex-shrink: 0;
+    animation: ymm-tab-pulse 1s ease-in-out infinite;
+}
+
+/* Inline rename input — appears on double-click [PLACEHOLDER] */
+.ymm-tab__rename-input {
+    background: #3c3c3c;
+    color: #d4d4d4;
+    border: 1px solid #569cd6;
+    border-radius: 2px;
+    font-size: 11px;
+    font-family: inherit;
+    padding: 1px 4px;
+    outline: none;
+    width: 100%;
+    min-width: 40px;
+    max-width: 140px;
+}
+
+/* Context usage chip [PLACEHOLDER — always hidden until implemented] */
+.ymm-tab__context-chip {
+    font-size: 8px;
+    line-height: 1;
+    flex-shrink: 0;
+}
+
+.ymm-tab__context-chip--placeholder {
+    display: none;
+}
+
+.ymm-tab__context-chip--amber {
+    color: #dcdcaa;
+}
+
+.ymm-tab__context-chip--red {
+    color: #f44747;
 }
 
 /* Close button — subtle, more visible on hover */
-.ymm-tab-bar__close {
+.ymm-tab__close {
+    display: flex;
+    align-items: center;
+    justify-content: center;
     font-size: 14px;
     line-height: 1;
     color: #666;
+    background: transparent;
+    border: none;
     cursor: pointer;
     padding: 0 2px;
     border-radius: 2px;
     flex-shrink: 0;
 }
 
-.ymm-tab-bar__close:hover {
+.ymm-tab__close:hover {
     color: #f44747;
     background: rgba(244, 71, 71, 0.15);
 }
 
-/* New tab button — fixed on the right */
-.ymm-tab-bar__new {
+/* "+" new tab button — fixed on the right end of the tab bar */
+.ymm-tab-bar__add {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -237,9 +308,15 @@ body {
     flex-shrink: 0;
 }
 
-.ymm-tab-bar__new:hover {
+.ymm-tab-bar__add:hover:not(:disabled) {
     background: #2d2d2d;
     color: #d4d4d4;
+}
+
+.ymm-tab-bar__add--disabled,
+.ymm-tab-bar__add:disabled {
+    color: #444;
+    cursor: not-allowed;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════

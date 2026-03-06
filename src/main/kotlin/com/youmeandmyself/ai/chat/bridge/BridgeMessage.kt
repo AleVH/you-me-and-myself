@@ -28,6 +28,13 @@ import kotlinx.serialization.json.Json
  *
  * Added code block bookmarking: BookmarkCodeBlock command, BookmarkResultEvent.
  * Added cross-panel navigation: OpenConversation command, OpenConversationResultEvent.
+ *
+ * ## Per-Tab Provider Changes
+ *
+ * - SendMessage: gains providerId so the backend knows which provider to use
+ *   for this specific tab's conversation, not the global selection.
+ * - TabStateDto: gains providerId so per-tab provider survives IDE restart.
+ * - SwitchTabProvider: new command for when user changes provider on a specific tab.
  */
 object BridgeMessage {
 
@@ -46,12 +53,21 @@ object BridgeMessage {
         abstract val type: String
     }
 
+    /**
+     * Send a chat message.
+     *
+     * conversationId: groups this message with its conversation in storage.
+     * providerId: the profile ID to use for this tab's conversation.
+     *   If null, falls back to the globally selected chat provider.
+     *   Set by the frontend from the per-tab provider selection.
+     */
     @Serializable
     @SerialName("SEND_MESSAGE")
     data class SendMessage(
         override val type: String = "SEND_MESSAGE",
         val text: String,
-        val conversationId: String? = null
+        val conversationId: String? = null,
+        val providerId: String? = null
     ) : Command()
 
     @Serializable
@@ -78,6 +94,13 @@ object BridgeMessage {
         override val type: String = "NEW_CONVERSATION"
     ) : Command()
 
+    /**
+     * Switch the global chat provider selection.
+     *
+     * This updates AiProfilesState.selectedChatProfileId — the fallback
+     * provider used when a tab has no per-tab provider set.
+     * For per-tab provider changes, use SwitchTabProvider instead.
+     */
     @Serializable
     @SerialName("SWITCH_PROVIDER")
     data class SwitchProvider(
@@ -89,6 +112,28 @@ object BridgeMessage {
     @SerialName("REQUEST_PROVIDERS")
     data class RequestProviders(
         override val type: String = "REQUEST_PROVIDERS"
+    ) : Command()
+
+    // ── Per-Tab Provider Command ──────────────────────────────────────
+
+    /**
+     * Switch the provider for a specific tab.
+     *
+     * Unlike SwitchProvider (which updates the global selection),
+     * this updates only the provider associated with the given tab.
+     * The selection is persisted in open_tabs.provider_id so it
+     * survives IDE restarts.
+     *
+     * Backend: BridgeDispatcher.handleSwitchTabProvider()
+     * → Updates TabStateService for the specific tab
+     * → Does NOT affect AiProfilesState.selectedChatProfileId
+     */
+    @Serializable
+    @SerialName("SWITCH_TAB_PROVIDER")
+    data class SwitchTabProvider(
+        override val type: String = "SWITCH_TAB_PROVIDER",
+        val tabId: String,
+        val providerId: String
     ) : Command()
 
     // ── R4: Tab Management Commands ──────────────────────────────────
@@ -335,9 +380,17 @@ object BridgeMessage {
     ) : Event()
 
     // ═══════════════════════════════════════════════════════════════════
-    //  SHARED DTOs (R4, unchanged in R5)
+    //  SHARED DTOs
     // ═══════════════════════════════════════════════════════════════════
 
+    /**
+     * Persisted tab state.
+     *
+     * providerId: the AI profile selected for this specific tab.
+     *   Null means "use the global chat provider selection".
+     *   Persisted in open_tabs.provider_id so per-tab provider
+     *   survives IDE restarts.
+     */
     @Serializable
     data class TabStateDto(
         val id: String,
@@ -345,7 +398,8 @@ object BridgeMessage {
         val title: String,
         val tabOrder: Int,
         val isActive: Boolean,
-        val scrollPosition: Int
+        val scrollPosition: Int,
+        val providerId: String? = null
     )
 
     @Serializable
@@ -374,6 +428,8 @@ object BridgeMessage {
                 "NEW_CONVERSATION" -> json.decodeFromString<NewConversation>(jsonString)
                 "SWITCH_PROVIDER" -> json.decodeFromString<SwitchProvider>(jsonString)
                 "REQUEST_PROVIDERS" -> json.decodeFromString<RequestProviders>(jsonString)
+                // Per-tab provider
+                "SWITCH_TAB_PROVIDER" -> json.decodeFromString<SwitchTabProvider>(jsonString)
                 // R4: Tab management
                 "SWITCH_TAB" -> json.decodeFromString<SwitchTab>(jsonString)
                 "CLOSE_TAB" -> json.decodeFromString<CloseTab>(jsonString)

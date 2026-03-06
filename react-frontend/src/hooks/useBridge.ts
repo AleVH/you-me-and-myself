@@ -30,6 +30,31 @@
  * 5. Tab close: removes tab, switches to neighbor. Last tab → new empty tab.
  * 6. On meaningful changes: SAVE_TAB_STATE sent to backend for persistence
  *
+ * ## Per-Tab Provider
+ *
+ * Each tab has its own providerId (string | null). When null, the backend
+ * falls back to AiProfilesState.selectedChatProfileId (global selection).
+ * The active tab's providerId is included in every SEND_MESSAGE command so
+ * the backend always uses the correct provider without additional lookup.
+ * Provider changes are sent immediately via SWITCH_TAB_PROVIDER and are
+ * also persisted in the next SAVE_TAB_STATE cycle.
+ *
+ * ## PLACEHOLDER: keep_tabs Preference
+ *
+ * On startup, REQUEST_TAB_STATE is always sent. The backend decides
+ * whether to return saved tabs based on the keep_tabs setting.
+ * The keep_tabs toggle UI is NOT YET IMPLEMENTED — it lives in the
+ * General settings config page (Tools → YMM Assistant → General).
+ * Backend default: keep_tabs = true.
+ *
+ * ## PLACEHOLDER: Max Tabs Config
+ *
+ * DEFAULT_MAX_TABS is hardcoded to 5 here and in TabBar.tsx.
+ * The configurable range (2–20) is NOT YET IMPLEMENTED — it lives in
+ * the General settings config page (Tools → YMM Assistant → General).
+ * When implemented, the backend should send maxTabs in the TAB_STATE
+ * event so the frontend cap stays in sync with the setting.
+ *
  * @see transport.ts — Wire layer that this hook wraps
  * @see types.ts — Event and command type definitions
  */
@@ -44,14 +69,26 @@ import {
     type UpdateMetricsEvent,
     type SystemMessageEvent,
     type ProvidersListEvent,
-    type ProviderInfoDto,
     type TabStateEvent,
     type ConversationHistoryEvent,
     type StarUpdatedEvent,
     type BookmarkResultEvent,
     type OpenConversationResultEvent,
-    type TabStateDto,
+    type TabStateDto, ProviderInfoDto,
 } from "../bridge/types";
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Default maximum simultaneous open tabs.
+ *
+ * PLACEHOLDER: This will come from the General settings config page
+ * (Tools → YMM Assistant → General → "Maximum open tabs", range 2–20)
+ * once that page is implemented. For now hardcoded here and in TabBar.tsx.
+ */
+const DEFAULT_MAX_TABS = 5;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  LOCAL STATE TYPES
@@ -84,7 +121,11 @@ export interface MetricsData {
 
 /**
  * R4: Per-tab conversation state.
- * Each open tab has its own messages, metrics, thinking state, and conversation.
+ *
+ * providerId: the AI profile selected for this tab's conversation.
+ * Null means "use the global chat provider selection" (AiProfilesState.selectedChatProfileId).
+ * Included in SEND_MESSAGE so the backend always uses the correct provider.
+ * Persisted in open_tabs.provider_id via SAVE_TAB_STATE so it survives IDE restarts.
  */
 export interface TabData {
     id: string;
@@ -96,6 +137,8 @@ export interface TabData {
     scrollPosition: number;
     /** False for restored tabs that haven't fetched messages yet. */
     historyLoaded: boolean;
+    /** Per-tab AI provider. Null = use global selection. */
+    providerId: string | null;
 }
 
 /** R4: Lightweight tab descriptor for the TabBar component. */
@@ -105,6 +148,23 @@ export interface TabInfo {
     isActive: boolean;
     hasMessages: boolean;
     isThinking: boolean;
+    /**
+     * PLACEHOLDER: Context window usage percentage (0–100).
+     *
+     * Used by TabBar to render the context indicator chip:
+     * - null / < 75% → no chip
+     * - >= 75%       → amber chip
+     * - >= 90%       → red chip
+     *
+     * To implement:
+     * 1. Add modelContextLimit to MetricsData (from provider config)
+     * 2. Compute: (metrics.totalTokens / modelContextLimit) * 100
+     * 3. Populate contextUsagePct below in the tabs derived state
+     * 4. Remove this PLACEHOLDER comment
+     */
+    contextUsagePct: number | null; // PLACEHOLDER: always null until implemented
+    /** Per-tab AI provider. Null = using global selection. Shown in TabBar dropdown. */
+    providerId: string | null;
 }
 
 /**
@@ -146,6 +206,31 @@ export interface BridgeState {
     setScrolledUp: (isUp: boolean) => void;
     saveScrollPosition: (position: number) => void;
 
+    /**
+     * Rename a tab title.
+     *
+     * PLACEHOLDER: Backend command RENAME_TAB not yet implemented.
+     * Calling this logs a warning and does nothing until:
+     * 1. RENAME_TAB added to CommandType in types.ts
+     * 2. Handled in BridgeDispatcher.kt (UPDATE conversations SET title)
+     * 3. sendCommand call below uncommented
+     */
+    renameTab: (tabId: string, newTitle: string) => void;
+
+    /**
+     * Switch the AI provider for a specific tab.
+     *
+     * Updates the tab's local providerId immediately, sends SWITCH_TAB_PROVIDER
+     * to the backend for immediate DB persistence, and includes the new
+     * providerId in the next SAVE_TAB_STATE for full state sync.
+     *
+     * Does NOT affect the global selectedProviderId — use switchProvider()
+     * for that. Per-tab and global selections are independent.
+     *
+     * Pass null to revert the tab to the global provider selection.
+     */
+    switchTabProvider: (tabId: string, providerId: string | null) => void;
+
     // R5: Bookmark command
     bookmarkCodeBlock: (exchangeId: string, blockIndex: number) => void;
 }
@@ -170,6 +255,9 @@ function generateTabId(): string {
  * conversationId is ALWAYS set — new tabs generate a UUID, loaded
  * conversations provide their existing one. This guarantees every
  * exchange written to JSONL has a non-null conversationId.
+ *
+ * providerId defaults to null (use global selection) for new tabs.
+ * Restored tabs pass their persisted providerId from TabStateDto.
  */
 function createTab(data?: Partial<TabData>): TabData {
     const conversationId = data?.conversationId ?? crypto.randomUUID();
@@ -182,12 +270,13 @@ function createTab(data?: Partial<TabData>): TabData {
         metrics: data?.metrics ?? null,
         scrollPosition: data?.scrollPosition ?? 0,
         historyLoaded: data?.historyLoaded ?? true,
+        providerId: data?.providerId ?? null,
     };
 
     console.log(
         `[YMM] createTab: tabId=${tab.id}, conversationId=${conversationId}, ` +
         `source=${data?.conversationId ? "loaded" : "generated"}, ` +
-        `messages=${tab.messages.length}`
+        `messages=${tab.messages.length}, providerId=${tab.providerId ?? "global"}`
     );
 
     return tab;
@@ -252,7 +341,7 @@ export function useBridge(): BridgeState {
     const activeMetrics = activeTab?.metrics ?? null;
     const activeScrollPosition = activeTab?.scrollPosition ?? 0;
 
-    const tabs: TabInfo[] = tabOrder
+    const tabs= tabOrder
         .map((id) => {
             const tab = tabMap.get(id);
             if (!tab) return null;
@@ -262,6 +351,11 @@ export function useBridge(): BridgeState {
                 isActive: tab.id === activeTabId,
                 hasMessages: tab.messages.length > 0,
                 isThinking: tab.isThinking,
+                // PLACEHOLDER: contextUsagePct not yet computed.
+                // Will be: (tab.metrics?.totalTokens ?? 0) / modelContextLimit * 100
+                // Requires modelContextLimit from provider config.
+                contextUsagePct: null as number | null,
+                providerId: tab.providerId,
             };
         })
         .filter((t): t is TabInfo => t !== null);
@@ -272,25 +366,32 @@ export function useBridge(): BridgeState {
         if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
 
         saveTimerRef.current = setTimeout(() => {
-            const tabDtos: TabStateDto[] = tabOrder.map((id, index) => {
-                const tab = tabMap.get(id);
-                return {
-                    id,
-                    conversationId: tab?.conversationId ?? null,
-                    title: tab?.title ?? "New Chat",
-                    tabOrder: index,
-                    isActive: id === activeTabId,
-                    scrollPosition: tab?.scrollPosition ?? 0,
-                };
-            });
+            // Read tabMap via closure — tabOrder and activeTabId are stable
+            // within the debounce window. tabMap is captured at call time.
+            setTabMap((prev) => {
+                const tabDtos: TabStateDto[] = tabOrder.map((id, index) => {
+                    const tab = prev.get(id);
+                    return {
+                        id,
+                        conversationId: tab?.conversationId ?? null,
+                        title: tab?.title ?? "New Chat",
+                        tabOrder: index,
+                        isActive: id === activeTabId,
+                        scrollPosition: tab?.scrollPosition ?? 0,
+                        providerId: tab?.providerId ?? null,
+                    };
+                });
 
-            sendCommand({
-                type: CommandType.SAVE_TAB_STATE,
-                tabs: tabDtos,
-                activeTabId,
+                sendCommand({
+                    type: CommandType.SAVE_TAB_STATE,
+                    tabs: tabDtos,
+                    activeTabId,
+                });
+
+                return prev; // No state change — just reading
             });
         }, 500);
-    }, [tabMap, tabOrder, activeTabId]);
+    }, [tabOrder, activeTabId]);
 
     // ── Helper: Update a specific tab ────────────────────────────────
 
@@ -310,7 +411,7 @@ export function useBridge(): BridgeState {
     // ── Event Subscriptions ──────────────────────────────────────────
 
     useEffect(() => {
-        console.log("[YMM] useBridge useEffect registered — build 20260304a");
+        console.log("[YMM] useBridge useEffect registered — build 20260305b");
         const unsubscribers: Array<() => void> = [];
 
         // CHAT_RESULT → active tab
@@ -323,7 +424,6 @@ export function useBridge(): BridgeState {
                     const tab = prev.get(targetId);
                     if (!tab) return prev;
 
-                    // Sanity check: warn if backend returns a different conversationId
                     if (e.conversationId && tab.conversationId && e.conversationId !== tab.conversationId) {
                         console.warn(
                             `[YMM] conversationId mismatch! tab=${tab.conversationId}, backend=${e.conversationId}, tabId=${targetId}`
@@ -455,7 +555,7 @@ export function useBridge(): BridgeState {
                 if (tabStateInitialized.current) return;
                 tabStateInitialized.current = true;
 
-                if (e.tabs.length === 0) return; // Keep initial empty tab
+                if (e.tabs.length === 0) return;
 
                 const newMap = new Map<string, TabData>();
                 const newOrder: string[] = [];
@@ -472,6 +572,7 @@ export function useBridge(): BridgeState {
                         metrics: null,
                         scrollPosition: dto.scrollPosition,
                         historyLoaded: dto.conversationId === null,
+                        providerId: dto.providerId ?? null,
                     });
                     newOrder.push(dto.id);
                     if (dto.isActive) newActiveId = dto.id;
@@ -483,7 +584,6 @@ export function useBridge(): BridgeState {
                 setTabOrder(newOrder);
                 setActiveTabId(newActiveId);
 
-                // Load history for active tab if it has a conversation
                 const activeData = newMap.get(newActiveId);
                 if (activeData && !activeData.historyLoaded && activeData.conversationId) {
                     sendCommand({
@@ -495,34 +595,44 @@ export function useBridge(): BridgeState {
             }),
         );
 
-        // OPEN_CONVERSATION_RESULT — Library "Continue chat" opens/switches to a tab
-        // Uses a local Set to debounce rapid duplicate events for the same conversation.
-        const openedConversations = new Set<string>();
+        // OPEN_CONVERSATION_RESULT — Library "Continue chat"
+        //
+        // Debounce guard: prevents double-processing when the backend
+        // sends the same event twice in quick succession (e.g. double-click).
+        // Uses a short time window (500ms) rather than a permanent Set,
+        // so re-opening the same conversation later always works.
+        const recentlyOpenedConversations = new Map<string, number>();
         unsubscribers.push(
             onEvent(EventType.OPEN_CONVERSATION_RESULT, (event: BridgeEvent) => {
                 const e = event as OpenConversationResultEvent;
 
                 console.log(`[YMM] OPEN_CONVERSATION_RESULT: conversationId=${e.conversationId}, tabId=${e.tabId}`);
 
-                // Debounce: ignore duplicate events for same conversation
-                if (openedConversations.has(e.conversationId)) {
-                    console.log(`[YMM] Ignoring duplicate OPEN_CONVERSATION_RESULT for ${e.conversationId}`);
+                // Debounce: ignore if we processed this conversationId within the last 500ms
+                const now = Date.now();
+                const lastOpened = recentlyOpenedConversations.get(e.conversationId);
+                if (lastOpened && now - lastOpened < 500) {
+                    console.log(`[YMM] Ignoring duplicate OPEN_CONVERSATION_RESULT for ${e.conversationId} (within 500ms)`);
                     return;
                 }
-                openedConversations.add(e.conversationId);
+                recentlyOpenedConversations.set(e.conversationId, now);
 
-                // Check if this conversation is already open in a tab
-                let existingTabId: string | null = null;
+                // Atomic check-and-mutate: all decisions inside the updater
+                // so we always work with the latest state.
                 setTabMap((prev) => {
-                    for (const [id, tab] of prev) {
-                        if (tab.conversationId === e.conversationId) {
-                            existingTabId = id;
-                            console.log(`[YMM] Conversation already open in tab ${id}, switching`);
-                            return prev;
+                    // Check if a tab with this conversationId already exists
+                    for (const [id] of prev) {
+                        const tab = prev.get(id);
+                        if (tab && tab.conversationId === e.conversationId) {
+                            console.log(`[YMM] OPEN_CONVERSATION_RESULT: existing tab found: ${id}`);
+                            setActiveTabId(id);
+                            setIsScrolledUp(false);
+                            return prev; // No tabMap change — just switch
                         }
                     }
 
-                    // Create a new tab for this conversation
+                    // No existing tab — create one
+                    console.log(`[YMM] OPEN_CONVERSATION_RESULT: creating new tab: ${e.tabId}`);
                     const newTab = createTab({
                         id: e.tabId,
                         conversationId: e.conversationId,
@@ -530,21 +640,15 @@ export function useBridge(): BridgeState {
                         historyLoaded: false,
                     });
 
-                    console.log(`[YMM] Created tab ${e.tabId} for conversation ${e.conversationId}`);
-
                     const next = new Map(prev);
                     next.set(e.tabId, newTab);
+
+                    setTabOrder((prevOrder) => [...prevOrder, e.tabId]);
+                    setActiveTabId(e.tabId);
+                    setIsScrolledUp(false);
+
                     return next;
                 });
-
-                if (existingTabId) {
-                    setActiveTabId(existingTabId);
-                } else {
-                    setTabOrder((prev) => [...prev, e.tabId]);
-                    setActiveTabId(e.tabId);
-                }
-
-                setIsScrolledUp(false);
             }),
         );
 
@@ -600,7 +704,7 @@ export function useBridge(): BridgeState {
             }),
         );
 
-        // R5: BOOKMARK_RESULT — confirmation from backend (future: update icon state)
+        // R5: BOOKMARK_RESULT
         unsubscribers.push(
             onEvent(EventType.BOOKMARK_RESULT, (event: BridgeEvent) => {
                 const e = event as BookmarkResultEvent;
@@ -612,7 +716,6 @@ export function useBridge(): BridgeState {
             }),
         );
 
-        // Dev mode: BRIDGE_READY never fires, request immediately
         if (!isJcefMode()) {
             sendCommand({ type: CommandType.REQUEST_PROVIDERS });
             sendCommand({ type: CommandType.REQUEST_TAB_STATE });
@@ -622,20 +725,26 @@ export function useBridge(): BridgeState {
             for (const unsub of unsubscribers) unsub();
         };
     }, [nextId, updateTab]);
-    // Note: activeTabId deliberately NOT in deps. We use activeTabIdRef
-    // so event handlers always get the latest value without re-subscribing.
 
     // ── Command Functions ────────────────────────────────────────────
 
+    /**
+     * Send a chat message using the active tab's provider.
+     *
+     * Reads providerId from within setTabMap so we always get the current
+     * tab state without needing tabMap in the dependency array.
+     */
     const sendMessage = useCallback(
         (text: string) => {
             const targetId = activeTabIdRef.current;
             let convId: string | null = null;
+            let tabProviderId: string | null = null;
 
             setTabMap((prev) => {
                 const tab = prev.get(targetId);
                 if (!tab) return prev;
                 convId = tab.conversationId;
+                tabProviderId = tab.providerId;
 
                 const newMsg: ChatMessage = {
                     id: `msg-${Date.now()}-${++idCounter.current}`,
@@ -655,14 +764,29 @@ export function useBridge(): BridgeState {
                 return next;
             });
 
-            console.log(`[YMM] sendMessage: conversationId=${convId}, tabId=${targetId}`);
+            console.log(
+                `[YMM] sendMessage: conversationId=${convId}, tabId=${targetId}, ` +
+                `providerId=${tabProviderId ?? "global"}`
+            );
 
-            sendCommand({ type: CommandType.SEND_MESSAGE, text, conversationId: convId });
+            sendCommand({
+                type: CommandType.SEND_MESSAGE,
+                text,
+                conversationId: convId,
+                providerId: tabProviderId,
+            });
             persistTabState();
         },
         [persistTabState],
     );
 
+    /**
+     * Switch the global chat provider selection.
+     *
+     * Updates AiProfilesState.selectedChatProfileId on the backend —
+     * the fallback provider for tabs with no per-tab provider set.
+     * Does NOT affect per-tab provider selections.
+     */
     const switchProvider = useCallback((providerId: string) => {
         setSelectedProviderId(providerId);
         sendCommand({ type: CommandType.SWITCH_PROVIDER, providerId });
@@ -672,7 +796,25 @@ export function useBridge(): BridgeState {
         sendCommand({ type: CommandType.CLEAR_CHAT });
     }, []);
 
+    /**
+     * Create a new conversation tab.
+     *
+     * Enforces DEFAULT_MAX_TABS cap — logs a warning and returns early
+     * if the limit is reached. The TabBar "+" button is disabled at the
+     * same threshold, so this is a safety net for programmatic calls.
+     *
+     * PLACEHOLDER: maxTabs will come from General settings config when
+     * that page is implemented. For now DEFAULT_MAX_TABS = 5.
+     */
     const newConversation = useCallback(() => {
+        if (tabOrder.length >= DEFAULT_MAX_TABS) {
+            console.warn(
+                `[YMM] newConversation blocked: already at max tabs (${DEFAULT_MAX_TABS}). ` +
+                `Close a tab first. Max configurable in Settings → YMM Assistant → General (not yet implemented).`
+            );
+            return;
+        }
+
         const newTab = createTab();
 
         setTabMap((prev) => {
@@ -686,7 +828,7 @@ export function useBridge(): BridgeState {
 
         sendCommand({ type: CommandType.NEW_CONVERSATION });
         persistTabState();
-    }, [persistTabState]);
+    }, [tabOrder.length, persistTabState]);
 
     const switchTab = useCallback(
         (tabId: string) => {
@@ -695,7 +837,6 @@ export function useBridge(): BridgeState {
             setActiveTabId(tabId);
             setIsScrolledUp(false);
 
-            // Load history if needed
             setTabMap((prev) => {
                 const tab = prev.get(tabId);
                 if (tab && !tab.historyLoaded && tab.conversationId) {
@@ -723,7 +864,6 @@ export function useBridge(): BridgeState {
                 const newOrder = prevOrder.filter((id) => id !== tabId);
 
                 if (newOrder.length === 0) {
-                    // Last tab — create fresh empty one
                     const freshTab = createTab();
                     setTabMap((prev) => {
                         const next = new Map(prev);
@@ -760,11 +900,75 @@ export function useBridge(): BridgeState {
         [persistTabState],
     );
 
+    /**
+     * Rename a tab title (updates both local state and persists).
+     *
+     * PLACEHOLDER: RENAME_TAB backend command not yet implemented.
+     * Currently updates local state only — title survives tab switches
+     * and IDE restarts (included in TabStateDto via SAVE_TAB_STATE).
+     *
+     * Full backend wiring needed:
+     * 1. Add RENAME_TAB to CommandType in types.ts
+     * 2. Handle in BridgeDispatcher.kt → UPDATE conversations SET title = ?
+     * 3. Uncomment sendCommand(RENAME_TAB) below
+     */
+    const renameTab = useCallback(
+        (tabId: string, newTitle: string) => {
+            const trimmed = newTitle.trim();
+            if (!trimmed) return;
+
+            updateTab(tabId, (tab) => ({ ...tab, title: trimmed }));
+
+            // PLACEHOLDER: sendCommand({ type: CommandType.RENAME_TAB, tabId, title: trimmed });
+            console.warn(
+                `[YMM] renameTab: local title updated to "${trimmed}" for tab ${tabId}. ` +
+                `RENAME_TAB backend command not yet implemented — add to CommandType and handle in BridgeDispatcher.kt.`
+            );
+
+            persistTabState();
+        },
+        [updateTab, persistTabState],
+    );
+
+    /**
+     * Switch the AI provider for a specific tab.
+     *
+     * Updates local tab state immediately so the UI reflects the change
+     * without waiting for a round-trip. Sends SWITCH_TAB_PROVIDER to
+     * the backend for immediate DB persistence (open_tabs.provider_id),
+     * independent of the SAVE_TAB_STATE cycle.
+     *
+     * providerId null = revert to global provider selection.
+     */
+    const switchTabProvider = useCallback(
+        (tabId: string, providerId: string | null) => {
+            updateTab(tabId, (tab) => ({ ...tab, providerId }));
+
+            if (providerId !== null) {
+                // Only send SWITCH_TAB_PROVIDER when setting a specific provider.
+                // Null (revert to global) is handled naturally by the next
+                // SAVE_TAB_STATE which writes null to open_tabs.provider_id.
+                sendCommand({
+                    type: CommandType.SWITCH_TAB_PROVIDER,
+                    tabId,
+                    providerId,
+                });
+            }
+
+            console.log(
+                `[YMM] switchTabProvider: tabId=${tabId}, ` +
+                `providerId=${providerId ?? "global (reverted)"}`
+            );
+
+            persistTabState();
+        },
+        [updateTab, persistTabState],
+    );
+
     const toggleStar = useCallback((exchangeId: string) => {
         sendCommand({ type: CommandType.TOGGLE_STAR, exchangeId });
     }, []);
 
-    // R5: Bookmark a code block (bookmarks the entire exchange)
     const bookmarkCodeBlock = useCallback((exchangeId: string, blockIndex: number) => {
         sendCommand({ type: CommandType.BOOKMARK_CODE_BLOCK, exchangeId, blockIndex });
     }, []);
@@ -812,6 +1016,8 @@ export function useBridge(): BridgeState {
         switchTab,
         closeTab,
         toggleStar,
+        renameTab,
+        switchTabProvider,
         setScrolledUp: setIsScrolledUp,
         saveScrollPosition,
         bookmarkCodeBlock,

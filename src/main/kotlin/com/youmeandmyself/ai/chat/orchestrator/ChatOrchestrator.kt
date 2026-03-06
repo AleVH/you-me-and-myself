@@ -120,6 +120,8 @@ class ChatOrchestrator(
      * This is the single entry point for the UI. The full pipeline:
      *
      * 1. Resolve the active AI provider
+     *    - If providerId is supplied (per-tab selection), use that profile.
+     *    - If not, fall back to the globally selected chat provider.
      * 2. Capture IDE context (before the HTTP call, so we snapshot what the user sees)
      * 3. Assemble the prompt (user input + IDE context + summaries)
      * 4. Call the AI provider (HTTP only, returns ProviderResponse)
@@ -134,11 +136,36 @@ class ChatOrchestrator(
      *
      * @param userInput The raw text the user typed
      * @param scope Coroutine scope for context gathering and provider calls
+     * @param conversationId Groups this message with its conversation in storage
+     * @param providerId Optional: the specific profile ID to use for this request.
+     *   If null, falls back to ProviderRegistry.selectedChatProvider().
+     *   Set by BridgeDispatcher from the tab's per-tab provider selection.
      * @return ChatResult that the UI renders. Never null, never throws.
      */
-    suspend fun send(userInput: String, scope: CoroutineScope, conversationId: String? = null): ChatResult {
+    suspend fun send(
+        userInput: String,
+        scope: CoroutineScope,
+        conversationId: String? = null,
+        providerId: String? = null
+    ): ChatResult {
         // ── Step 1: Resolve provider ──────────────────────────────────
-        val provider = ProviderRegistry.selectedChatProvider(project)
+        // Per-tab provider takes precedence over global selection.
+        // If the per-tab provider is set but invalid/missing, we warn and
+        // fall back to the global selection rather than failing the request.
+        val provider = if (providerId != null) {
+            val perTabProvider = ProviderRegistry.providerById(project, providerId)
+            if (perTabProvider == null) {
+                Dev.warn(log, "orchestrator.provider.pertab_fallback",
+                    null,
+                    "requestedProviderId" to providerId,
+                    "reason" to "profile not found or invalid, falling back to global selection"
+                )
+            }
+            perTabProvider ?: ProviderRegistry.selectedChatProvider(project)
+        } else {
+            ProviderRegistry.selectedChatProvider(project)
+        }
+
         if (provider == null) {
             return ChatResult.error(
                 "[No provider selected/configured. Pick one in the dropdown or set keys in Settings.]"
@@ -203,8 +230,6 @@ class ChatOrchestrator(
 
             val (finalDisplayText, finalIsError, correctionAvailable) =
                 runCorrectionFlow(response, provider.id, modelId)
-
-
 
             // ── Step 9: Build and return ChatResult ──────────────────
             val tokenUsage = response.parsed.tokenUsage?.let {

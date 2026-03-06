@@ -31,6 +31,14 @@
  * and STAR_UPDATED event for exchange-level starring. Added LOAD_CONVERSATION
  * command and CONVERSATION_HISTORY event for restoring tab content.
  *
+ * ## Per-Tab Provider Changes
+ *
+ * - SendMessageCommand: gains providerId so the backend uses the tab's
+ *   selected provider rather than the global selection.
+ * - TabStateDto: gains providerId so per-tab provider survives IDE restart.
+ * - SWITCH_TAB_PROVIDER: new command for changing provider on a specific tab
+ *   without affecting the global AiProfilesState selection.
+ *
  * @see BridgeMessage.kt — Kotlin counterpart
  * @see transport.ts — Wire layer that sends/receives these messages
  */
@@ -61,11 +69,29 @@ export const CommandType = {
     /** User starts a new conversation. @see BridgeMessage.NewConversation */
     NEW_CONVERSATION: "NEW_CONVERSATION",
 
-    /** User selects a different AI provider. @see BridgeMessage.SwitchProvider */
+    /**
+     * User selects a different global AI provider.
+     * Updates AiProfilesState.selectedChatProfileId — the fallback for
+     * tabs with no per-tab provider set. @see BridgeMessage.SwitchProvider
+     */
     SWITCH_PROVIDER: "SWITCH_PROVIDER",
 
     /** Frontend requests the list of available providers. @see BridgeMessage.RequestProviders */
     REQUEST_PROVIDERS: "REQUEST_PROVIDERS",
+
+    // ── Per-Tab Provider ─────────────────────────────────────────────
+
+    /**
+     * User switches the provider for a specific tab.
+     *
+     * Unlike SWITCH_PROVIDER (which updates the global selection),
+     * this updates only the provider associated with the given tab.
+     * The selection is persisted in open_tabs.provider_id.
+     *
+     * @see BridgeMessage.SwitchTabProvider
+     * @see BridgeDispatcher.handleSwitchTabProvider
+     */
+    SWITCH_TAB_PROVIDER: "SWITCH_TAB_PROVIDER",
 
     // ── R4: Tab Management ───────────────────────────────────────────
 
@@ -88,7 +114,8 @@ export const CommandType = {
     /**
      * Frontend persists current tab state to the backend.
      * Sent on tab switch, new message, or periodic save. Includes tab order,
-     * active tab, scroll positions, and titles. Backend writes to open_tabs table.
+     * active tab, scroll positions, titles, and per-tab provider IDs.
+     * Backend writes to open_tabs table.
      * @see BridgeMessage.SaveTabState
      */
     SAVE_TAB_STATE: "SAVE_TAB_STATE",
@@ -128,11 +155,19 @@ export type CommandType = (typeof CommandType)[keyof typeof CommandType];
 
 // ── Individual Command Interfaces ────────────────────────────────────
 
-/** User submits a chat message. Mirrors BridgeMessage.SendMessage. */
+/**
+ * User submits a chat message. Mirrors BridgeMessage.SendMessage.
+ *
+ * providerId: the profile ID for the active tab's per-tab provider selection.
+ * Null means the backend should use the globally selected chat provider
+ * (AiProfilesState.selectedChatProfileId). Set by useBridge.sendMessage()
+ * from the active tab's TabData.providerId.
+ */
 export interface SendMessageCommand {
     type: typeof CommandType.SEND_MESSAGE;
     text: string;
     conversationId: string | null;
+    providerId: string | null;
 }
 
 /** User confirms heuristic was correct. Mirrors BridgeMessage.ConfirmCorrection. */
@@ -155,7 +190,13 @@ export interface NewConversationCommand {
     type: typeof CommandType.NEW_CONVERSATION;
 }
 
-/** User selects a different AI provider. Mirrors BridgeMessage.SwitchProvider. */
+/**
+ * User selects a different global AI provider. Mirrors BridgeMessage.SwitchProvider.
+ *
+ * Updates the global fallback provider (AiProfilesState.selectedChatProfileId).
+ * Does not affect per-tab provider selections. For per-tab changes use
+ * SwitchTabProviderCommand instead.
+ */
 export interface SwitchProviderCommand {
     type: typeof CommandType.SWITCH_PROVIDER;
     providerId: string;
@@ -164,6 +205,19 @@ export interface SwitchProviderCommand {
 /** Frontend requests provider list. Mirrors BridgeMessage.RequestProviders. */
 export interface RequestProvidersCommand {
     type: typeof CommandType.REQUEST_PROVIDERS;
+}
+
+/**
+ * User switches the provider for a specific tab. Mirrors BridgeMessage.SwitchTabProvider.
+ *
+ * Updates only the provider_id for the given tab in open_tabs. Does NOT
+ * affect AiProfilesState.selectedChatProfileId (the global selection).
+ * The next SEND_MESSAGE from this tab will use the new provider.
+ */
+export interface SwitchTabProviderCommand {
+    type: typeof CommandType.SWITCH_TAB_PROVIDER;
+    tabId: string;
+    providerId: string;
 }
 
 /**
@@ -192,7 +246,7 @@ export interface CloseTabCommand {
  * Frontend saves the full tab state to the backend. Mirrors BridgeMessage.SaveTabState.
  *
  * Sent periodically and on meaningful state changes (new message, tab switch,
- * tab close, tab reorder). The backend writes this to the open_tabs SQLite table.
+ * tab close, provider change). The backend writes this to the open_tabs SQLite table.
  *
  * The tabs array contains the complete current state — backend does a full
  * replace (delete all + insert) rather than incremental updates. Simpler
@@ -273,6 +327,7 @@ export type BridgeCommand =
     | NewConversationCommand
     | SwitchProviderCommand
     | RequestProvidersCommand
+    | SwitchTabProviderCommand
     | SwitchTabCommand
     | CloseTabCommand
     | SaveTabStateCommand
@@ -481,6 +536,10 @@ export interface BridgeReadyEvent {
  *
  * Used in both SaveTabStateCommand (frontend → backend) and
  * TabStateEvent (backend → frontend). Same shape in both directions.
+ *
+ * providerId: the AI profile selected for this specific tab.
+ * Null means "use the global chat provider selection".
+ * Persisted in open_tabs.provider_id so per-tab provider survives IDE restarts.
  */
 export interface TabStateDto {
     /** Unique tab identifier (generated by frontend). */
@@ -495,6 +554,8 @@ export interface TabStateDto {
     isActive: boolean;
     /** Scroll position in pixels for restoring exact scroll state. */
     scrollPosition: number;
+    /** Per-tab AI provider profile ID. Null = use global selection. */
+    providerId: string | null;
 }
 
 /**

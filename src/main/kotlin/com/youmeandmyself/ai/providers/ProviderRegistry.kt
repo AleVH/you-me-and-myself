@@ -22,6 +22,10 @@ import com.youmeandmyself.dev.Dev
  * 2. If there's an explicit selection (selectedChatProfileId/selectedSummaryProfileId), use it
  * 3. Otherwise, auto-select the newest valid profile (UUIDs are time-based)
  *
+ * For per-tab provider (providerById):
+ * 1. Find the profile by ID regardless of role
+ * 2. Return null if not found or invalid
+ *
  * ## Profile Validity
  *
  * A profile is valid if it has:
@@ -63,6 +67,58 @@ object ProviderRegistry {
         Dev.info(Dev.logger(ProviderRegistry::class.java), "chat.autoSelect",
             "chosen" to chosen?.label, "eligible" to eligible.size)
         return chosen?.let { providerFromProfile(it, project) }
+    }
+
+    /**
+     * Get a provider by explicit profile ID.
+     *
+     * Used for per-tab provider resolution. Unlike [selectedChatProvider],
+     * this does not filter by role — the tab's stored providerId is trusted
+     * as a valid selection made by the user.
+     *
+     * Returns null if:
+     * - No profile with this ID exists
+     * - The profile exists but is invalid (missing apiKey, baseUrl, or model)
+     *
+     * When null is returned, the caller should fall back to [selectedChatProvider].
+     *
+     * @param project The IntelliJ project (profiles are project-scoped)
+     * @param profileId The specific profile ID to resolve
+     * @return AiProvider for the given profile, or null if not found/invalid
+     */
+    fun providerById(project: Project, profileId: String): AiProvider? {
+        val ps = AiProfilesState.getInstance(project)
+        val profile = ps.profiles.find { it.id == profileId }
+
+        if (profile == null) {
+            Dev.warn(
+                Dev.logger(ProviderRegistry::class.java),
+                "provider.byId.notFound",
+                null,
+                "profileId" to profileId
+            )
+            return null
+        }
+
+        if (!isValidProfile(profile)) {
+            Dev.warn(
+                Dev.logger(ProviderRegistry::class.java),
+                "provider.byId.invalid",
+                null,
+                "profileId" to profileId,
+                "label" to profile.label,
+                "hasApiKey" to profile.apiKey.isNotBlank(),
+                "hasBaseUrl" to profile.baseUrl.isNotBlank(),
+                "hasModel" to (profile.model?.isNotBlank() == true)
+            )
+            return null
+        }
+
+        Dev.info(Dev.logger(ProviderRegistry::class.java), "provider.byId.resolved",
+            "profileId" to profileId,
+            "label" to profile.label
+        )
+        return providerFromProfile(profile, project)
     }
 
     /**

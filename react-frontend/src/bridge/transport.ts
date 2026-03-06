@@ -227,6 +227,7 @@ const mockTabStore: {
         tabOrder: number;
         isActive: boolean;
         scrollPosition: number;
+        providerId: string | null;
     }>;
     keepTabs: boolean;
 } = {

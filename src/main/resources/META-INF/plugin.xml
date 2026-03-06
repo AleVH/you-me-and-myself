@@ -26,6 +26,11 @@
                              id="com.youmeandmyself.ai.settings.summary"
                              parentId="com.youmeandmyself.ai.settings"/>
 
+        <projectConfigurable instance="com.youmeandmyself.ai.settings.GeneralConfigurable"
+                             displayName="General"
+                             id="com.youmeandmyself.ai.settings.general"
+                             parentId="com.youmeandmyself.ai.settings"/>
+
         <notificationGroup id="AI Plugin" displayType="BALLOON" isLogByDefault="true"/>
 
         <!-- Storage facade for persisting AI exchanges and metadata -->

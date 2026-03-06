@@ -12,8 +12,8 @@ import java.time.Instant
  * ## What This Does
  *
  * Persists the frontend's open tab state (which tabs are open, their order,
- * which is active, scroll positions) so that tabs survive IDE restarts.
- * Controlled by the `keep_tabs` setting in storage_config.
+ * which is active, scroll positions, per-tab provider) so that tabs survive
+ * IDE restarts. Controlled by the `keep_tabs` setting in storage_config.
  *
  * ## Storage Strategy
  *
@@ -21,6 +21,14 @@ import java.time.Instant
  * are deleted and re-inserted in a single transaction. This is simpler than
  * incremental updates and avoids sync issues between frontend and backend.
  * The table is small (typically <20 rows) so this is fast.
+ *
+ * ## Per-Tab Provider
+ *
+ * Each tab can have its own AI provider (provider_id column in open_tabs).
+ * Null means "use the global chat provider selection" (AiProfilesState.selectedChatProfileId).
+ * updateTabProvider() handles immediate single-tab updates — called from
+ * BridgeDispatcher.handleSwitchTabProvider() — so the DB is correct even
+ * if the IDE crashes before the next full SAVE_TAB_STATE.
  *
  * ## Relationship to Other Services
  *
@@ -99,6 +107,9 @@ class TabStateService(private val project: Project) {
      * sends the complete tab list on every meaningful change, so we don't
      * need incremental updates.
      *
+     * Each TabStateDto now includes providerId for per-tab provider
+     * persistence. Null means the tab uses the global provider selection.
+     *
      * @param tabs The complete tab state from the frontend
      */
     fun saveAll(tabs: List<BridgeMessage.TabStateDto>) {
@@ -117,8 +128,8 @@ class TabStateService(private val project: Project) {
                     for (tab in tabs) {
                         db.execute(
                             """INSERT INTO open_tabs
-                               (id, project_id, conversation_id, title, tab_order, is_active, scroll_position, created_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                               (id, project_id, conversation_id, title, tab_order, is_active, scroll_position, provider_id, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             tab.id,
                             projectId,
                             tab.conversationId,
@@ -126,6 +137,7 @@ class TabStateService(private val project: Project) {
                             tab.tabOrder,
                             tab.isActive,
                             tab.scrollPosition,
+                            tab.providerId,
                             Instant.now().toString()
                         )
                     }
@@ -150,6 +162,9 @@ class TabStateService(private val project: Project) {
      * or keep_tabs was false), returns an empty list — the frontend will
      * create a single fresh tab.
      *
+     * provider_id is read from the DB and included in each TabStateDto
+     * so the frontend can restore the per-tab provider selection.
+     *
      * @return Saved tab state, or empty list if none
      */
     fun loadAll(): List<BridgeMessage.TabStateDto> {
@@ -158,7 +173,7 @@ class TabStateService(private val project: Project) {
         return try {
             facade.withReadableDatabase { db ->
                 db.query(
-                    """SELECT id, conversation_id, title, tab_order, is_active, scroll_position
+                    """SELECT id, conversation_id, title, tab_order, is_active, scroll_position, provider_id
                        FROM open_tabs
                        WHERE project_id = ?
                        ORDER BY tab_order""",
@@ -170,13 +185,50 @@ class TabStateService(private val project: Project) {
                         title = rs.getString("title"),
                         tabOrder = rs.getInt("tab_order"),
                         isActive = rs.getInt("is_active") == 1,
-                        scrollPosition = rs.getInt("scroll_position")
+                        scrollPosition = rs.getInt("scroll_position"),
+                        providerId = rs.getString("provider_id")
                     )
                 }
             }
         } catch (e: Exception) {
             Dev.warn(log, "tab_state.load_failed", e)
             emptyList()
+        }
+    }
+
+    /**
+     * Update the provider for a single tab.
+     *
+     * Called immediately when the user switches a tab's provider via
+     * SWITCH_TAB_PROVIDER, so the DB reflects the change even if the IDE
+     * crashes before the next full SAVE_TAB_STATE cycle.
+     *
+     * Does not affect any other tab or the global provider selection in
+     * AiProfilesState.
+     *
+     * @param tabId The frontend tab ID to update
+     * @param providerId The profile ID to associate with this tab,
+     *   or null to fall back to the global provider selection
+     */
+    fun updateTabProvider(tabId: String, providerId: String?) {
+        try {
+            facade.withDatabase { db ->
+                db.execute(
+                    "UPDATE open_tabs SET provider_id = ? WHERE id = ?",
+                    providerId,
+                    tabId
+                )
+            }
+            Dev.info(log, "tab_state.provider_updated",
+                "tabId" to tabId,
+                "providerId" to providerId
+            )
+        } catch (e: Exception) {
+            Dev.error(log, "tab_state.provider_update_failed", e,
+                "tabId" to tabId,
+                "providerId" to providerId
+            )
+            throw e // Re-throw so BridgeDispatcher can emit an error event
         }
     }
 

@@ -1,12 +1,12 @@
 /**
  * Main chat application component.
  *
- * ## Layout (R4, unchanged in R5)
+ * ## Layout
  *
  * ┌──────────────────────────────┐
  * │  MetricsBar (token usage)    │  ← top bar, hidden until first exchange
  * ├──────────────────────────────┤
- * │  ProviderSelector (dropdown) │  ← provider dropdown only
+ * │  ProviderSelector (dropdown) │  ← global provider dropdown
  * ├──────────────────────────────┤
  * │  TabBar (conversation tabs)  │  ← R4: tab bar with +/× buttons
  * ├──────────────────────────────┤
@@ -19,18 +19,24 @@
  * │  InputBar (text + send)      │  ← fixed at bottom
  * └──────────────────────────────┘
  *
+ * ## Per-Tab Provider
+ *
+ * Per-tab provider override is planned but NOT YET in the UI.
+ * The global ProviderSelector at the top is the only provider
+ * dropdown. Per-tab overrides will be revisited once the core
+ * tab functionality is stable.
+ *
  * ## R5 Changes
  *
  * - Passes scrollPosition and onBookmarkCodeBlock to MessageList
  * - R5: Bookmark/Library integration, code block save-to-library
- * - R6: Feature parity flag, legacy UI removal
  */
 import { useBridge } from "../hooks/useBridge";
 import MessageList from "./MessageList";
 import InputBar from "./InputBar";
 import ProviderSelector from "./ProviderSelector";
 import MetricsBar from "./MetricsBar";
-import TabBar from "./TabBar.tsx";
+import TabBar from "./TabBar";
 
 function ChatApp() {
     const bridge = useBridge();
@@ -47,9 +53,11 @@ function ChatApp() {
 
             <TabBar
                 tabs={bridge.tabs}
+                activeTabId={bridge.activeTabId}
                 onSwitchTab={bridge.switchTab}
                 onCloseTab={bridge.closeTab}
-                onNewTab={bridge.newConversation}
+                onNewConversation={bridge.newConversation}
+                onRenameTab={bridge.renameTab}
             />
 
             <MessageList

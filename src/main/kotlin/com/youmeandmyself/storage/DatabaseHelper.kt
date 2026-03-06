@@ -511,6 +511,7 @@ class DatabaseHelper(private val dbFile: File) {
                     tab_order       INTEGER NOT NULL DEFAULT 0,
                     is_active       INTEGER NOT NULL DEFAULT 0,
                     scroll_position INTEGER NOT NULL DEFAULT 0,
+                    provider_id     TEXT,
                     created_at      TEXT NOT NULL
                 )
             """.trimIndent())
