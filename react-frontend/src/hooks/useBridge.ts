@@ -76,6 +76,8 @@ import {
     type OpenConversationResultEvent,
     type TabStateDto, ProviderInfoDto,
 } from "../bridge/types";
+import type { TabMetricsState, MetricsSnapshot } from "../metrics";
+import { createAccumulator, accumulate } from "../metrics";
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CONSTANTS
@@ -110,22 +112,14 @@ export interface ChatMessage {
     isStarred: boolean;
 }
 
-/** Token usage metrics for the latest exchange in a tab. */
-export interface MetricsData {
-    model: string | null;
-    promptTokens: number | null;
-    completionTokens: number | null;
-    totalTokens: number | null;
-    estimatedCost: string | null;
-}
-
 /**
- * R4: Per-tab conversation state.
+ * Per-tab metrics state: last exchange snapshot + session accumulator.
  *
- * providerId: the AI profile selected for this tab's conversation.
- * Null means "use the global chat provider selection" (AiProfilesState.selectedChatProfileId).
- * Included in SEND_MESSAGE so the backend always uses the correct provider.
- * Persisted in open_tabs.provider_id via SAVE_TAB_STATE so it survives IDE restarts.
+ * Always initialized (never null) — starts with null lastExchange
+ * and an empty accumulator. Replaces the old `metrics: MetricsData | null`
+ * which only stored the latest exchange and lost session totals.
+ *
+ * @see TabMetricsState in metrics/types.ts
  */
 export interface TabData {
     id: string;
@@ -133,7 +127,7 @@ export interface TabData {
     conversationId: string | null;
     messages: ChatMessage[];
     isThinking: boolean;
-    metrics: MetricsData | null;
+    metricsState: TabMetricsState;
     scrollPosition: number;
     /** False for restored tabs that haven't fetched messages yet. */
     historyLoaded: boolean;
@@ -175,7 +169,8 @@ export interface BridgeState {
     // Active tab state
     messages: ChatMessage[];
     isThinking: boolean;
-    metrics: MetricsData | null;
+    /** Per-tab metrics: last exchange + session totals. */
+    metricsState: TabMetricsState;
 
     // Global state
     providers: ProviderInfoDto[];
@@ -267,7 +262,10 @@ function createTab(data?: Partial<TabData>): TabData {
         conversationId,
         messages: data?.messages ?? [],
         isThinking: data?.isThinking ?? false,
-        metrics: data?.metrics ?? null,
+        metricsState: data?.metricsState ?? {
+            lastExchange: null,
+            session: createAccumulator(),
+        },
         scrollPosition: data?.scrollPosition ?? 0,
         historyLoaded: data?.historyLoaded ?? true,
         providerId: data?.providerId ?? null,
@@ -338,7 +336,10 @@ export function useBridge(): BridgeState {
     const activeTab = tabMap.get(activeTabId);
     const activeMessages = activeTab?.messages ?? [];
     const activeIsThinking = activeTab?.isThinking ?? false;
-    const activeMetrics = activeTab?.metrics ?? null;
+    const activeMetricsState: TabMetricsState = activeTab?.metricsState ?? {
+        lastExchange: null,
+        session: createAccumulator(),
+    };
     const activeScrollPosition = activeTab?.scrollPosition ?? 0;
 
     const tabs= tabOrder
@@ -469,21 +470,33 @@ export function useBridge(): BridgeState {
             }),
         );
 
-        // UPDATE_METRICS → active tab
+        // UPDATE_METRICS → active tab (snapshot + accumulate)
         unsubscribers.push(
             onEvent(EventType.UPDATE_METRICS, (event: BridgeEvent) => {
                 const e = event as UpdateMetricsEvent;
                 const targetId = activeTabIdRef.current;
-                updateTab(targetId, (tab) => ({
-                    ...tab,
-                    metrics: {
+
+                updateTab(targetId, (tab) => {
+                    // Build snapshot from the bridge event.
+                    // contextWindowSize and responseTimeMs are NOT yet sent by
+                    // Kotlin — null until the backend is enhanced.
+                    const snapshot: MetricsSnapshot = {
                         model: e.model,
                         promptTokens: e.promptTokens,
                         completionTokens: e.completionTokens,
                         totalTokens: e.totalTokens,
-                        estimatedCost: e.estimatedCost,
-                    },
-                }));
+                        contextWindowSize: null,  // NOT YET: Kotlin enhancement needed
+                        responseTimeMs: null,      // NOT YET: Kotlin enhancement needed
+                    };
+
+                    return {
+                        ...tab,
+                        metricsState: {
+                            lastExchange: snapshot,
+                            session: accumulate(tab.metricsState.session, snapshot),
+                        },
+                    };
+                });
             }),
         );
 
@@ -535,7 +548,10 @@ export function useBridge(): BridgeState {
                     ...tab,
                     messages: [],
                     isThinking: false,
-                    metrics: null,
+                    metricsState: {
+                        lastExchange: null,
+                        session: createAccumulator(),
+                    },
                 }));
             }),
         );
@@ -569,7 +585,10 @@ export function useBridge(): BridgeState {
                         conversationId: dto.conversationId,
                         messages: [],
                         isThinking: false,
-                        metrics: null,
+                        metricsState: {
+                            lastExchange: null,
+                            session: createAccumulator(),
+                        },
                         scrollPosition: dto.scrollPosition,
                         historyLoaded: dto.conversationId === null,
                         providerId: dto.providerId ?? null,
@@ -998,7 +1017,7 @@ export function useBridge(): BridgeState {
     return {
         messages: activeMessages,
         isThinking: activeIsThinking,
-        metrics: activeMetrics,
+        metricsState: activeMetricsState,
         providers,
         selectedProviderId,
         isProduction: isJcefMode(),

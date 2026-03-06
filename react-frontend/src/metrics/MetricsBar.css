@@ -1,0 +1,288 @@
+/**
+ * MetricsBar — Styles for the compact token usage bar.
+ *
+ * ## Naming Convention
+ *
+ * All classes use .ymm-metrics-bar{__element}{--modifier} following the
+ * BEM-ish pattern established in index.css. This file replaces the old
+ * .ymm-metrics-bar styles in index.css — those should be removed when
+ * this is integrated.
+ *
+ * ## Theme
+ *
+ * Dark theme matching IntelliJ Darcula palette from index.css:
+ *   - Background:  #252526 (surfaces)
+ *   - Text:        #808080 (muted), #d4d4d4 (primary)
+ *   - Accent:      #569cd6 (model name, active indicators)
+ *   - Total:       #d4d4d4 (emphasized)
+ *
+ * ## Fill Bar Colors
+ *
+ *   - muted:  #555 (unknown or low usage)
+ *   - green:  #4ec9b0 (healthy, 50–74%)
+ *   - amber:  #dcdcaa (approaching limit, 75–89%)
+ *   - red:    #f44747 (danger zone, 90–100%)
+ *
+ * @see MetricsBar.tsx — Component using these styles
+ * @see index.css — Global stylesheet (remove old .ymm-metrics-bar block)
+ */
+
+/* ═══════════════════════════════════════════════════════════════════════
+   BAR CONTAINER
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-metrics-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 12px;
+    background: #252526;
+    border-bottom: 1px solid #333;
+    font-size: 11px;
+    color: #808080;
+    flex-shrink: 0;
+    min-height: 28px;
+}
+
+/* Collapsed state — thin strip with just total and expand arrow */
+.ymm-metrics-bar--collapsed {
+    gap: 6px;
+    min-height: 20px;
+    padding: 2px 12px;
+    cursor: pointer;
+}
+
+.ymm-metrics-bar--collapsed:hover {
+    background: #2d2d2d;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MODEL NAME
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-metrics-bar__model {
+    color: #569cd6;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 150px;
+    flex-shrink: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   TOKEN COUNTS (clickable toggle area)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * The tokens area is a <button> for accessibility but styled as inline
+ * text. Clicking toggles between exchange and session views.
+ */
+.ymm-metrics-bar__tokens {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: none;
+    border: none;
+    color: #808080;
+    font: inherit;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 3px;
+    transition: background-color 0.15s ease;
+}
+
+.ymm-metrics-bar__tokens:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.ymm-metrics-bar__tokens:focus-visible {
+    outline: 1px solid #569cd6;
+    outline-offset: 1px;
+}
+
+/* View indicator: "•" for exchange view, "Σ" for session view */
+.ymm-metrics-bar__view-indicator {
+    color: #569cd6;
+    font-weight: 700;
+    font-size: 12px;
+    width: 12px;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+/* Individual P:/C:/T: items */
+.ymm-metrics-bar__item {
+    white-space: nowrap;
+}
+
+/* Total gets emphasized */
+.ymm-metrics-bar__item--total {
+    color: #d4d4d4;
+    font-weight: 600;
+}
+
+/* Exchange count badge in session view (×5) */
+.ymm-metrics-bar__exchange-count {
+    color: #569cd6;
+    font-size: 10px;
+    opacity: 0.8;
+    margin-left: -2px;
+}
+
+/* Summary text in collapsed state */
+.ymm-metrics-bar__collapsed-summary {
+    color: #808080;
+    font-size: 10px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CONTEXT FILL BAR
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-metrics-bar__fill-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+/*
+ * PLACEHOLDER visual treatment — dashed border signals "not wired yet".
+ * When contextWindowSize starts flowing from Kotlin, remove this modifier
+ * from the JSX and delete this rule.
+ */
+.ymm-metrics-bar__fill-wrapper--placeholder .ymm-metrics-bar__fill-track {
+    border: 1px dashed #555;
+    background: transparent;
+}
+
+/* Track (background) for the fill bar — fixed width for consistency */
+.ymm-metrics-bar__fill-track {
+    width: 48px;
+    height: 6px;
+    background: #333;
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+/* The filled portion — width set inline by the component */
+.ymm-metrics-bar__fill-bar {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s ease, background-color 0.3s ease;
+}
+
+/* Fill bar color variants — match design doc thresholds */
+.ymm-metrics-bar__fill-bar--muted {
+    background: #555;
+}
+
+.ymm-metrics-bar__fill-bar--green {
+    background: #4ec9b0;
+}
+
+.ymm-metrics-bar__fill-bar--amber {
+    background: #dcdcaa;
+}
+
+.ymm-metrics-bar__fill-bar--red {
+    background: #f44747;
+}
+
+/* Percentage label next to the fill bar */
+.ymm-metrics-bar__fill-label {
+    font-size: 10px;
+    color: #808080;
+    min-width: 24px;
+    text-align: right;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   RESPONSE TIME
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-metrics-bar__response-time {
+    white-space: nowrap;
+    font-size: 11px;
+    color: #808080;
+}
+
+/*
+ * PLACEHOLDER visual treatment — dimmed with dashed underline.
+ * Signals "this element exists but data isn't flowing yet."
+ * When responseTimeMs starts flowing from Kotlin, remove --placeholder
+ * from the JSX and delete this rule.
+ */
+.ymm-metrics-bar__response-time--placeholder {
+    opacity: 0.45;
+    border-bottom: 1px dashed #555;
+    padding-bottom: 1px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   COST (Pricing Module — post-launch)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-metrics-bar__cost {
+    white-space: nowrap;
+    font-size: 11px;
+    color: #dcdcaa;
+}
+
+/*
+ * PLACEHOLDER visual treatment — dimmed with dashed underline.
+ * The Pricing Module is post-launch scope. When it ships, remove
+ * --placeholder from the JSX and delete this rule.
+ */
+.ymm-metrics-bar__cost--placeholder {
+    opacity: 0.45;
+    border-bottom: 1px dashed #555;
+    padding-bottom: 1px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CONTROL BUTTONS (collapse toggle, expand)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Shared styles for the ▾ collapse and ⤢ expand buttons.
+ * Minimal chrome — just the symbol, hover highlight, focus outline.
+ */
+.ymm-metrics-bar__toggle,
+.ymm-metrics-bar__expand {
+    background: none;
+    border: none;
+    color: #808080;
+    font-size: 12px;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 3px;
+    line-height: 1;
+    flex-shrink: 0;
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.ymm-metrics-bar__toggle:hover,
+.ymm-metrics-bar__expand:hover {
+    color: #d4d4d4;
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.ymm-metrics-bar__toggle:focus-visible,
+.ymm-metrics-bar__expand:focus-visible {
+    outline: 1px solid #569cd6;
+    outline-offset: 1px;
+}
+
+/*
+ * PLACEHOLDER visual treatment for ⤢ expand button — dimmed with
+ * dashed border. Signals "Metrics Panel not built yet."
+ * When MetricsPanel.tsx is implemented, remove --placeholder from
+ * the JSX and delete this rule.
+ */
+.ymm-metrics-bar__expand--placeholder {
+    opacity: 0.45;
+    border: 1px dashed #555;
+}

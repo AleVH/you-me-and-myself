@@ -59,38 +59,6 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   METRICS BAR
-   ═══════════════════════════════════════════════════════════════════════ */
-
-.ymm-metrics-bar {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 4px 12px;
-    background: #252526;
-    border-bottom: 1px solid #333;
-    font-size: 11px;
-    color: #808080;
-    flex-shrink: 0;
-}
-
-.ymm-metrics-bar__model {
-    color: #569cd6;
-    font-weight: 600;
-    margin-right: 4px;
-}
-
-.ymm-metrics-bar__item--total {
-    color: #d4d4d4;
-    font-weight: 600;
-}
-
-.ymm-metrics-bar__cost {
-    margin-left: auto;
-    color: #dcdcaa;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
    PROVIDER BAR (Global provider selector — top of window)
    ═══════════════════════════════════════════════════════════════════════ */
 

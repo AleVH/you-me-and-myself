@@ -35,7 +35,7 @@ import { useBridge } from "../hooks/useBridge";
 import MessageList from "./MessageList";
 import InputBar from "./InputBar";
 import ProviderSelector from "./ProviderSelector";
-import MetricsBar from "./MetricsBar";
+import MetricsBar from "../metrics/MetricsBar";
 import TabBar from "./TabBar";
 
 function ChatApp() {
@@ -43,7 +43,7 @@ function ChatApp() {
 
     return (
         <div className="ymm-chat-app">
-            {bridge.metrics && <MetricsBar metrics={bridge.metrics} />}
+            <MetricsBar metricsState={bridge.metricsState} />
 
             <ProviderSelector
                 providers={bridge.providers}
