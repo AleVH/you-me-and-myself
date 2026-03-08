@@ -294,10 +294,10 @@ body {
 .ymm-message-list {
     flex: 1;
     overflow-y: auto;
-    padding: 12px;
+    padding: 16px 14px;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 2px;
     /* R4: position relative for the scroll-to-bottom button */
     position: relative;
 }
@@ -310,43 +310,55 @@ body {
 .ymm-empty-state {
     text-align: center;
     color: #808080;
+    padding: 32px 24px;
 }
 
 .ymm-empty-state__title {
-    font-size: 16px;
-    margin-bottom: 4px;
+    font-size: 15px;
+    margin-bottom: 6px;
     color: #999;
+    font-weight: 500;
+    letter-spacing: 0.2px;
 }
 
 .ymm-empty-state__subtitle {
     font-size: 12px;
+    line-height: 1.5;
+    max-width: 280px;
+    margin: 0 auto;
 }
 
 /* ── Individual Messages ──────────────────────────────────────────── */
 
 .ymm-message {
-    padding: 8px 12px;
+    padding: 10px 14px;
     border-radius: 6px;
     max-width: 100%;
     word-wrap: break-word;
     white-space: pre-wrap;
 }
 
+/* User messages: right-aligned bubble with softer bottom-right corner */
 .ymm-message--user {
     background: #264f78;
     align-self: flex-end;
-    max-width: 85%;
+    max-width: 82%;
     border-radius: 6px 6px 2px 6px;
+    margin-bottom: 12px;
 }
 
+/* Assistant messages: full-width with subtle left accent for visual hierarchy */
 .ymm-message--assistant {
     background: #2d2d2d;
     border-radius: 6px;
+    border-left: 2px solid #3d3d3d;
+    margin-bottom: 16px;
 }
 
+/* Error state: red accent replaces the subtle grey left border */
 .ymm-message--error {
-    background: rgba(244, 71, 71, 0.1);
-    border-left: 3px solid #f44747;
+    background: rgba(244, 71, 71, 0.08);
+    border-left: 2px solid #f44747;
 }
 
 /* R4: Message header — row with role label and star button */
@@ -354,13 +366,15 @@ body {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 2px;
+    margin-bottom: 4px;
 }
 
 .ymm-message__role {
     font-size: 11px;
     font-weight: 600;
-    color: #808080;
+    color: #707070;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
 }
 
 .ymm-message--user .ymm-message__role {
@@ -376,11 +390,17 @@ body {
     white-space: normal;
 }
 
+/* Timestamp: subtle by default, slightly more visible on message hover */
 .ymm-message__timestamp {
     font-size: 10px;
-    color: #666;
-    margin-top: 4px;
+    color: #555;
+    margin-top: 6px;
     text-align: right;
+    transition: color 0.15s ease;
+}
+
+.ymm-message:hover .ymm-message__timestamp {
+    color: #777;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -392,12 +412,13 @@ body {
 .ymm-exchange-star {
     background: transparent;
     border: none;
-    color: #666;
+    color: #555;
     font-size: 14px;
     cursor: pointer;
-    padding: 0 4px;
+    padding: 2px 6px;
     line-height: 1;
-    transition: color 0.15s ease;
+    border-radius: 3px;
+    transition: color 0.15s ease, background-color 0.15s ease;
 }
 
 .ymm-exchange-star:hover {
@@ -420,27 +441,28 @@ body {
 
 .ymm-scroll-to-bottom {
     position: sticky;
-    bottom: 8px;
+    bottom: 12px;
     align-self: center;
-    width: 36px;
-    height: 36px;
+    width: 32px;
+    height: 32px;
     border-radius: 50%;
-    background: #3c3c3c;
-    color: #d4d4d4;
-    border: 1px solid #555;
-    font-size: 18px;
+    background: #333;
+    color: #bbb;
+    border: 1px solid #444;
+    font-size: 16px;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-    transition: background 0.15s ease;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+    transition: background 0.15s ease, transform 0.15s ease;
     z-index: 10;
     flex-shrink: 0;
 }
 
 .ymm-scroll-to-bottom:hover {
-    background: #505050;
+    background: #444;
+    transform: translateY(-1px);
 }
 
 /* ── Correction Buttons ───────────────────────────────────────────── */
@@ -454,12 +476,13 @@ body {
 }
 
 .ymm-correction-btn {
-    padding: 3px 10px;
+    padding: 5px 12px;
     border: 1px solid #555;
-    border-radius: 3px;
+    border-radius: 4px;
     font-size: 11px;
     cursor: pointer;
     background: #3c3c3c;
+    transition: background 0.15s ease;
 }
 
 .ymm-correction-btn--confirm {
@@ -505,10 +528,13 @@ body {
     display: flex;
     align-items: center;
     gap: 2px;
-    padding: 8px 24px;
+    padding: 10px 14px;
     color: #808080;
     font-size: 13px;
     flex-shrink: 0;
+    border-left: 2px solid #3d3d3d;
+    border-radius: 6px;
+    margin-bottom: 4px;
 }
 
 .ymm-thinking__label {
@@ -688,11 +714,12 @@ body {
 }
 
 .ymm-markdown blockquote {
-    border-left: 3px solid #555;
-    padding: 4px 12px;
+    border-left: 3px solid #569cd6;
+    padding: 6px 14px;
     margin: 8px 0;
     color: #999;
-    background: rgba(255, 255, 255, 0.03);
+    background: rgba(86, 156, 214, 0.04);
+    border-radius: 0 4px 4px 0;
 }
 
 .ymm-markdown hr {
@@ -742,10 +769,10 @@ body {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 4px 8px;
+    padding: 4px 10px;
     background: #1c2129;
     border-bottom: 1px solid #2a2a2a;
-    min-height: 26px;
+    min-height: 28px;
 }
 
 .ymm-code-lang {

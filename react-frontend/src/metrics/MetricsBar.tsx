@@ -94,9 +94,10 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
 
     // ── Early Return: Nothing To Show ────────────────────────────────
 
-    // Don't render anything until there's at least one exchange.
-    // This matches the old behavior of {bridge.metrics && <MetricsBar />}.
-    if (!metricsState.lastExchange) {
+    // Show the bar if there's either a last exchange OR historical session data.
+    // Historical data (from reopened conversations) has session totals but no
+    // lastExchange — we still want to show the accumulated usage.
+    if (!metricsState.lastExchange && metricsState.session.exchangeCount === 0) {
         return null;
     }
 
@@ -107,25 +108,32 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
 
     // When viewing "exchange", show snapshot data.
     // When viewing "session", show accumulated totals.
-    const isSessionView = view === "session";
+    // Force session view when there's no last exchange (reopened conversation
+    // with only historical data — no individual exchange to show).
+    const hasSnapshot = snapshot !== null;
+    const isSessionView = !hasSnapshot || view === "session";
 
-    const displayPrompt = isSessionView ? session.promptTokens : snapshot.promptTokens;
-    const displayCompletion = isSessionView ? session.completionTokens : snapshot.completionTokens;
-    const displayTotal = isSessionView ? session.totalTokens : snapshot.totalTokens;
+    const displayPrompt = isSessionView ? session.promptTokens : snapshot!.promptTokens;
+    const displayCompletion = isSessionView ? session.completionTokens : snapshot!.completionTokens;
+    const displayTotal = isSessionView ? session.totalTokens : snapshot!.totalTokens;
 
     // Model name: always from the last exchange (session view doesn't have a single model).
     // Session with multiple models shows "N models" instead.
     const modelCount = Object.keys(session.byModel).length;
     const modelDisplay = isSessionView && modelCount > 1
         ? `${modelCount} models`
-        : snapshot.model ?? "unknown";
+        : isSessionView && !hasSnapshot
+            ? "historical"
+            : snapshot!.model ?? "unknown";
 
     // Model tooltip: for session multi-model, list all models.
     const modelTooltip = isSessionView && modelCount > 1
         ? `Models used:\n${Object.entries(session.byModel)
             .map(([name, bd]) => `  ${name}: ${bd.exchangeCount} exchanges, ${formatTokenCount(bd.totalTokens)} tokens`)
             .join("\n")}`
-        : snapshot.model ?? "Model not reported by provider";
+        : !hasSnapshot
+            ? "Historical totals from previous exchanges (no per-model breakdown)"
+            : snapshot!.model ?? "Model not reported by provider";
 
     // Truncate model name for display.
     const modelTruncated = modelDisplay.length > MODEL_NAME_MAX_DISPLAY
@@ -134,9 +142,9 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
 
     // Context fill — only meaningful for "exchange" view (uses snapshot's context window).
     // Session view doesn't have a single context window size.
-    const fillPct = isSessionView
+    const fillPct = isSessionView || !hasSnapshot
         ? null
-        : contextFillPercent(snapshot.totalTokens, snapshot.contextWindowSize);
+        : contextFillPercent(snapshot!.totalTokens, snapshot!.contextWindowSize);
     const fillColor = fillBarColor(fillPct);
 
     // View toggle tooltip.
@@ -182,9 +190,12 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
             {/* Token counts — clickable to toggle exchange/session view */}
             <button
                 className="ymm-metrics-bar__tokens"
-                onClick={() => setView(isSessionView ? "exchange" : "session")}
-                title={viewToggleTooltip}
-                aria-label={viewToggleTooltip}
+                onClick={() => {
+                    if (hasSnapshot) setView(isSessionView ? "exchange" : "session");
+                }}
+                title={hasSnapshot ? viewToggleTooltip : "Session totals from conversation history. Send a message to see per-exchange metrics."}
+                aria-label={hasSnapshot ? viewToggleTooltip : "Session totals from conversation history"}
+                style={!hasSnapshot ? { cursor: "default" } : undefined}
             >
                 {/* View indicator: dot or sigma symbol */}
                 <span className="ymm-metrics-bar__view-indicator">
@@ -232,8 +243,8 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
                 className="ymm-metrics-bar__response-time ymm-metrics-bar__response-time--placeholder"
                 title="Response time: not wired yet (needs Kotlin: responseTimeMs in UpdateMetricsEvent)"
             >
-                ⏱ {snapshot.responseTimeMs !== null
-                ? `${(snapshot.responseTimeMs / 1000).toFixed(1)}s`
+                ⏱ {hasSnapshot && snapshot!.responseTimeMs !== null
+                ? `${(snapshot!.responseTimeMs / 1000).toFixed(1)}s`
                 : "—"}
             </span>
 

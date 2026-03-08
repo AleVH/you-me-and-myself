@@ -691,8 +691,36 @@ export function useBridge(): BridgeState {
                         isStarred: msg.isStarred,
                     }));
 
+                    // Seed the session accumulator from historical token data.
+                    // Each assistant message in the history carries its token usage
+                    // (from chat_exchanges in SQLite). We accumulate them the same
+                    // way live UPDATE_METRICS events are accumulated — same function,
+                    // same data shape. lastExchange stays null until the user sends
+                    // a new message in this tab.
+                    let seededSession = tab.metricsState.session;
+                    for (const msg of e.messages) {
+                        if (msg.totalTokens !== null || msg.promptTokens !== null) {
+                            seededSession = accumulate(seededSession, {
+                                model: msg.model ?? null,
+                                promptTokens: msg.promptTokens ?? null,
+                                completionTokens: msg.completionTokens ?? null,
+                                totalTokens: msg.totalTokens ?? null,
+                                contextWindowSize: null,
+                                responseTimeMs: null,
+                            });
+                        }
+                    }
+
                     const next = new Map(prev);
-                    next.set(e.tabId, { ...tab, messages, historyLoaded: true });
+                    next.set(e.tabId, {
+                        ...tab,
+                        messages,
+                        historyLoaded: true,
+                        metricsState: {
+                            lastExchange: null,
+                            session: seededSession,
+                        },
+                    });
                     return next;
                 });
             }),

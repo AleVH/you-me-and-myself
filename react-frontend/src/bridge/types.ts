@@ -590,6 +590,19 @@ export interface HistoryMessageDto {
     exchangeId: string | null;
     /** Whether this exchange is starred (favourite). */
     isStarred: boolean;
+    /**
+     * Token usage from this exchange. Populated from chat_exchanges columns
+     * (prompt_tokens, completion_tokens, total_tokens, model_id).
+     * Null for user messages (only assistant exchanges have token data).
+     *
+     * Used by the CONVERSATION_HISTORY handler in useBridge to seed the
+     * tab's metrics accumulator, so the MetricsBar shows historical usage
+     * immediately when a conversation is reopened.
+     */
+    promptTokens: number | null;
+    completionTokens: number | null;
+    totalTokens: number | null;
+    model: string | null;
 }
 
 /**
