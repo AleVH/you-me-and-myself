@@ -1,4 +1,4 @@
-YouMeAndMyself Assistant — IntelliJ Platform Plugin
+YouMeAndMyself Assistant — IntelliJ Platform Plugin (by Ale Van Houtte)
 
 Welcome! This repository contains a multi‑provider AI assistant for JetBrains IDEs, featuring a chat tool window, provider abstraction, and a context orchestrator to enrich prompts from your project.
 
