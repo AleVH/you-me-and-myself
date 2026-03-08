@@ -122,9 +122,11 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
     const modelCount = Object.keys(session.byModel).length;
     const modelDisplay = isSessionView && modelCount > 1
         ? `${modelCount} models`
-        : isSessionView && !hasSnapshot
+        : isSessionView && !hasSnapshot && modelCount === 0
             ? "historical"
-            : snapshot!.model ?? "unknown";
+            : isSessionView && !hasSnapshot
+                ? Object.keys(session.byModel)[0] ?? "historical"
+                : snapshot!.model ?? "unknown";
 
     // Model tooltip: for session multi-model, list all models.
     const modelTooltip = isSessionView && modelCount > 1

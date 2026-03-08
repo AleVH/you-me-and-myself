@@ -5,22 +5,30 @@ package com.youmeandmyself.storage.model
  *
  * Used by [LocalStorageFacade.getExchangesForConversation] to return
  * only the fields needed to reconstruct the chat display in a restored tab.
- * Deliberately simpler than [AiExchange] — no raw JSON, no derived metadata,
- * no token breakdown.
+ * Deliberately simpler than [AiExchange] — no raw JSON, no derived metadata.
  *
  * The orchestrator maps these to [BridgeMessage.HistoryMessageDto] before
- * sending to the frontend.
+ * sending to the frontend. Token fields are included so the frontend can
+ * seed the MetricsBar accumulator for reopened conversations.
  *
  * @param id Exchange ID (used as exchangeId in the frontend for starring)
  * @param userPrompt The user's message text, or null if not stored
  * @param assistantText The cached assistant response, or null if not yet cached
  * @param timestamp ISO timestamp string from storage
  * @param isStarred Whether this exchange is starred (favourite)
+ * @param promptTokens Prompt token count from the provider response, or null
+ * @param completionTokens Completion token count from the provider response, or null
+ * @param totalTokens Total token count from the provider response, or null
+ * @param modelId Model identifier as reported by the provider, or null
  */
 data class ConversationExchange(
     val id: String,
     val userPrompt: String?,
     val assistantText: String?,
     val timestamp: String,
-    val isStarred: Boolean
+    val isStarred: Boolean,
+    val promptTokens: Int? = null,
+    val completionTokens: Int? = null,
+    val totalTokens: Int? = null,
+    val modelId: String? = null
 )

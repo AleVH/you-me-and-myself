@@ -413,7 +413,11 @@ class ChatOrchestrator(
                     content = assistantContent,
                     timestamp = exchange.timestamp,
                     exchangeId = exchange.id,
-                    isStarred = exchange.isStarred
+                    isStarred = exchange.isStarred,
+                    promptTokens = exchange.promptTokens,
+                    completionTokens = exchange.completionTokens,
+                    totalTokens = exchange.totalTokens,
+                    model = exchange.modelId
                 ))
 
                 messages

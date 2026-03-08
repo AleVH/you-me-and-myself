@@ -1750,10 +1750,11 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
     fun getExchangesForConversation(conversationId: String): List<ConversationExchange> {
         return withReadableDatabase { db ->
             db.query(
-                """SELECT id, user_prompt, assistant_text, timestamp, is_starred
-                   FROM chat_exchanges
-                   WHERE conversation_id = ? AND purpose = 'CHAT'
-                   ORDER BY timestamp ASC""",
+                """SELECT id, user_prompt, assistant_text, timestamp, is_starred,
+                    prompt_tokens, completion_tokens, total_tokens, model_id
+                    FROM chat_exchanges
+                    WHERE conversation_id = ? AND purpose = 'CHAT'
+                    ORDER BY timestamp ASC""",
                 conversationId
             ) { rs ->
                 ConversationExchange(
@@ -1761,7 +1762,11 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                     userPrompt = rs.getString("user_prompt"),
                     assistantText = rs.getString("assistant_text"),
                     timestamp = rs.getString("timestamp"),
-                    isStarred = rs.getInt("is_starred") == 1
+                    isStarred = rs.getInt("is_starred") == 1,
+                    promptTokens = rs.getInt("prompt_tokens").let { if (rs.wasNull()) null else it },
+                    completionTokens = rs.getInt("completion_tokens").let { if (rs.wasNull()) null else it },
+                    totalTokens = rs.getInt("total_tokens").let { if (rs.wasNull()) null else it },
+                    modelId = rs.getString("model_id")
                 )
             }
         }

@@ -408,7 +408,11 @@ object BridgeMessage {
         val content: String,
         val timestamp: String,
         val exchangeId: String?,
-        val isStarred: Boolean
+        val isStarred: Boolean,
+        val promptTokens: Int? = null,
+        val completionTokens: Int? = null,
+        val totalTokens: Int? = null,
+        val model: String? = null
     )
 
     // ═══════════════════════════════════════════════════════════════════
