@@ -76,8 +76,8 @@ import {
     type OpenConversationResultEvent,
     type TabStateDto, ProviderInfoDto,
 } from "../bridge/types";
-import type { TabMetricsState, MetricsSnapshot } from "../metrics";
 import { createAccumulator, accumulate } from "../metrics";
+import type {TabMetricsState, MetricsSnapshot} from "../metrics";
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CONSTANTS
@@ -133,6 +133,12 @@ export interface TabData {
     historyLoaded: boolean;
     /** Per-tab AI provider. Null = use global selection. */
     providerId: string | null;
+    /**
+     * Set of message IDs whose assistant responses are collapsed.
+     * Persisted per-tab so collapse state survives tab switching.
+     * Ephemeral — not saved to backend (resets on IDE restart).
+     */
+    collapsedIds: Set<string>;
 }
 
 /** R4: Lightweight tab descriptor for the TabBar component. */
@@ -177,13 +183,15 @@ export interface BridgeState {
     selectedProviderId: string | null;
     isProduction: boolean;
 
-    // R4: Tab state
+    // Tab state
     tabs: TabInfo[];
     activeTabId: string;
     isScrolledUp: boolean;
 
-    // R5: Scroll position for restore
+    // Scroll position for restore
     scrollPosition: number;
+    // Set of collapsed assistant message IDs for the active tab.
+    collapsedIds: Set<string>;
 
     // Commands (existing)
     sendMessage: (text: string) => void;
@@ -194,12 +202,19 @@ export interface BridgeState {
     requestCorrection: () => void;
     requestProviders: () => void;
 
-    // R4: Tab commands
+    // Tab commands
     switchTab: (tabId: string) => void;
     closeTab: (tabId: string) => void;
     toggleStar: (exchangeId: string) => void;
     setScrolledUp: (isUp: boolean) => void;
     saveScrollPosition: (position: number) => void;
+
+    /** Toggle collapse state of a single assistant message. */
+    toggleCollapse: (messageId: string) => void;
+    /** Collapse all assistant messages in the active tab. */
+    collapseAll: () => void;
+    /** Expand all collapsed messages in the active tab. */
+    expandAll: () => void;
 
     /**
      * Rename a tab title.
@@ -269,6 +284,7 @@ function createTab(data?: Partial<TabData>): TabData {
         scrollPosition: data?.scrollPosition ?? 0,
         historyLoaded: data?.historyLoaded ?? true,
         providerId: data?.providerId ?? null,
+        collapsedIds: data?.collapsedIds ?? new Set(),
     };
 
     console.log(
@@ -341,6 +357,7 @@ export function useBridge(): BridgeState {
         session: createAccumulator(),
     };
     const activeScrollPosition = activeTab?.scrollPosition ?? 0;
+    const activeCollapsedIds = activeTab?.collapsedIds ?? new Set<string>();
 
     const tabs= tabOrder
         .map((id) => {
@@ -592,6 +609,7 @@ export function useBridge(): BridgeState {
                         scrollPosition: dto.scrollPosition,
                         historyLoaded: dto.conversationId === null,
                         providerId: dto.providerId ?? null,
+                        collapsedIds: new Set(),
                     });
                     newOrder.push(dto.id);
                     if (dto.isActive) newActiveId = dto.id;
@@ -1042,6 +1060,40 @@ export function useBridge(): BridgeState {
         [updateTab],
     );
 
+    // ── Collapse/Expand ──────────────────────────────────────────
+
+    const toggleCollapse = useCallback(
+        (messageId: string) => {
+            updateTab(activeTabIdRef.current, (tab) => {
+                const next = new Set(tab.collapsedIds);
+                if (next.has(messageId)) {
+                    next.delete(messageId);
+                } else {
+                    next.add(messageId);
+                }
+                return { ...tab, collapsedIds: next };
+            });
+        },
+        [updateTab],
+    );
+
+    const collapseAll = useCallback(() => {
+        updateTab(activeTabIdRef.current, (tab) => {
+            const ids = new Set<string>();
+            for (const msg of tab.messages) {
+                if (msg.role === "assistant") ids.add(msg.id);
+            }
+            return { ...tab, collapsedIds: ids };
+        });
+    }, [updateTab]);
+
+    const expandAll = useCallback(() => {
+        updateTab(activeTabIdRef.current, (tab) => ({
+            ...tab,
+            collapsedIds: new Set(),
+        }));
+    }, [updateTab]);
+
     return {
         messages: activeMessages,
         isThinking: activeIsThinking,
@@ -1067,6 +1119,10 @@ export function useBridge(): BridgeState {
         switchTabProvider,
         setScrolledUp: setIsScrolledUp,
         saveScrollPosition,
+        collapsedIds: activeCollapsedIds,
+        toggleCollapse,
+        collapseAll,
+        expandAll,
         bookmarkCodeBlock,
     };
 }

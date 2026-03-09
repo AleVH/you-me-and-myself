@@ -1,6 +1,18 @@
 /**
  * Scrollable message list component.
  *
+ * ## 4B Changes
+ *
+ * - Expand/collapse toggle (▾/▸) on each assistant message header.
+ *   Collapsed messages show only the header row with a content preview
+ *   (~60 chars). Content, correction buttons, and timestamp are hidden.
+ * - Collapse All / Expand All toolbar button above the message list.
+ *   Only visible when 2+ assistant messages exist. Toggles based on
+ *   whether any messages are currently collapsed.
+ * - collapsedIds comes from useBridge (per-tab TabData.collapsedIds),
+ *   so collapse state survives tab switching within a session.
+ *   Resets on IDE restart (not persisted to backend).
+ *
  * ## R5 Changes
  *
  * - Code block star button REMOVED — star belongs on the response level only.
@@ -40,12 +52,16 @@ interface MessageListProps {
     isThinking: boolean;
     isScrolledUp: boolean;
     scrollPosition: number;
+    /** 4B: Set of collapsed assistant message IDs, managed by useBridge per-tab. */
+    collapsedIds: Set<string>;
     onConfirmCorrection: () => void;
     onRequestCorrection: () => void;
     onToggleStar: (exchangeId: string) => void;
     onBookmarkCodeBlock: (exchangeId: string, blockIndex: number) => void;
     onScrolledUpChange: (isUp: boolean) => void;
     onScrollPositionChange: (position: number) => void;
+    /** 4B: Toggle collapse for a single assistant message. */
+    onToggleCollapse: (messageId: string) => void;
 }
 
 const SCROLL_BOTTOM_THRESHOLD = 200;
@@ -65,12 +81,14 @@ function MessageList({
                          isThinking,
                          isScrolledUp,
                          scrollPosition,
+                         collapsedIds,
                          onConfirmCorrection,
                          onRequestCorrection,
                          onToggleStar,
                          onBookmarkCodeBlock,
                          onScrolledUpChange,
                          onScrollPositionChange,
+                         onToggleCollapse,
                      }: MessageListProps) {
     const bottomRef = useRef<HTMLDivElement>(null);
     const listRef = useRef<HTMLDivElement>(null);
@@ -284,15 +302,38 @@ function MessageList({
                     );
                 }
 
-                // Assistant message
+                // Assistant message — with collapse/expand toggle
+                const isCollapsed = collapsedIds.has(msg.id);
+
                 return (
                     <div
                         key={msg.id}
-                        className={`ymm-message ymm-message--assistant${msg.isError ? " ymm-message--error" : ""}`}
+                        className={
+                            `ymm-message ymm-message--assistant`
+                            + (msg.isError ? " ymm-message--error" : "")
+                            + (isCollapsed ? " ymm-message--collapsed" : "")
+                        }
                     >
-                        {/* R4: Header row with role label and star button */}
+                        {/* 4B: Header row — collapse toggle + role label (left), star (right) */}
                         <div className="ymm-message__header">
-                            <span className="ymm-message__role">Assistant</span>
+                            <div className="ymm-message__header-left">
+                                <button
+                                    className="ymm-collapse-toggle"
+                                    onClick={() => onToggleCollapse(msg.id)}
+                                    title={isCollapsed ? "Expand response" : "Collapse response"}
+                                >
+                                    {isCollapsed ? "▸" : "▾"}
+                                </button>
+                                <span className="ymm-message__role">Assistant</span>
+                                {/* 4B: Preview snippet when collapsed — first ~60 chars of content */}
+                                {isCollapsed && (
+                                    <span className="ymm-collapse-preview">
+                                        {msg.content.length > 60
+                                            ? msg.content.substring(0, 60) + "…"
+                                            : msg.content}
+                                    </span>
+                                )}
+                            </div>
                             {msg.exchangeId && (
                                 <button
                                     className={`ymm-exchange-star${msg.isStarred ? " ymm-exchange-star--active" : ""}`}
@@ -304,33 +345,38 @@ function MessageList({
                             )}
                         </div>
 
-                        <div
-                            className="ymm-message__content ymm-markdown"
-                            dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
-                        />
+                        {/* 4B: Content, correction, and timestamp hidden when collapsed */}
+                        {!isCollapsed && (
+                            <>
+                                <div
+                                    className="ymm-message__content ymm-markdown"
+                                    dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
+                                />
 
-                        {msg.correctionAvailable && (
-                            <div className="ymm-message__correction">
-                                <button
-                                    className="ymm-correction-btn ymm-correction-btn--confirm"
-                                    onClick={onConfirmCorrection}
-                                    title="The response looks correct"
-                                >
-                                    ✓ Looks right
-                                </button>
-                                <button
-                                    className="ymm-correction-btn ymm-correction-btn--reject"
-                                    onClick={onRequestCorrection}
-                                    title="The response was parsed incorrectly"
-                                >
-                                    ✗ Not right
-                                </button>
-                            </div>
+                                {msg.correctionAvailable && (
+                                    <div className="ymm-message__correction">
+                                        <button
+                                            className="ymm-correction-btn ymm-correction-btn--confirm"
+                                            onClick={onConfirmCorrection}
+                                            title="The response looks correct"
+                                        >
+                                            ✓ Looks right
+                                        </button>
+                                        <button
+                                            className="ymm-correction-btn ymm-correction-btn--reject"
+                                            onClick={onRequestCorrection}
+                                            title="The response was parsed incorrectly"
+                                        >
+                                            ✗ Not right
+                                        </button>
+                                    </div>
+                                )}
+
+                                <div className="ymm-message__timestamp">
+                                    {new Date(msg.timestamp).toLocaleTimeString()}
+                                </div>
+                            </>
                         )}
-
-                        <div className="ymm-message__timestamp">
-                            {new Date(msg.timestamp).toLocaleTimeString()}
-                        </div>
                     </div>
                 );
             })}

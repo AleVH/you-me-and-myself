@@ -1,8 +1,6 @@
 package com.youmeandmyself.dev
 
 import com.intellij.openapi.project.Project
-import com.youmeandmyself.ai.chat.service.ChatUIService
-import com.youmeandmyself.ai.chat.service.SystemMessageType
 import com.youmeandmyself.ai.providers.parsing.ui.CorrectionFlowHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -17,44 +15,75 @@ import com.youmeandmyself.storage.model.ExchangeTokenUsage
 import com.youmeandmyself.storage.model.IdeContextCapture
 
 /**
- * Handles dev-only test commands for exercising the correction flow.
+ * Handles dev-only test commands for exercising the correction flow,
+ * summary pipeline, git detection, and IDE context capture.
  *
  * Only active when dev mode is enabled (-Dymm.devMode=true).
- * Called by ChatPanel to check if user input is a dev command.
+ *
+ * ## R6 Status — Output Channel Disconnected
+ *
+ * This class previously rendered output through ChatUIService (legacy chat UI).
+ * That dependency was removed in R6 when the legacy chat was deleted.
+ *
+ * Output currently goes to the IDE log via Dev.info(). To reconnect:
+ *
+ * **Option A — React bridge:** Add a DEV_OUTPUT bridge event. DevCommandHandler
+ * sends events through BridgeDispatcher, React renders them as system messages.
+ * This is the proper solution — dev output appears in the chat alongside normal messages.
+ *
+ * **Option B — Tool window:** Create a dedicated "Dev Console" tab in the tool
+ * window that renders dev output independently of the chat.
+ *
+ * **To rewire:** Replace all `output(...)` calls with the chosen channel.
+ * Every dev command's logic is fully preserved — only the rendering changed.
+ *
+ * ## How This Was Called (Legacy)
+ *
+ * ChatPanel called `handleIfDevCommand(userInput)` before processing normal messages.
+ * The React chat does NOT currently route to this class. When rewiring, add a
+ * DEV_COMMAND bridge command in BridgeDispatcher that calls handleIfDevCommand().
  *
  * ## Available Commands
  *
+ * - /dev-help: Show available commands
+ * - /dev-status: Show dev mode status
  * - /dev-scenario1: Test known format (no correction UI)
  * - /dev-scenario2: Test heuristic with correction option
  * - /dev-scenario3: Test low confidence (immediate dialog)
  * - /dev-error: Test error response
- * - /dev-status: Show dev mode status
- * - /dev-help: Show available commands
- *
- * ## Usage in ChatPanel
- *
- * ```kotlin
- * private val devHandler = DevCommandHandler(project, chatService, correctionHelper, scope)
- *
- * private fun doSend() {
- *     val userInput = input.text?.trim().orEmpty()
- *
- *     // Check for dev commands first
- *     if (devHandler.handleIfDevCommand(userInput)) {
- *         input.text = ""
- *         return
- *     }
- *
- *     // ... rest of normal processing
- * }
- * ```
+ * - /dev-summary-test: Dry-run summary pipeline on current file
+ * - /dev-summary-mock: Write mock FILE_SUMMARY through full save pipeline
+ * - /dev-summarize: Request on-demand summary of current file
+ * - /dev-summary-status: Show summary system status
+ * - /dev-summary-stop: Emergency stop — cancel all queued summaries
+ * - /dev-git-test: Test git branch detection step by step
+ * - /dev-context-test: Test full IDE context capture
  */
 class DevCommandHandler(
     private val project: Project,
-    private val chatService: ChatUIService,
     private val correctionHelper: CorrectionFlowHelper,
     private val scope: CoroutineScope
 ) {
+    private val log = Dev.logger(DevCommandHandler::class.java)
+
+    /**
+     * Temporary output function — sends dev command output to IDE log.
+     *
+     * PLACEHOLDER: Replace with bridge event / React system message / dev console
+     * when the output channel is reconnected. All dev commands call this instead
+     * of the old chatService.addSystemMessage().
+     *
+     * @param message The dev output text to display
+     */
+    private fun output(message: String) {
+        // Every line gets logged so output is visible in idea.log
+        Dev.info(log, "dev.output", "message" to message)
+
+        // TODO: When reconnected, send through chosen output channel:
+        // Option A: sendEvent(DevOutputEvent(message))
+        // Option B: devConsolePanel.append(message)
+    }
+
     /**
      * Check if the input is a dev command and handle it.
      *
@@ -62,17 +91,14 @@ class DevCommandHandler(
      * @return true if it was a dev command (handled), false otherwise (continue normal flow)
      */
     fun handleIfDevCommand(input: String): Boolean {
-        // Dev commands start with /dev
         if (!input.lowercase().startsWith("/dev")) {
             return false
         }
 
-        // If dev mode is not enabled, silently ignore (don't reveal commands exist)
         if (!DevMode.isEnabled()) {
             return false
         }
 
-        // Parse and handle the command
         val command = input.lowercase().trim()
 
         when {
@@ -90,26 +116,17 @@ class DevCommandHandler(
             command == "/dev-context-test" -> runContextTest()
             command == "/dev-summary-mock" -> runMockSummary()
             else -> {
-                chatService.addSystemMessage(
-                    "Unknown dev command: $input\nType /dev-help to see available commands.",
-                    SystemMessageType.INFO
-                )
+                output("Unknown dev command: $input\nType /dev-help to see available commands.")
             }
         }
 
         return true
     }
 
-    /**
-     * Show available dev commands.
-     */
     private fun showHelp() {
-        chatService.addSystemMessage(DevMode.helpText(), SystemMessageType.INFO)
+        output(DevMode.helpText())
     }
 
-    /**
-     * Show current dev mode status and configuration.
-     */
     private fun showStatus() {
         val status = buildString {
             appendLine("🔧 YMM Dev Mode Status")
@@ -119,87 +136,54 @@ class DevCommandHandler(
             appendLine()
             appendLine("  Correction helper has context: ${correctionHelper.hasCorrectableResponse()}")
         }
-        chatService.addSystemMessage(status, SystemMessageType.INFO)
+        output(status)
     }
 
-    /**
-     * Test Scenario 1: Known format, high confidence.
-     * Should display response immediately with no correction UI.
-     */
-    private fun runScenario1() {
-        chatService.addSystemMessage(
-            "🧪 Running Scenario 1: Known Format Test",
-            SystemMessageType.INFO
-        )
+    // ══════════════════════════════════════════════════════════════════════
+    //  CORRECTION FLOW TEST SCENARIOS
+    //
+    //  These test the response parsing + correction dialog pipeline.
+    //  They use TestResponseFactory to create fake AI responses with
+    //  known characteristics, then run them through CorrectionFlowHelper.
+    //
+    //  R6 NOTE: processTestResponse() previously rendered results through
+    //  ChatUIService. The logic is preserved below but the rendering calls
+    //  now go through output(). The correction flow itself still works —
+    //  CorrectionFlowHelper is independent of the UI layer.
+    // ══════════════════════════════════════════════════════════════════════
 
+    private fun runScenario1() {
+        output("🧪 Running Scenario 1: Known Format Test")
         val testResponse = TestResponseFactory.scenario1_KnownFormat()
         processTestResponse(testResponse, expectCorrectionUI = false)
     }
 
-    /**
-     * Test Scenario 2: Heuristic with medium confidence.
-     * Should display response with "Type /correct to fix" hint.
-     */
     private fun runScenario2() {
-        chatService.addSystemMessage(
-            "🧪 Running Scenario 2: Heuristic + Confident Test",
-            SystemMessageType.INFO
-        )
-
+        output("🧪 Running Scenario 2: Heuristic + Confident Test")
         val testResponse = TestResponseFactory.scenario2_HeuristicConfident()
         processTestResponse(testResponse, expectCorrectionUI = true)
     }
 
-    /**
-     * Test Scenario 3: Low confidence.
-     * Should show CorrectionDialog immediately before displaying.
-     */
     private fun runScenario3() {
-        chatService.addSystemMessage(
-            "🧪 Running Scenario 3: Low Confidence Test\n" +
-                    "⚠️ A dialog should appear - select a response option.",
-            SystemMessageType.INFO
-        )
-
+        output("🧪 Running Scenario 3: Low Confidence Test\n⚠️ A dialog should appear - select a response option.")
         val testResponse = TestResponseFactory.scenario3_LowConfidence()
         processTestResponse(testResponse, expectCorrectionUI = true)
     }
 
-    /**
-     * Test error response handling.
-     */
     private fun runErrorScenario() {
-        chatService.addSystemMessage(
-            "🧪 Running Error Response Test",
-            SystemMessageType.INFO
-        )
-
+        output("🧪 Running Error Response Test")
         val testResponse = TestResponseFactory.errorResponse()
-
-        // Error responses just display, no correction flow
-        chatService.addAssistantMessage(
-            testResponse.parsedResponse.displayText,
-            testResponse.providerId,
-            testResponse.parsedResponse.isError
-        )
+        output("Error response display text: ${testResponse.parsedResponse.displayText}")
     }
 
-    /**
-     * Process a test response through the correction flow.
-     * Mimics what ChatPanel does with real provider responses.
-     */
     private fun processTestResponse(testResponse: TestResponse, expectCorrectionUI: Boolean) {
         val result = testResponse.parsedResponse
-
-        // Clear any previous correction context
         correctionHelper.clearCorrectionContext()
 
         scope.launch {
             val finalDisplayText: String
-            val finalIsError: Boolean
 
             when {
-                // Scenario 3: Low confidence - ask immediately
                 correctionHelper.shouldAskImmediately(result) && result.metadata.candidates.isNotEmpty() -> {
                     val corrected = correctionHelper.handleImmediateCorrection(
                         result = result,
@@ -209,99 +193,60 @@ class DevCommandHandler(
 
                     if (corrected != null) {
                         finalDisplayText = corrected.displayText
-                        finalIsError = false
                     } else {
-                        // User cancelled
                         finalDisplayText = result.displayText
-                        finalIsError = result.isError
                         storeForCorrectionWithRawJson(testResponse)
                     }
                 }
 
-                // Scenario 2: Heuristic but confident
                 correctionHelper.shouldOfferPostCorrection(result) -> {
                     finalDisplayText = result.displayText
-                    finalIsError = result.isError
                     storeForCorrectionWithRawJson(testResponse)
                 }
 
-                // Scenario 1: Known format
                 else -> {
                     finalDisplayText = result.displayText
-                    finalIsError = result.isError
                 }
             }
 
-            // Display the response
-            chatService.addAssistantMessage(
-                finalDisplayText,
-                testResponse.providerId,
-                finalIsError
-            )
+            output("Response: $finalDisplayText")
 
-            // Show correction hint for Scenario 2
             if (correctionHelper.hasCorrectableResponse()) {
-                chatService.addSystemMessage(
-                    "ℹ️ Response auto-detected. Not what you expected? Type /correct to fix.",
-                    SystemMessageType.INFO
-                )
+                output("ℹ️ Response auto-detected. Correction context stored.")
             }
 
-            // Show test verification message
             if (expectCorrectionUI && correctionHelper.hasCorrectableResponse()) {
-                chatService.addSystemMessage(
-                    "✅ Test passed: Correction context stored. Try /correct or /raw",
-                    SystemMessageType.INFO
-                )
+                output("✅ Test passed: Correction context stored.")
             } else if (!expectCorrectionUI && !correctionHelper.hasCorrectableResponse()) {
-                chatService.addSystemMessage(
-                    "✅ Test passed: No correction UI (as expected for known format)",
-                    SystemMessageType.INFO
-                )
+                output("✅ Test passed: No correction UI (as expected for known format)")
             }
         }
     }
 
-    /**
-     * Store test response for correction, including the fake raw JSON.
-     *
-     * For real responses, the raw JSON is fetched from storage via exchangeId.
-     * For test responses, we need to inject it into the correction context
-     * so /raw command works.
-     */
     private fun storeForCorrectionWithRawJson(testResponse: TestResponse) {
         correctionHelper.storeForPostCorrection(
             result = testResponse.parsedResponse,
             providerId = testResponse.providerId,
             modelId = testResponse.modelId,
-            force = true // Force storage for test scenarios
+            force = true
         )
-
-        // Store raw JSON for /raw command
-        // Note: This uses a test-specific mechanism since we're not persisting to real storage
         correctionHelper.storeTestRawJson(testResponse.rawJson)
     }
 
-    /**
-     * Test the summary pipeline in dry-run mode.
-     *
-     * Evaluates the currently open file against summary config:
-     * 1. Checks config (mode, kill switch, budget, scope)
-     * 2. Shows the decision and reasoning
-     * 3. Shows what provider/model would be used
-     * 4. Estimates token cost
-     * 5. Does NOT make any API call
-     */
+    // ══════════════════════════════════════════════════════════════════════
+    //  SUMMARY PIPELINE COMMANDS
+    //
+    //  These exercise the summarization config, scope evaluation,
+    //  dry-run mode, and the full save pipeline (for mock summaries).
+    //  All logic preserved — only output channel changed.
+    // ══════════════════════════════════════════════════════════════════════
+
     private fun runSummaryTest() {
-        chatService.addSystemMessage(
-            "🧪 Running Summary Pipeline Test (dry-run)",
-            SystemMessageType.INFO
-        )
+        output("🧪 Running Summary Pipeline Test (dry-run)")
 
         val configService = SummaryConfigService.getInstance(project)
         val config = configService.getConfig()
 
-        // Show current config
         val configStatus = buildString {
             appendLine("📋 Current Summary Config:")
             appendLine("  Mode: ${config.mode.displayName}")
@@ -314,17 +259,13 @@ class DevCommandHandler(
             appendLine("  Include patterns: ${config.includePatterns.ifEmpty { listOf("(all)") }}")
             appendLine("  Exclude patterns: ${config.excludePatterns.ifEmpty { listOf("(none)") }}")
         }
-        chatService.addSystemMessage(configStatus, SystemMessageType.INFO)
+        output(configStatus)
 
-        // Try to get the currently open file
         val editor = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).selectedTextEditor
         val virtualFile = editor?.virtualFile
 
         if (virtualFile == null) {
-            chatService.addSystemMessage(
-                "⚠️ No file open in editor. Open a file and run /dev-summary-test again.",
-                SystemMessageType.INFO
-            )
+            output("⚠️ No file open in editor. Open a file and run /dev-summary-test again.")
             return
         }
 
@@ -332,20 +273,12 @@ class DevCommandHandler(
         val lineCount = editor.document.lineCount
         val languageId = virtualFile.fileType?.name
 
-        chatService.addSystemMessage(
-            "📄 Testing against: ${virtualFile.name} ($lineCount lines, language: $languageId)",
-            SystemMessageType.INFO
-        )
+        output("📄 Testing against: ${virtualFile.name} ($lineCount lines, language: $languageId)")
 
-        // Evaluate scope
         val scopeDecision = configService.shouldSummarize(filePath, lineCount)
         val scopeIcon = if (scopeDecision.allowed) "✅" else "❌"
-        chatService.addSystemMessage(
-            "$scopeIcon Scope decision: ${scopeDecision.reason}",
-            SystemMessageType.INFO
-        )
+        output("$scopeIcon Scope decision: ${scopeDecision.reason}")
 
-        // Dry-run evaluation
         val dryRun = configService.evaluateDryRun(filePath, lineCount)
         val dryRunStatus = buildString {
             appendLine("🔍 Dry-run evaluation:")
@@ -358,46 +291,26 @@ class DevCommandHandler(
                 appendLine("  Matched pattern: ${dryRun.matchedPattern}")
             }
         }
-        chatService.addSystemMessage(dryRunStatus, SystemMessageType.INFO)
+        output(dryRunStatus)
 
-        // Final verdict
         val verdict = if (dryRun.wouldSummarize) {
             "✅ This file WOULD be summarized (dry-run prevented the API call)"
         } else {
             "⛔ This file would NOT be summarized: ${dryRun.reason}"
         }
-        chatService.addSystemMessage(verdict, SystemMessageType.INFO)
+        output(verdict)
     }
 
-    /**
-     * Write a mock FILE_SUMMARY exchange through the full save pipeline.
-     *
-     * Creates a fake summary for the currently open file and persists it
-     * through saveExchange — same code path as a real summary. Used to
-     * verify storage routing (summaries → summaries/ folder) without
-     * making any API call or spending tokens.
-     *
-     * The mock exchange has:
-     * - purpose = FILE_SUMMARY
-     * - providerId/modelId = "dev-mock"
-     * - A recognizable fake response so it's easy to spot in JSONL
-     */
     private fun runMockSummary() {
         val editor = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).selectedTextEditor
         val virtualFile = editor?.virtualFile
 
         if (virtualFile == null) {
-            chatService.addSystemMessage(
-                "⚠️ No file open in editor. Open a file and run /dev-summary-mock again.",
-                SystemMessageType.INFO
-            )
+            output("⚠️ No file open in editor. Open a file and run /dev-summary-mock again.")
             return
         }
 
-        chatService.addSystemMessage(
-            "🧪 Writing mock FILE_SUMMARY for: ${virtualFile.name}",
-            SystemMessageType.INFO
-        )
+        output("🧪 Writing mock FILE_SUMMARY for: ${virtualFile.name}")
 
         val facade = LocalStorageFacade.getInstance(project)
         val projectId = facade.resolveProjectId()
@@ -424,17 +337,12 @@ class DevCommandHandler(
             )
         )
 
-        // Go through the real save pipeline — this is what we're testing
         kotlinx.coroutines.runBlocking {
             val savedId = facade.saveExchange(mockExchange, projectId)
             if (savedId != null) {
-                chatService.addSystemMessage(
-                    "✅ Mock FILE_SUMMARY saved (id: ${savedId.take(8)}…). Check ~/YouMeAndMyself/summaries/ for the JSONL file.",
-                    SystemMessageType.INFO
-                )
+                output("✅ Mock FILE_SUMMARY saved (id: ${savedId.take(8)}…). Check ~/YouMeAndMyself/summaries/ for the JSONL file.")
 
-                // Verify the file landed in the right folder
-                val config = facade.getStorageConfig()  // you may need to expose this
+                val config = facade.getStorageConfig()
                 val summariesDir = config.summariesDirForProject(projectId)
                 val chatDir = config.chatDirForProject(projectId)
 
@@ -452,14 +360,12 @@ class DevCommandHandler(
                     inSummaries && inChat -> "⚠️ Found in BOTH folders — unexpected"
                     else -> "⚠️ Not found in either folder — check logs"
                 }
-                chatService.addSystemMessage(routingResult, SystemMessageType.INFO)
+                output(routingResult)
 
-                // Cleanup: remove mock from SQLite
                 facade.withDatabase { db ->
                     db.execute("DELETE FROM chat_exchanges WHERE id = ?", savedId)
                 }
 
-                // Cleanup: remove mock line from JSONL
                 val targetDir = if (inSummaries) summariesDir else chatDir
                 targetDir.listFiles()?.forEach { file ->
                     if (file.extension == "jsonl") {
@@ -471,53 +377,36 @@ class DevCommandHandler(
                     }
                 }
 
-                chatService.addSystemMessage(
-                    "🧹 Cleanup complete — mock exchange removed from SQLite and JSONL.",
-                    SystemMessageType.INFO
-                )
+                output("🧹 Cleanup complete — mock exchange removed from SQLite and JSONL.")
             } else {
-                chatService.addSystemMessage(
-                    "❌ saveExchange returned null — check logs.",
-                    SystemMessageType.INFO
-                )
+                output("❌ saveExchange returned null — check logs.")
             }
         }
     }
 
-    /**
-     * Request an on-demand summary of the currently open file.
-     * Respects config — will make an API call if not in dry-run mode.
-     */
     private fun runSummarize() {
         val editor = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).selectedTextEditor
         val virtualFile = editor?.virtualFile
 
         if (virtualFile == null) {
-            chatService.addSystemMessage(
-                "⚠️ No file open in editor. Open a file and run /dev-summarize again.",
-                SystemMessageType.INFO
-            )
+            output("⚠️ No file open in editor. Open a file and run /dev-summarize again.")
             return
         }
 
         val configService = SummaryConfigService.getInstance(project)
 
         if (!configService.isEnabled()) {
-            chatService.addSystemMessage(
-                "⛔ Summarization is disabled. Enable it in Settings → Tools → YMM Assistant → Summary.",
-                SystemMessageType.INFO
-            )
+            output("⛔ Summarization is disabled. Enable it in Settings → Tools → YMM Assistant → Summary.")
             return
         }
 
         if (configService.isDryRun()) {
             val lineCount = editor.document.lineCount
             val dryRun = configService.evaluateDryRun(virtualFile.path, lineCount)
-            chatService.addSystemMessage(
+            output(
                 "🔍 Dry-run mode: would summarize ${virtualFile.name} " +
                         "(~${dryRun.estimatedTokens} tokens, provider: ${dryRun.providerInfo}). " +
-                        "Turn off dry-run in Settings to actually summarize.",
-                SystemMessageType.INFO
+                        "Turn off dry-run in Settings to actually summarize."
             )
             return
         }
@@ -535,21 +424,12 @@ class DevCommandHandler(
         )
 
         if (enqueued) {
-            chatService.addSystemMessage(
-                "📝 Summarizing ${virtualFile.name}... Running in the background.",
-                SystemMessageType.INFO
-            )
+            output("📝 Summarizing ${virtualFile.name}... Running in the background.")
         } else {
-            chatService.addSystemMessage(
-                "⚠️ Could not enqueue ${virtualFile.name}. Check scope/budget settings.",
-                SystemMessageType.INFO
-            )
+            output("⚠️ Could not enqueue ${virtualFile.name}. Check scope/budget settings.")
         }
     }
 
-    /**
-     * Show current summary system status.
-     */
     private fun runSummaryStatus() {
         val configService = SummaryConfigService.getInstance(project)
         val store = project.getService(SummaryStore::class.java)
@@ -570,13 +450,9 @@ class DevCommandHandler(
                 if (pending.size > 10) appendLine("    ... and ${pending.size - 10} more")
             }
         }
-
-        chatService.addSystemMessage(status, SystemMessageType.INFO)
+        output(status)
     }
 
-    /**
-     * Emergency stop — cancel all queued summaries and flip the kill switch.
-     */
     private fun runSummaryStop() {
         val configService = SummaryConfigService.getInstance(project)
         val store = project.getService(SummaryStore::class.java)
@@ -584,28 +460,24 @@ class DevCommandHandler(
         val cancelled = store.queue.cancelAll()
         configService.setEnabled(false)
 
-        chatService.addSystemMessage(
+        output(
             "🛑 Summarization stopped. Cancelled $cancelled queued items. Kill switch is now OFF. " +
-                    "Re-enable in Settings → Tools → YMM Assistant → Summary.",
-            SystemMessageType.INFO
+                    "Re-enable in Settings → Tools → YMM Assistant → Summary."
         )
     }
 
-    /**
-     * Test git branch detection step by step.
-     *
-     * Reports exactly where the detection succeeds or fails, including
-     * the specific exception at each step. This helps diagnose why
-     * branch might be null in IdeContext.
-     */
+    // ══════════════════════════════════════════════════════════════════════
+    //  GIT & IDE CONTEXT COMMANDS
+    //
+    //  These diagnose git branch detection and IDE context capture.
+    //  Useful for verifying the context pipeline before sending real chats.
+    //  All logic preserved — only output channel changed.
+    // ══════════════════════════════════════════════════════════════════════
+
     private fun runGitTest() {
-        chatService.addSystemMessage(
-            "🧪 Testing Git Branch Detection",
-            SystemMessageType.INFO
-        )
+        output("🧪 Testing Git Branch Detection")
 
         val report = buildString {
-            // Step 1: Can we load the class?
             appendLine("Step 1: Load git4idea.repo.GitRepositoryManager class")
             val clazz = try {
                 val c = Class.forName("git4idea.repo.GitRepositoryManager")
@@ -628,7 +500,6 @@ class DevCommandHandler(
                 return@buildString
             }
 
-            // Step 2: Can we get the service?
             appendLine()
             appendLine("Step 2: Get GitRepositoryManager service from project")
             val manager = try {
@@ -637,7 +508,6 @@ class DevCommandHandler(
                     appendLine("  ✅ Service instance obtained: ${m.javaClass.name}")
                 } else {
                     appendLine("  ❌ getService returned null — service not registered for this project")
-                    appendLine("  This usually means Git4Idea plugin is installed but not active for this project")
                 }
                 m
             } catch (e: Exception) {
@@ -648,7 +518,6 @@ class DevCommandHandler(
 
             if (manager == null) return@buildString
 
-            // Step 3: Can we call getRepositories?
             appendLine()
             appendLine("Step 3: Call getRepositories()")
             val repos = try {
@@ -661,7 +530,6 @@ class DevCommandHandler(
                 result
             } catch (e: NoSuchMethodException) {
                 appendLine("  ❌ Method 'getRepositories' not found")
-                appendLine("  Error: ${e.message}")
                 appendLine("  Available methods: ${manager.javaClass.methods.map { it.name }.distinct().sorted().take(20)}")
                 null
             } catch (e: Exception) {
@@ -677,7 +545,6 @@ class DevCommandHandler(
                 return@buildString
             }
 
-            // Step 4: Can we get the branch?
             appendLine()
             appendLine("Step 4: Get current branch from first repository")
             val firstRepo = repos.first()!!
@@ -694,38 +561,23 @@ class DevCommandHandler(
                 }
             } catch (e: NoSuchMethodException) {
                 appendLine("  ❌ Method not found on repository object")
-                appendLine("  Error: ${e.message}")
                 appendLine("  Repo class: ${firstRepo.javaClass.name}")
-                appendLine("  Available methods: ${firstRepo.javaClass.methods.map { it.name }.distinct().sorted().take(20)}")
             } catch (e: Exception) {
                 appendLine("  ❌ Failed to get branch")
                 appendLine("  Error: ${e.javaClass.simpleName}: ${e.message}")
             }
         }
 
-        chatService.addSystemMessage(report, SystemMessageType.INFO)
+        output(report)
     }
 
-    /**
-     * Test the full IdeContext capture pipeline.
-     *
-     * Runs IdeContextCapture.capture() and displays everything it found:
-     * active file, all open files, language, module, git branch.
-     * Useful for verifying the capture works before sending a real chat.
-     */
     private fun runContextTest() {
-        chatService.addSystemMessage(
-            "🧪 Testing IDE Context Capture",
-            SystemMessageType.INFO
-        )
+        output("🧪 Testing IDE Context Capture")
 
         val context = try {
             IdeContextCapture.capture(project)
         } catch (e: Exception) {
-            chatService.addSystemMessage(
-                "❌ Capture threw exception: ${e.javaClass.simpleName}: ${e.message}",
-                SystemMessageType.INFO
-            )
+            output("❌ Capture threw exception: ${e.javaClass.simpleName}: ${e.message}")
             return
         }
 
@@ -755,6 +607,6 @@ class DevCommandHandler(
             appendLine("isEmpty: ${context.isEmpty}")
         }
 
-        chatService.addSystemMessage(report, SystemMessageType.INFO)
+        output(report)
     }
 }

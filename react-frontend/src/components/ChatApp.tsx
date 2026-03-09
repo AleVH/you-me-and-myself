@@ -60,17 +60,33 @@ function ChatApp() {
                 onRenameTab={bridge.renameTab}
             />
 
+            {/* Collapse/Expand All — between tab bar and message list.
+                Only visible when 2+ assistant messages exist in active tab. */}
+            {bridge.messages.filter((m) => m.role === "assistant").length >= 2 && (
+                <div className="ymm-collapse-toolbar">
+                    <button
+                        className="ymm-collapse-toolbar__btn"
+                        onClick={bridge.collapsedIds.size > 0 ? bridge.expandAll : bridge.collapseAll}
+                        title={bridge.collapsedIds.size > 0 ? "Expand all responses" : "Collapse all responses"}
+                    >
+                        {bridge.collapsedIds.size > 0 ? "▸ Expand All" : "▾ Collapse All"}
+                    </button>
+                </div>
+            )}
+
             <MessageList
                 messages={bridge.messages}
                 isThinking={bridge.isThinking}
                 isScrolledUp={bridge.isScrolledUp}
                 scrollPosition={bridge.scrollPosition}
+                collapsedIds={bridge.collapsedIds}
                 onConfirmCorrection={bridge.confirmCorrection}
                 onRequestCorrection={bridge.requestCorrection}
                 onToggleStar={bridge.toggleStar}
                 onBookmarkCodeBlock={bridge.bookmarkCodeBlock}
                 onScrolledUpChange={bridge.setScrolledUp}
                 onScrollPositionChange={bridge.saveScrollPosition}
+                onToggleCollapse={bridge.toggleCollapse}
             />
 
             <InputBar

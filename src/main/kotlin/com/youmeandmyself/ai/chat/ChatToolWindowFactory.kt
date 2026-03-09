@@ -15,16 +15,12 @@ import javax.swing.*
  *
  * ## Chat Tab
  *
- * Two implementations exist during the React migration:
- * - **Legacy (default):** ChatPanel with vanilla HTML/JS in JCEF
- * - **React (opt-in):** ReactChatPanel with Vite-built React in JCEF
- *
- * Toggle via system property: `-Dymm.reactChat=true`
- * This is a dev flag — it will be removed once React reaches feature parity (R6).
+ * Uses ReactChatPanel — a Vite-built React app rendered in JCEF.
+ * The legacy vanilla HTML/JS chat was removed in R6.
  *
  * ## Library Tab
  *
- * Always uses LibraryPanel (not affected by the React migration).
+ * Uses LibraryPanel (legacy HTML/JS, will migrate to React in R5).
  */
 class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
     private val log = Dev.logger(ChatToolWindowFactory::class.java)
@@ -33,16 +29,7 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         Dev.info(log, "toolwindow.create", "start" to true)
 
         // ── Chat tab ─────────────────────────────────────────────────
-        // Check the dev flag to decide which chat implementation to use.
-        // Legacy path is the default until React reaches full parity.
-        val useReact = System.getProperty("ymm.reactChat", "false").toBoolean()
-        Dev.info(log, "toolwindow.chat_mode", "react" to useReact)
-
-        if (useReact) {
-            createReactChatTab(project, toolWindow)
-        } else {
-            createLegacyChatTab(project, toolWindow)
-        }
+        createReactChatTab(project, toolWindow)
 
         // ── Library tab ──────────────────────────────────────────────
         try {
@@ -56,8 +43,6 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
             Dev.error(log, "toolwindow.library_failed", e)
         }
     }
-
-    // ── React Chat (new) ─────────────────────────────────────────────
 
     /**
      * Create the React-based chat tab.
@@ -76,68 +61,12 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
             Dev.info(log, "toolwindow.react_chat", "added" to true)
         } catch (e: Throwable) {
             Dev.error(log, "toolwindow.react_chat_failed", e)
-            // Fall back to an error message rather than crashing the tool window
             val errorPanel = JPanel(BorderLayout()).apply {
                 add(JLabel("React chat failed to initialize: ${e.message}", SwingConstants.CENTER))
             }
             val chatContent = toolWindow.contentManager.factory.createContent(errorPanel, "Chat", false)
             chatContent.isCloseable = false
             toolWindow.contentManager.addContent(chatContent)
-        }
-    }
-
-    // ── Legacy Chat (existing) ───────────────────────────────────────
-
-    /**
-     * Create the legacy vanilla HTML/JS chat tab.
-     *
-     * Uses SwingWorker for async initialization because ChatPanel's JCEF
-     * browser setup can block. Shows a loading indicator until ready.
-     * This is the original implementation — untouched by the React migration.
-     */
-    private fun createLegacyChatTab(project: Project, toolWindow: ToolWindow) {
-        val loadingPanel = createLoadingPanel()
-        val chatContent = toolWindow.contentManager.factory.createContent(loadingPanel, "Chat", false)
-        chatContent.isCloseable = false
-        toolWindow.contentManager.addContent(chatContent)
-
-        val worker = object : SwingWorker<ChatPanel, Void>() {
-            override fun doInBackground(): ChatPanel {
-                Dev.info(log, "toolwindow.worker", "background_start" to true)
-                return ChatPanel(project) { isReady ->
-                    Dev.info(log, "toolwindow.callback", "isReady" to isReady, "thread" to Thread.currentThread().name)
-                    SwingUtilities.invokeLater {
-                        Dev.info(log, "toolwindow.swing", "swing_invoke" to true)
-                        if (isReady) {
-                            Dev.info(log, "toolwindow.ready", "swapping_panels" to true)
-                            val chatPanel = get()
-                            loadingPanel.removeAll()
-                            loadingPanel.add(chatPanel.root, BorderLayout.CENTER)
-                            loadingPanel.revalidate()
-                            loadingPanel.repaint()
-                            Dev.info(log, "toolwindow.ready", "panels_swapped" to true)
-                        } else {
-                            Dev.info(log, "toolwindow.failed", "fallback_mode" to true)
-                            loadingPanel.removeAll()
-                            loadingPanel.add(JLabel("Chat initialization failed - using basic mode", SwingConstants.CENTER))
-                            loadingPanel.revalidate()
-                            loadingPanel.repaint()
-                        }
-                    }
-                }
-            }
-
-            override fun done() {
-                Dev.info(log, "toolwindow.worker", "done" to true)
-            }
-        }
-        worker.execute()
-        Dev.info(log, "toolwindow.create", "worker_executed" to true)
-    }
-
-    private fun createLoadingPanel(): JPanel {
-        return JPanel(BorderLayout()).apply {
-            add(JLabel("Loading chat...", SwingConstants.CENTER))
         }
     }
 }
