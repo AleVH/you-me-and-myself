@@ -2,73 +2,129 @@
 <idea-plugin>
     <id>com.youmeandmyself.ai</id>
     <name>YouMeAndMyself Assistant</name>
-    <version>0.1.0</version> <!-- NEW: required -->
+    <version>0.1.0</version>
     <vendor email="dev@example.com">YouMeAndMyself</vendor>
     <description>Generic multi-provider AI scaffold with connectivity test.</description>
+
+    <!--
+        JetBrains Marketplace paid plugin descriptor.
+        Required for any plugin that uses the freemium or paid model.
+
+        - code:            Product identifier in the JetBrains sales system. Must start with P,
+                           uppercase, 4-15 chars, no digits or special chars. Changing this after
+                           publication is painful — pick carefully.
+                           TODO: Confirm "PYMM" availability with JetBrains before first submission.
+
+        - release-date:    Date of the first public release (YYYYMMDD). Affects subscription
+                           fallback rights — users who paid before this date get perpetual access
+                           to this version.
+                           TODO: Set to actual launch date.
+
+        - release-version: Integer version for licensing comparison. Convention: major*10000 +
+                           minor*100 + patch (so 1.0.0 = 10000, 1.2.3 = 10203). Must be updated
+                           with each release that changes subscription-relevant behavior.
+                           TODO: Keep in sync with <version> tag at release time.
+    -->
+    <product-descriptor code="PYMM"
+                        release-date="20260401"
+                        release-version="10000"/>
 
     <depends>com.intellij.modules.platform</depends>
     <depends optional="true" config-file="git-integration.xml">Git4Idea</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <!-- Registers the YMM Chat tool window -->
+
+        <!-- ═══ UI ════════════════════════════════════════════════════════ -->
+
+        <!-- Main chat tool window (right sidebar) -->
         <toolWindow id="YMM Chat"
                     factoryClass="com.youmeandmyself.ai.chat.ChatToolWindowFactory"
                     anchor="right"/>
 
-        <!-- Settings page: AI Profiles -->
+        <!-- ═══ Settings Pages ════════════════════════════════════════════ -->
+
+        <!-- Root settings node under Tools → YMM Assistant -->
         <projectConfigurable instance="com.youmeandmyself.ai.settings.AiProfilesConfigurable"
                              displayName="YMM Assistant"
                              id="com.youmeandmyself.ai.settings"
                              parentId="tools"/>
 
+        <!-- Settings → YMM Assistant → Summary -->
         <projectConfigurable instance="com.youmeandmyself.ai.settings.SummaryConfigurable"
                              displayName="Summary"
                              id="com.youmeandmyself.ai.settings.summary"
                              parentId="com.youmeandmyself.ai.settings"/>
 
+        <!-- Settings → YMM Assistant → General -->
         <projectConfigurable instance="com.youmeandmyself.ai.settings.GeneralConfigurable"
                              displayName="General"
                              id="com.youmeandmyself.ai.settings.general"
                              parentId="com.youmeandmyself.ai.settings"/>
 
+        <!-- ═══ Notifications ═════════════════════════════════════════════ -->
+
         <notificationGroup id="AI Plugin" displayType="BALLOON" isLogByDefault="true"/>
 
-        <!-- Storage facade for persisting AI exchanges and metadata -->
+        <!-- ═══ Application-Level Services (global, not per-project) ═════ -->
+
+        <!--
+            Tier provider: single entry point for all tier/feature checks.
+            CompositeTierProvider checks custom server first (Company tiers),
+            then falls back to JetBrains Marketplace licensing (Individual tiers).
+            At launch, custom server returns NONE → effectively delegates to JB.
+        -->
+        <applicationService
+                serviceInterface="com.youmeandmyself.tier.TierProvider"
+                serviceImplementation="com.youmeandmyself.tier.CompositeTierProvider"/>
+
+        <!--
+            Account service: placeholder for future user identity and org context.
+            All methods return null/defaults at launch. Wired here so the package
+            has a home and future Company tier code can depend on it.
+        -->
+        <applicationService
+                serviceImplementation="com.youmeandmyself.account.AccountService"/>
+
+        <!-- ═══ Project-Level Services ════════════════════════════════════ -->
+
+        <!-- Core storage: JSONL (source of truth) + SQLite (rebuildable index) -->
         <projectService serviceImplementation="com.youmeandmyself.storage.LocalStorageFacade"/>
 
-        <!-- Initialize storage system on project open -->
+        <!-- Runs on project open: initializes storage, rebuilds SQLite from JSONL if needed -->
         <postStartupActivity implementation="com.youmeandmyself.storage.StorageInitializer"/>
 
-        <!-- Summary configuration service -->
+        <!-- Summarization: config, cache, pipeline, file-change watcher -->
         <projectService serviceImplementation="com.youmeandmyself.context.summary.config.SummaryConfigService"/>
-
-        <!-- Summary store for code summary caching and orchestration -->
         <projectService serviceImplementation="com.youmeandmyself.summary.cache.SummaryCache"/>
         <projectService serviceImplementation="com.youmeandmyself.summary.pipeline.SummaryPipeline"/>
-
-        <!-- VFS watcher for tracking file changes and summary staleness -->
         <projectService serviceImplementation="com.youmeandmyself.summary.watcher.VfsSummaryWatcher"/>
 
-        <!-- Phase 4A: Search and bookmark services for Library tab -->
+        <!-- Library: full-text search and bookmark/collection management -->
         <projectService serviceImplementation="com.youmeandmyself.storage.search.SearchService"/>
         <projectService serviceImplementation="com.youmeandmyself.storage.BookmarkService"/>
 
+        <!-- Chat: conversation lifecycle (create, load, switch, close) -->
         <projectService serviceImplementation="com.youmeandmyself.ai.chat.conversation.ConversationManager"/>
+
     </extensions>
 
     <actions>
 
+        <!-- Tools → AI submenu -->
         <group id="com.youmeandmyself.ai.toolsGroup"
                text="AI"
                popup="true"
                description="AI tools">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
+
+            <!-- Ping all configured AI providers and report status -->
             <action id="com.youmeandmyself.ai.actions.TestAiProvidersAction"
                     class="com.youmeandmyself.ai.actions.TestAiProvidersAction"
                     text="Test AI Providers"
                     description="Ping all configured AI providers"/>
         </group>
 
+        <!-- Test actions: send a prompt to a specific provider -->
         <action id="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"
                 class="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"
                 text="Send Test Prompt to OpenAI"
@@ -85,7 +141,7 @@
             <add-to-group group-id="com.youmeandmyself.ai.toolsGroup" anchor="last"/>
         </action>
 
-        <!-- Add the "Open YMM Chat" action -->
+        <!-- Keyboard shortcut to open the chat panel -->
         <action id="com.youmeandmyself.ai.actions.OpenChatToolWindow"
                 class="com.youmeandmyself.ai.actions.OpenChatToolWindowAction"
                 text="Open YMM Chat">
