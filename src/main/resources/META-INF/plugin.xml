@@ -40,13 +40,14 @@
         <postStartupActivity implementation="com.youmeandmyself.storage.StorageInitializer"/>
 
         <!-- Summary configuration service -->
-        <projectService serviceImplementation="com.youmeandmyself.context.orchestrator.config.SummaryConfigService"/>
+        <projectService serviceImplementation="com.youmeandmyself.context.summary.config.SummaryConfigService"/>
 
         <!-- Summary store for code summary caching and orchestration -->
-        <projectService serviceImplementation="com.youmeandmyself.context.orchestrator.SummaryStore"/>
+        <projectService serviceImplementation="com.youmeandmyself.summary.cache.SummaryCache"/>
+        <projectService serviceImplementation="com.youmeandmyself.summary.pipeline.SummaryPipeline"/>
 
         <!-- VFS watcher for tracking file changes and summary staleness -->
-        <projectService serviceImplementation="com.youmeandmyself.context.orchestrator.VfsSummaryWatcher"/>
+        <projectService serviceImplementation="com.youmeandmyself.summary.watcher.VfsSummaryWatcher"/>
 
         <!-- Phase 4A: Search and bookmark services for Library tab -->
         <projectService serviceImplementation="com.youmeandmyself.storage.search.SearchService"/>

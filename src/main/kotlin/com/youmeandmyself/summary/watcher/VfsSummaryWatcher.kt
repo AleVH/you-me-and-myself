@@ -1,5 +1,5 @@
 // File: src/main/kotlin/com/youmeandmyself/context/orchestrator/VfsSummaryWatcher.kt
-package com.youmeandmyself.context.orchestrator
+package com.youmeandmyself.summary.watcher
 
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
@@ -13,40 +13,48 @@ import com.intellij.openapi.vfs.newvfs.events.VFileDeleteEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileMoveEvent
 import com.intellij.util.messages.MessageBusConnection
-import com.youmeandmyself.context.orchestrator.config.SummaryConfigService
-import com.youmeandmyself.context.orchestrator.config.SummaryMode
+import com.youmeandmyself.summary.config.SummaryConfigService
+import com.youmeandmyself.summary.config.SummaryMode
+import com.youmeandmyself.summary.cache.SummaryCache
+import com.youmeandmyself.summary.pipeline.SummaryPipeline
 import com.youmeandmyself.dev.Dev
 import java.io.InputStream
 import java.security.MessageDigest
 
 /**
- * Project-level VFS watcher that keeps SummaryStore in sync with file changes.
+ * Project-level VFS watcher that keeps summary cache and pipeline in sync with file changes.
  *
- * ## Responsibilities
+ * ## ResponsibilitiesF
  *
  * - Listen to VFS events (create, content change, move/rename, delete)
  * - Compute a stable content hash for changed files (cheap SHA-256 streaming)
- * - Notify SummaryStore about changes so synopses/header samples refresh lazily
+ * - Notify SummaryCache and SummaryPipeline about changes so synopses refresh lazily
  *
  * ## Phase 3 Changes
  *
- * Now checks [SummaryConfigService] before notifying SummaryStore:
+ * Now checks [SummaryConfigService] before notifying SummaryPipeline:
  * - Hash changes are ALWAYS tracked (staleness detection is free, no API call)
  * - File deletions are ALWAYS handled (cache cleanup is free)
- * - But we only log/track — actual summarization decisions are made by SummaryStore
- *   when it checks config via evaluateAndEnqueue()
+ * - But we only log/track — actual summarization decisions are made by SummaryPipeline
+ * when it checks config via evaluateAndEnqueue()
  *
  * ## Design Note
  *
  * We purposefully do NOT trigger immediate re-summarization here.
- * SummaryStore will refresh on-demand (lazy) via getOrEnqueueSynopsis(),
+ * SummaryPipeline will refresh on-demand (lazy) via getOrEnqueueSynopsis(),
  * which checks config (mode, budget, scope, dry-run) before doing anything.
  */
 @Service(Service.Level.PROJECT)
 class VfsSummaryWatcher(
     private val project: Project,
-    private val summaryStore: SummaryStore
 ) {
+    private val cache: SummaryCache by lazy {
+        SummaryCache.getInstance(project)
+    }
+
+    private val pipeline: SummaryPipeline by lazy {
+        SummaryPipeline.getInstance(project)
+    }
 
     private val log = Logger.getInstance(VfsSummaryWatcher::class.java)
 
@@ -93,7 +101,7 @@ class VfsSummaryWatcher(
         val (hash, _) = computeHashAndLang(vf) ?: return
 
         // Always track hash changes — staleness detection is free
-        summaryStore.onHashChange(vf.path, hash)
+        pipeline.onFileChanged(vf.path, hash)
 
         // Log if summarization is active (useful for dry-run visibility)
         if (configService.isEnabled() && configService.getMode() == SummaryMode.SMART_BACKGROUND) {
@@ -109,7 +117,7 @@ class VfsSummaryWatcher(
         val (hash, _) = computeHashAndLang(vf) ?: return
 
         // Always track hash changes
-        summaryStore.onHashChange(vf.path, hash)
+        pipeline.onFileChanged(vf.path, hash)
     }
 
     private fun onMovedOrRenamed(vf: VirtualFile) {
@@ -117,12 +125,12 @@ class VfsSummaryWatcher(
         val (hash, _) = computeHashAndLang(vf) ?: return
 
         // Always track hash changes
-        summaryStore.onHashChange(vf.path, hash)
+        pipeline.onFileChanged(vf.path, hash)
     }
 
     private fun onDeleted(path: String) {
         // Always handle deletions — cache cleanup is free
-        summaryStore.onFileDeleted(path)
+        pipeline.onFileDeleted(path)
     }
 
     // -------- Helpers (unchanged from original) --------

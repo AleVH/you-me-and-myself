@@ -1,4 +1,4 @@
-package com.youmeandmyself.context.orchestrator.config
+package com.youmeandmyself.summary.config
 
 import com.intellij.openapi.diagnostic.Logger
 import com.youmeandmyself.dev.Dev

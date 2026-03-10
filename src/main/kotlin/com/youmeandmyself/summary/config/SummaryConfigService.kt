@@ -1,5 +1,4 @@
-// File: src/main/kotlin/com/youmeandmyself/context/orchestrator/config/SummaryConfigService.kt
-package com.youmeandmyself.context.orchestrator.config
+package com.youmeandmyself.summary.config
 
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.Service

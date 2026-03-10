@@ -5,9 +5,9 @@ import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.project.Project
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextField
-import com.youmeandmyself.context.orchestrator.config.SummaryConfig
-import com.youmeandmyself.context.orchestrator.config.SummaryConfigService
-import com.youmeandmyself.context.orchestrator.config.SummaryMode
+import com.youmeandmyself.summary.config.SummaryConfig
+import com.youmeandmyself.summary.config.SummaryConfigService
+import com.youmeandmyself.summary.config.SummaryMode
 import com.youmeandmyself.dev.Dev
 import java.awt.BorderLayout
 import java.awt.Component
@@ -381,9 +381,8 @@ class SummaryConfigurable(private val project: Project) : Configurable {
 
         // Queue size from SummaryStore
         try {
-            val store = com.youmeandmyself.context.orchestrator.SummaryStore::class.java
-                .let { project.getService(it) }
-            queueSizeLabel.text = store.queue.size().toString()
+            val pipeline = com.youmeandmyself.summary.pipeline.SummaryPipeline.getInstance(project)
+            queueSizeLabel.text = pipeline.queue.size().toString()
         } catch (_: Throwable) {
             queueSizeLabel.text = "N/A"
         }

@@ -1,4 +1,4 @@
-package com.youmeandmyself.ai.summary
+package com.youmeandmyself.summary.pipeline
 
 import com.intellij.openapi.project.Project
 import com.youmeandmyself.ai.providers.AiProvider

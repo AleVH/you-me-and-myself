@@ -23,8 +23,8 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.time.Instant
-import com.youmeandmyself.context.orchestrator.config.SummaryConfig
-import com.youmeandmyself.context.orchestrator.config.SummaryMode
+import com.youmeandmyself.summary.config.SummaryConfig
+import com.youmeandmyself.summary.config.SummaryMode
 import com.youmeandmyself.storage.model.ConversationExchange
 import com.youmeandmyself.storage.model.DerivedMetadata
 import com.youmeandmyself.storage.model.IdeContext

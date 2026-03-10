@@ -3,6 +3,8 @@ package com.youmeandmyself.ai.chat.context
 import com.intellij.openapi.project.Project
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.LocalStorageFacade
+import com.youmeandmyself.summary.cache.SummaryCache
+import com.youmeandmyself.summary.pipeline.SummaryPipeline
 
 /**
  * Individual-tier implementation of [SummaryStoreProvider].
@@ -36,9 +38,16 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
 
     private val log = Dev.logger(LocalSummaryStoreProvider::class.java)
 
-    /** Storage facade for querying the local SQLite database. Lazy to avoid init-order issues. */
     private val storage: LocalStorageFacade by lazy {
         LocalStorageFacade.getInstance(project)
+    }
+
+    private val cache: SummaryCache by lazy {
+        SummaryCache.getInstance(project)
+    }
+
+    private val pipeline: SummaryPipeline by lazy {
+        SummaryPipeline.getInstance(project)
     }
 
     /**
@@ -51,33 +60,62 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
      * - The query fails (logged, not thrown)
      */
     override suspend fun getSummary(filePath: String, projectId: String): CodeSummary? {
+        // Layer 1: Check in-memory cache (nanoseconds)
+        val (cachedSynopsis, isStale) = cache.getCachedSynopsis(filePath, null)
+        if (cachedSynopsis != null) {
+            Dev.info(log, "summary_store.cache_hit", "filePath" to filePath)
+            return CodeSummary(
+                filePath = filePath,
+                synopsis = cachedSynopsis,
+                headerSample = null,
+                isStale = isStale,
+                generatedAt = "",
+                providerId = "cached",
+                modelId = "cached",
+                isShared = false
+            )
+        }
+
+        // Layer 2: Query SQLite (microseconds)
         if (!storage.isInitialized) {
             Dev.info(log, "summary_store.not_ready", "filePath" to filePath)
             return null
         }
 
+        val fromDb = querySummaryFromDb(filePath, projectId)
+        if (fromDb != null) {
+            // Populate cache so next read is instant
+            cache.populateFromStorage(
+                path = filePath,
+                languageId = null,
+                synopsis = fromDb.synopsis,
+                contentHash = null,
+                summarizedAt = null
+            )
+            Dev.info(log, "summary_store.db_hit", "filePath" to filePath)
+            return fromDb
+        }
+
+        // Layer 3: No summary exists
+        Dev.info(log, "summary_store.miss", "filePath" to filePath)
+        return null
+    }
+
+    private fun querySummaryFromDb(filePath: String, projectId: String): CodeSummary? {
         return try {
-            // Query the local database for this file's summary.
-            // Uses the chat_exchanges table filtered by purpose = FILE_SUMMARY
-            // and the derived metadata for the file path.
-            //
-            // TODO: When the dedicated summaries table is created in Phase 5,
-            //       switch this query to use that table instead. The current
-            //       approach works but is less efficient (scanning exchanges
-            //       rather than a purpose-built summary index).
             storage.withReadableDatabase { db ->
                 db.queryOne(
                     """
-                    SELECT ce.id, ce.provider_id, ce.model_id, ce.timestamp,
-                           ce.assistant_text, dm.file_paths
-                    FROM chat_exchanges ce
-                    LEFT JOIN derived_metadata dm ON dm.exchange_id = ce.id
-                    WHERE ce.project_id = ?
-                      AND ce.purpose = 'FILE_SUMMARY'
-                      AND dm.file_paths LIKE ?
-                    ORDER BY ce.timestamp DESC
-                    LIMIT 1
-                    """.trimIndent(),
+                SELECT ce.id, ce.provider_id, ce.model_id, ce.timestamp,
+                       ce.assistant_text, dm.file_paths
+                FROM chat_exchanges ce
+                LEFT JOIN derived_metadata dm ON dm.exchange_id = ce.id
+                WHERE ce.project_id = ?
+                  AND ce.purpose = 'FILE_SUMMARY'
+                  AND dm.file_paths LIKE ?
+                ORDER BY ce.timestamp DESC
+                LIMIT 1
+                """.trimIndent(),
                     projectId,
                     "%$filePath%"
                 ) { rs ->
@@ -87,12 +125,12 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
                     CodeSummary(
                         filePath = filePath,
                         synopsis = synopsis,
-                        headerSample = null, // TODO: Store header samples in Phase 5
-                        isStale = false,     // TODO: Staleness tracking in Phase 5
+                        headerSample = null,
+                        isStale = false,
                         generatedAt = rs.getString("timestamp") ?: "",
                         providerId = rs.getString("provider_id") ?: "unknown",
                         modelId = rs.getString("model_id") ?: "unknown",
-                        isShared = false     // Local provider never returns shared summaries
+                        isShared = false
                     )
                 }
             }
@@ -115,31 +153,16 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
         filePaths: List<String>,
         projectId: String
     ): Map<String, CodeSummary> {
-        if (!storage.isInitialized || filePaths.isEmpty()) {
-            return emptyMap()
-        }
+        if (filePaths.isEmpty()) return emptyMap()
 
-        return try {
-            // For each file path, find the most recent FILE_SUMMARY exchange.
-            // This is a simplistic approach — Phase 5 will have a dedicated
-            // summaries table with proper file path indexing.
-            val results = mutableMapOf<String, CodeSummary>()
-
-            for (path in filePaths) {
-                val summary = getSummary(path, projectId)
-                if (summary != null) {
-                    results[path] = summary
-                }
+        val results = mutableMapOf<String, CodeSummary>()
+        for (path in filePaths) {
+            val summary = getSummary(path, projectId)
+            if (summary != null) {
+                results[path] = summary
             }
-
-            results
-        } catch (e: Exception) {
-            Dev.warn(log, "summary_store.batch_query_failed", e,
-                "fileCount" to filePaths.size,
-                "projectId" to projectId
-            )
-            emptyMap()
         }
+        return results
     }
 
     /**
@@ -164,12 +187,15 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
      * In company tier, this would also create a claim in the shared system.
      */
     override suspend fun suggestSummarization(filePath: String, projectId: String) {
-        // TODO: Wire to CodeSummarizationPipeline.suggest(filePath) when pipeline is ready.
-        //       For now, log the suggestion so we can verify the flow works.
+        pipeline.requestSummary(
+            path = filePath,
+            languageId = null,
+            currentContentHash = null
+        )
         Dev.info(log, "summary_store.suggest",
             "filePath" to filePath,
             "projectId" to projectId,
-            "action" to "logged_only_pipeline_not_wired"
+            "action" to "enqueued_via_pipeline"
         )
     }
 }

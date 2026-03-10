@@ -4,8 +4,8 @@ import com.intellij.openapi.project.Project
 import com.youmeandmyself.ai.providers.parsing.ui.CorrectionFlowHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
-import com.youmeandmyself.context.orchestrator.config.SummaryConfigService
-import com.youmeandmyself.context.orchestrator.SummaryStore
+import com.youmeandmyself.summary.config.SummaryConfigService
+import com.youmeandmyself.summary.pipeline.SummaryPipeline
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.storage.model.AiExchange
 import com.youmeandmyself.storage.model.ExchangePurpose
@@ -411,16 +411,15 @@ class DevCommandHandler(
             return
         }
 
-        val store = project.getService(SummaryStore::class.java)
+        val pipeline = SummaryPipeline.getInstance(project)
         val contentHash = try {
             java.nio.file.Files.readString(java.nio.file.Path.of(virtualFile.path)).hashCode().toString()
         } catch (_: Throwable) { null }
 
-        val enqueued = store.requestSummary(
+        val enqueued = pipeline.requestSummary(
             path = virtualFile.path,
             languageId = virtualFile.fileType?.name,
-            currentContentHash = contentHash,
-            maxTokens = 500
+            currentContentHash = contentHash
         )
 
         if (enqueued) {
@@ -432,7 +431,7 @@ class DevCommandHandler(
 
     private fun runSummaryStatus() {
         val configService = SummaryConfigService.getInstance(project)
-        val store = project.getService(SummaryStore::class.java)
+        val pipeline = SummaryPipeline.getInstance(project)
         val config = configService.getConfig()
 
         val status = buildString {
@@ -442,8 +441,8 @@ class DevCommandHandler(
             appendLine("  Dry-run: ${config.dryRun}")
             appendLine("  Tokens used this session: ${config.tokensUsedSession}")
             appendLine("  Budget remaining: ${config.remainingBudget?.let { "$it tokens" } ?: "unlimited"}")
-            appendLine("  Files queued: ${store.queue.size()}")
-            val pending = store.queue.pendingPaths()
+            appendLine("  Files queued: ${pipeline.queue.size()}")
+            val pending = pipeline.queue.pendingPaths()
             if (pending.isNotEmpty()) {
                 appendLine("  Queued files:")
                 pending.take(10).forEach { appendLine("    • $it") }
@@ -455,9 +454,8 @@ class DevCommandHandler(
 
     private fun runSummaryStop() {
         val configService = SummaryConfigService.getInstance(project)
-        val store = project.getService(SummaryStore::class.java)
-
-        val cancelled = store.queue.cancelAll()
+        val pipeline = SummaryPipeline.getInstance(project)
+        val cancelled = pipeline.queue.cancelAll()
         configService.setEnabled(false)
 
         output(

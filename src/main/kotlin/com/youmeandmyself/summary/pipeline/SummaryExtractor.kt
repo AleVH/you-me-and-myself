@@ -1,5 +1,4 @@
-// File: src/main/kotlin/com/youmeandmyself/context/orchestrator/SummaryExtractor.kt
-package com.youmeandmyself.context.orchestrator
+package com.youmeandmyself.summary.pipeline
 
 import com.intellij.openapi.diagnostic.Logger
 import com.youmeandmyself.ai.providers.parsing.ParsedResponse
@@ -125,7 +124,7 @@ object SummaryExtractor {
 
         // Strategy 1: Standard parsing succeeded
         if (!response.isError && response.displayText.isNotBlank()) {
-            val cleaned = stripMarker(response.displayText)
+            val cleaned = stripMarkerIfPresent(response.displayText)
             Dev.info(log, "extract.standard_success",
                 "exchangeId" to response.exchangeId,
                 "length" to cleaned.length
@@ -236,7 +235,7 @@ object SummaryExtractor {
      *
      * The marker is just an extraction aid — we don't want it in the stored summary.
      */
-    private fun stripMarker(text: String): String {
+    fun stripMarkerIfPresent(text: String): String {
         val trimmed = text.trim()
         return if (trimmed.startsWith(SUMMARY_MARKER, ignoreCase = true)) {
             trimmed.substring(SUMMARY_MARKER.length).trim()

@@ -1,6 +1,6 @@
 package com.youmeandmyself.storage
 
-import com.youmeandmyself.context.orchestrator.config.SummaryConfig
+import com.youmeandmyself.summary.config.SummaryConfig
 import com.youmeandmyself.storage.model.AiExchange
 import com.youmeandmyself.storage.model.ExchangeMetadata
 import com.youmeandmyself.storage.model.MetadataFilter

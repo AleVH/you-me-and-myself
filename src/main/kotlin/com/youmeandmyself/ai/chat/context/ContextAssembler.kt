@@ -120,10 +120,13 @@ class ContextAssembler(
             "timeMs" to metrics.totalMillis
         )
 
+        // Step 3.5: Enrich files with summaries where available
+        val enrichedBundle = enrichWithSummaries(bundle)
+
         // Step 4: Format the context into a structured prompt section
-        val contextNote = formatContextNote(bundle)
-        val manifest = bundle.manifestLine()
-        val filesBlock = bundle.filesSection()
+        val contextNote = formatContextNote(enrichedBundle)
+        val manifest = enrichedBundle.manifestLine()
+        val filesBlock = enrichedBundle.filesSection()
 
         // Step 5: If the user refers to "this file", include the full file content
         val fileBlock = buildCurrentFileBlock(userInput, editorFile)
@@ -144,9 +147,9 @@ class ContextAssembler(
 
         Dev.info(log, "context.assembled",
             "effectivePromptLength" to effectivePrompt.length,
-            "bundleFiles" to bundle.files.size,
-            "rawFiles" to bundle.files.count { it.kind == ContextKind.RAW },
-            "summaryFiles" to bundle.files.count { it.kind == ContextKind.SUMMARY }
+            "bundleFiles" to enrichedBundle.files.size,
+            "rawFiles" to enrichedBundle.files.count { it.kind == ContextKind.RAW },
+            "summaryFiles" to enrichedBundle.files.count { it.kind == ContextKind.SUMMARY }
         )
 
         return AssembledPrompt(
@@ -281,6 +284,90 @@ class ContextAssembler(
         val request = ContextRequest(project = project, maxMillis = MAX_CONTEXT_GATHER_MS)
 
         return orchestrator.gather(request, scope)
+    }
+
+    // ── Summary Enrichment ───────────────────────────────────────────────
+
+    /**
+     * Enrich a ContextBundle by replacing large RAW files with summaries where available.
+     *
+     * For each file in the bundle that is marked as RAW and truncated (too large
+     * to include in full), checks [SummaryStoreProvider] for an existing summary.
+     * If a summary exists, replaces the RAW entry with a SUMMARY entry containing
+     * the synopsis and optional header sample.
+     *
+     * Files that are NOT truncated stay as RAW — no point using a summary when
+     * the full content fits within the budget.
+     *
+     * If a summary is missing for a truncated file, fires a suggestion to the
+     * pipeline so it may be generated for next time.
+     *
+     * @param bundle The context bundle with all-RAW files from MergePolicy
+     * @return A new bundle with truncated files replaced by summaries where available
+     */
+    private suspend fun enrichWithSummaries(bundle: ContextBundle): ContextBundle {
+        if (bundle.files.isEmpty()) return bundle
+
+        val projectId = try {
+            LocalStorageFacade.getInstance(project).resolveProjectId()
+        } catch (_: Throwable) {
+            project.basePath ?: project.name
+        }
+
+        // Collect paths of truncated files — only these benefit from summaries
+        val truncatedPaths = bundle.files
+            .filter { it.kind == ContextKind.RAW && it.truncated }
+            .map { it.path }
+
+        if (truncatedPaths.isEmpty()) return bundle
+
+        // Batch fetch summaries for all truncated files
+        val summaries = summaryStore.getSummaries(truncatedPaths, projectId)
+
+        Dev.info(log, "context.enrichment",
+            "truncatedFiles" to truncatedPaths.size,
+            "summariesFound" to summaries.size
+        )
+
+        // Rebuild the files list, replacing truncated RAW with SUMMARY where available
+        var totalChars = 0
+        val enrichedFiles = bundle.files.map { cf ->
+            val summary = summaries[cf.path]
+
+            if (cf.truncated && summary != null) {
+                // Replace with summary
+                val synopsisChars = (summary.headerSample?.length ?: 0) + summary.synopsis.length
+                totalChars += synopsisChars
+                cf.copy(
+                    kind = ContextKind.SUMMARY,
+                    charCount = synopsisChars,
+                    truncated = false,
+                    headerSample = summary.headerSample,
+                    modelSynopsis = summary.synopsis,
+                    isStale = summary.isStale,
+                    source = if (summary.isShared) "shared-summary" else "local-summary"
+                )
+            } else {
+                // Keep as RAW
+                totalChars += cf.charCount
+
+                // If truncated but no summary exists, suggest generation
+                if (cf.truncated && summary == null) {
+                    try {
+                        summaryStore.suggestSummarization(cf.path, projectId)
+                    } catch (_: Throwable) {
+                        // Fire-and-forget — don't block context assembly
+                    }
+                }
+
+                cf
+            }
+        }
+
+        return bundle.copy(
+            files = enrichedFiles,
+            totalChars = totalChars
+        )
     }
 
     // ── Prompt Formatting ────────────────────────────────────────────────

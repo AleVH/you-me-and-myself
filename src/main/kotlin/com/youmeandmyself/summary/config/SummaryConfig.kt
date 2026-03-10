@@ -1,5 +1,4 @@
-// File: src/main/kotlin/com/youmeandmyself/context/orchestrator/config/SummaryConfig.kt
-package com.youmeandmyself.context.orchestrator.config
+package com.youmeandmyself.summary.config
 
 import java.time.Instant
 

@@ -1,10 +1,7 @@
-// (project-root)/src/main/kotlin/com/youmeandmyself/context/orchestrator/ContextOrchestrator.kt
 package com.youmeandmyself.context.orchestrator
 
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.progress.ProcessCanceledException
-import com.intellij.openapi.project.Project
-import com.intellij.openapi.project.DumbService
 import kotlinx.coroutines.*
 
 /**
@@ -53,18 +50,15 @@ class ContextOrchestrator(
             }
         } ?: emptyList()
 
-        val bundle = MergePolicy.merge(signals)
-        // Pull counters from the merge result via a tiny helper.
-        // We don't have direct access here, so add a small API on MergePolicy to expose them.
-
+        val mergeResult = MergePolicy.merge(signals)
         val metrics = OrchestratorMetrics(
             totalMillis = System.currentTimeMillis() - start,
             detectorMillis = detectorTimes.toMap(),
             errors = errors.toMap(),
-            filesRawAttached = MergePolicy.lastFilesRawAttached,
-            filesSummarizedAttached = MergePolicy.lastFilesSummarizedAttached,
-            staleSynopsesUsed = MergePolicy.lastStaleSynopsesUsed
+            filesRawAttached = mergeResult.bundle.files.size,
+            filesSummarizedAttached = 0,  // Summary enrichment happens in ContextAssembler now
+            staleSynopsesUsed = 0          // Summary enrichment happens in ContextAssembler now
         )
-        return bundle to metrics
+        return mergeResult.bundle to metrics
     }
 }
