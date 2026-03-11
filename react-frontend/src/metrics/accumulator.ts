@@ -1,192 +1,204 @@
 /**
- * Metrics Module — Pure accumulator functions.
+ * Metrics Module — Accumulator & Formatting Functions
  *
- * ## Purpose
+ * Pure functions for metrics logic. No side effects, no state, no React
+ * dependencies. These are the building blocks used by useBridge.ts
+ * (state management) and MetricsBar.tsx (display).
  *
- * Stateless utility functions for creating accumulators, accumulating
- * snapshots into session totals, and formatting token counts for display.
- * All functions are pure (no side effects, no state) — easy to test.
+ * ## Functions
  *
- * ## Usage Flow
+ * - createAccumulator() — zero-state accumulator for new tabs
+ * - accumulate() — adds one snapshot to running totals (immutable)
+ * - formatTokenCount() — human-friendly token display (1.2k, 1.2M)
+ * - contextFillPercent() — fill bar percentage (or null)
+ * - fillBarColor() — color threshold for the fill bar
  *
- * 1. Tab created → `createAccumulator()` for initial empty state
- * 2. UPDATE_METRICS event → `accumulate(session, snapshot)` returns new session
- * 3. MetricsBar render → `formatTokenCount()`, `contextFillPercent()`, `fillBarColor()`
+ * ## Null Safety
  *
- * @see types.ts — Type definitions consumed and produced by these functions
- * @see MetricsBar.tsx — Display component that calls the formatting functions
- * @see useBridge.ts — State management that calls createAccumulator/accumulate
+ * All functions handle null inputs gracefully. Null token counts are
+ * skipped in accumulation. Null in formatting returns "–".
+ * Null in fill calculations returns null (bar hidden).
+ *
+ * @see types.ts — Type definitions these functions operate on
+ * @see MetricsBar.tsx — UI that calls these functions
+ * @see useBridge.ts — Hook that calls createAccumulator() and accumulate()
  */
 
-import type { MetricsSnapshot, MetricsAccumulator, ModelBreakdown } from "./types";
+import type { MetricsAccumulator, MetricsSnapshot, ModelBreakdown } from "./types";
 
 // ═══════════════════════════════════════════════════════════════════════
 //  ACCUMULATOR LIFECYCLE
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * Create an empty accumulator for a new tab session.
+ * Create a zero-state accumulator for a new or cleared tab.
  *
- * Called once per tab creation (both new tabs and restored tabs).
- * Returns zero-state — no exchanges, no tokens, no model breakdowns.
+ * Used in:
+ * - createTab() — fresh tabs start with empty metrics
+ * - CONVERSATION_CLEARED handler — reset after clear chat
+ * - TAB_STATE handler — restored tabs before history seeding
+ *
+ * @returns A fresh MetricsAccumulator with all counters at zero
  */
 export function createAccumulator(): MetricsAccumulator {
     return {
-        exchangeCount: 0,
-        promptTokens: 0,
-        completionTokens: 0,
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
         totalTokens: 0,
+        exchangeCount: 0,
         byModel: {},
     };
 }
 
 /**
- * Accumulate a new exchange snapshot into the session totals.
+ * Add one exchange's metrics to the running session totals.
  *
- * Returns a NEW accumulator object (immutable update) — safe for React
- * state updates without mutation. The original accumulator is not modified.
+ * Returns a new accumulator (immutable update for React state).
+ * Null token values in the snapshot are skipped — only non-null
+ * values contribute to the sums.
  *
- * ## Null Handling
+ * The byModel breakdown groups exchanges by model name. Exchanges
+ * with a null model are grouped under "__unknown__".
  *
- * Token fields that are null (provider didn't report them) are treated
- * as zero for accumulation purposes. This means session totals may
- * undercount if some providers don't report usage — but that's correct
- * behavior. We can't invent data we don't have.
+ * Used in two places:
+ * 1. UPDATE_METRICS handler — each live exchange
+ * 2. CONVERSATION_HISTORY handler — seeding from historical data
  *
- * ## Model Grouping
- *
- * Exchanges with a null model name are grouped under the key "unknown".
- * This shouldn't happen in practice (every provider reports a model),
- * but defensive handling prevents runtime errors.
- *
- * @param acc - Current session accumulator (not mutated)
- * @param snapshot - New exchange data to fold in
- * @returns New accumulator with updated totals
+ * @param acc The current accumulator state
+ * @param snapshot The new exchange's metrics to add
+ * @returns A new accumulator with updated totals
  */
 export function accumulate(
     acc: MetricsAccumulator,
-    snapshot: MetricsSnapshot,
+    snapshot: MetricsSnapshot
 ): MetricsAccumulator {
-    // Treat null token counts as zero for accumulation.
-    // We don't fabricate data — we just don't crash on missing data.
-    const prompt = snapshot.promptTokens ?? 0;
-    const completion = snapshot.completionTokens ?? 0;
-    const total = snapshot.totalTokens ?? 0;
-
-    // Model key for the byModel breakdown — "unknown" for null model names.
-    const modelKey = snapshot.model ?? "unknown";
+    // Resolve the model key for the byModel breakdown.
+    // Null models are grouped under "__unknown__" so they're still
+    // counted and visible in per-model charts (as "Unknown model").
+    const modelKey = snapshot.model ?? "__unknown__";
 
     // Get existing breakdown for this model, or create a fresh one.
     const existing: ModelBreakdown = acc.byModel[modelKey] ?? {
-        exchangeCount: 0,
         promptTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
+        exchangeCount: 0,
     };
 
-    // Build updated model breakdown (immutable).
-    const updatedModel: ModelBreakdown = {
+    // Update the per-model breakdown.
+    const updatedModelEntry: ModelBreakdown = {
+        promptTokens: existing.promptTokens + (snapshot.promptTokens ?? 0),
+        completionTokens: existing.completionTokens + (snapshot.completionTokens ?? 0),
+        totalTokens: existing.totalTokens + (snapshot.totalTokens ?? 0),
         exchangeCount: existing.exchangeCount + 1,
-        promptTokens: existing.promptTokens + prompt,
-        completionTokens: existing.completionTokens + completion,
-        totalTokens: existing.totalTokens + total,
     };
 
     return {
+        totalPromptTokens: acc.totalPromptTokens + (snapshot.promptTokens ?? 0),
+        totalCompletionTokens: acc.totalCompletionTokens + (snapshot.completionTokens ?? 0),
+        totalTokens: acc.totalTokens + (snapshot.totalTokens ?? 0),
         exchangeCount: acc.exchangeCount + 1,
-        promptTokens: acc.promptTokens + prompt,
-        completionTokens: acc.completionTokens + completion,
-        totalTokens: acc.totalTokens + total,
         byModel: {
             ...acc.byModel,
-            [modelKey]: updatedModel,
+            [modelKey]: updatedModelEntry,
         },
     };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-//  DISPLAY FORMATTING
+//  FORMATTING
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * Format a token count for compact display.
+ * Format a token count for human display.
  *
- * Produces human-readable abbreviated counts:
- *   - 0–999       → exact number: "0", "42", "999"
- *   - 1,000–9,999 → one decimal: "1.2k", "9.9k"
- *   - 10,000–999,999 → rounded: "10k", "150k", "999k"
- *   - 1,000,000+  → one decimal: "1.2M", "3.4M"
- *   - null        → "—" (em-dash, indicates data not available)
+ * Examples:
+ * - null → "–"
+ * - 0 → "0"
+ * - 847 → "847"
+ * - 1234 → "1.2k"
+ * - 12345 → "12.3k"
+ * - 123456 → "123k"
+ * - 1234567 → "1.2M"
  *
- * The goal is always ≤5 characters for compact display in the MetricsBar.
+ * Uses one decimal place for k/M to balance precision and readability.
+ * The MetricsBar is a compact ~20px strip — every character matters.
  *
- * @param count - Token count, or null if not reported by provider
+ * @param count Token count, or null if unavailable
  * @returns Formatted string for display
  */
 export function formatTokenCount(count: number | null): string {
-    if (count === null) return "—";
-    if (count < 1_000) return count.toString();
-    if (count < 10_000) {
-        // 1,234 → "1.2k" — one decimal for precision at small thousands
-        const k = count / 1_000;
-        return `${k.toFixed(1)}k`;
+    if (count === null || count === undefined) return "–";
+    if (count === 0) return "0";
+
+    const abs = Math.abs(count);
+    const sign = count < 0 ? "-" : "";
+
+    if (abs < 1_000) {
+        return `${sign}${abs}`;
     }
-    if (count < 1_000_000) {
-        // 12,345 → "12k" — no decimal needed, the magnitude tells the story
-        const k = Math.round(count / 1_000);
-        return `${k}k`;
+    if (abs < 1_000_000) {
+        const k = abs / 1_000;
+        // Show one decimal for < 100k, no decimal for >= 100k
+        return abs < 100_000
+            ? `${sign}${k.toFixed(1)}k`
+            : `${sign}${Math.round(k)}k`;
     }
-    // 1,234,567 → "1.2M"
-    const m = count / 1_000_000;
-    return `${m.toFixed(1)}M`;
+
+    const m = abs / 1_000_000;
+    return `${sign}${m.toFixed(1)}M`;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CONTEXT FILL BAR
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Fill bar color thresholds.
+ *
+ * These match the design doc §6.1:
+ * - muted (gray): < 50% — not distracting, context is plentiful
+ * - green: 50–74% — context is being used well
+ * - amber: 75–89% — approaching the limit, user should be aware
+ * - red: ≥ 90% — near capacity, responses may be truncated
+ */
+export type FillBarColor = "muted" | "green" | "amber" | "red";
 
 /**
  * Compute the context window fill percentage.
  *
- * Used for the context fill bar in MetricsBar — a visual indicator of
- * how close the conversation is to the model's context window limit.
- *
- * Returns null when either value is unavailable (can't compute a
- * percentage without both a numerator and a denominator).
- *
- * @param totalTokens - Total tokens used in the last exchange (prompt + completion)
- * @param windowSize - Model's maximum context window in tokens
- * @returns Fill percentage (0–100), or null if either input is null/zero
+ * @param totalTokens Total tokens from the last exchange (or session total)
+ * @param windowSize Model's maximum context window in tokens
+ * @returns Fill percentage (0-100+), or null if either input is null/zero.
+ *          Can exceed 100% if the provider reports more tokens than the
+ *          configured window (happens with some providers).
  */
 export function contextFillPercent(
     totalTokens: number | null,
-    windowSize: number | null,
+    windowSize: number | null
 ): number | null {
-    if (totalTokens === null || windowSize === null || windowSize === 0) {
-        return null;
-    }
-    // Clamp to 100 — shouldn't exceed it, but defensive against edge cases
-    // where totalTokens includes completion tokens beyond the window.
-    return Math.min(Math.round((totalTokens / windowSize) * 100), 100);
+    if (totalTokens === null || totalTokens === undefined) return null;
+    if (windowSize === null || windowSize === undefined || windowSize <= 0) return null;
+
+    return (totalTokens / windowSize) * 100;
 }
 
 /**
- * Determine the fill bar color based on context window usage percentage.
+ * Determine the fill bar color based on the fill percentage.
  *
- * Color bands match the design doc §6.1:
- *   - 'muted'  → 0–49%   — plenty of room, don't draw attention
- *   - 'green'  → 50–74%  — healthy usage, subtle positive indicator
- *   - 'amber'  → 75–89%  — approaching limit, user should be aware
- *   - 'red'    → 90–100% — danger zone, near or at context limit
+ * Thresholds from §6.1:
+ * - < 50%  → muted (gray) — context is plentiful
+ * - 50–74% → green — healthy usage
+ * - 75–89% → amber — approaching limit
+ * - ≥ 90%  → red — near capacity
  *
- * Returns 'muted' for null (unknown) — don't alarm users when we
- * simply don't have the data yet.
- *
- * @param percent - Context fill percentage (0–100), or null if unknown
- * @returns Color band identifier used for CSS class selection
+ * @param percent Fill percentage from contextFillPercent(), or null
+ * @returns Color name for CSS class selection, or "muted" if null
  */
-export function fillBarColor(
-    percent: number | null,
-): "muted" | "green" | "amber" | "red" {
+export function fillBarColor(percent: number | null): FillBarColor {
     if (percent === null) return "muted";
-    if (percent >= 90) return "red";
-    if (percent >= 75) return "amber";
-    if (percent >= 50) return "green";
-    return "muted";
+    if (percent < 50) return "muted";
+    if (percent < 75) return "green";
+    if (percent < 90) return "amber";
+    return "red";
 }

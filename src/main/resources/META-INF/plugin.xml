@@ -25,9 +25,12 @@
                            with each release that changes subscription-relevant behavior.
                            TODO: Keep in sync with <version> tag at release time.
     -->
+    <!-- DEV: Commented out to skip JetBrains platform license enforcement during development.
+         Uncomment before Marketplace submission.
     <product-descriptor code="PYMM"
                         release-date="20260401"
                         release-version="10000"/>
+    -->
 
     <depends>com.intellij.modules.platform</depends>
     <depends optional="true" config-file="git-integration.xml">Git4Idea</depends>
@@ -105,6 +108,25 @@
 
         <!-- Chat: conversation lifecycle (create, load, switch, close) -->
         <projectService serviceImplementation="com.youmeandmyself.ai.chat.conversation.ConversationManager"/>
+
+        <!-- ── MetricsService — project-level service ──────────────────────── -->
+        <!-- One instance per project. Receives token data from BridgeDispatcher,
+             writes MetricsRecord to SQLite, builds UpdateMetricsEvent. -->
+        <projectService serviceImplementation="com.youmeandmyself.ai.metrics.MetricsService"/>
+
+        <!-- ── MetricsSettingsState — project-level persistent state ───────── -->
+        <!-- Stores metrics user preferences (showMetricsBar, etc.).
+             Persisted to ymmMetricsSettings.xml in the project config dir. -->
+        <projectService serviceImplementation="com.youmeandmyself.ai.settings.MetricsSettingsState"/>
+
+        <!-- ── MetricsConfigurable — settings UI page ─────────────────────── -->
+        <!-- Settings → Tools → YMM Assistant → Metrics
+             Nested under the YMM root node (parentId matches the root configurable). -->
+        <projectConfigurable
+                instance="com.youmeandmyself.ai.settings.MetricsConfigurable"
+                displayName="Metrics"
+                id="com.youmeandmyself.ai.settings.metrics"
+                parentId="com.youmeandmyself.ai.settings"/>
 
     </extensions>
 

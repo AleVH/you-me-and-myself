@@ -37,6 +37,7 @@ import java.sql.ResultSet
  * 10. storage_config    — global plugin settings (retention, cleanup thresholds)
  * 11. open_tabs         — persisted chat tab state for restore on IDE restart
  * 12. code_bookmarks    — saved code blocks from chat responses
+ * 13. metrics           — per-exchange token usage metrics for the Metrics Module
  *
  * ## Thread Safety
  *
@@ -277,6 +278,7 @@ class DatabaseHelper(private val dbFile: File) {
                     stmt.execute("DROP TABLE IF EXISTS summary_hierarchy")
                     stmt.execute("DROP TABLE IF EXISTS summaries")
                     stmt.execute("DROP TABLE IF EXISTS code_bookmarks")
+                    stmt.execute("DROP TABLE IF EXISTS metrics")
                     stmt.execute("DROP TABLE IF EXISTS chat_exchanges")
                     stmt.execute("DROP TABLE IF EXISTS conversations")
                     stmt.execute("DROP TABLE IF EXISTS code_elements")
@@ -536,6 +538,53 @@ class DatabaseHelper(private val dbFile: File) {
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_exchange ON code_bookmarks(exchange_id)")
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_language ON code_bookmarks(language)")
 
+                // ── Table 13: metrics ──
+                // Per-exchange token usage metrics for the Metrics Module.
+                // Separate from chat_exchanges because:
+                // - Metrics have their own lifecycle (aggregation queries, cleanup policies)
+                // - Summary exchanges also produce metrics — same structure, different purpose
+                // - Company tier adds user/project dimensions that don't belong on chat_exchanges
+                // - Keeps chat_exchanges lean for chat-specific queries
+                //
+                // All aggregations are computed on read from this table —
+                // never stored separately. Any new dimension is immediately
+                // available without migration.
+                //
+                // Company tier columns (user_id, project_id) are present but
+                // null at Individual tier launch. Populated when Phase 6 ships.
+                stmt.execute("""
+                CREATE TABLE IF NOT EXISTS metrics (
+                    exchange_id         TEXT PRIMARY KEY,
+                    conversation_id     TEXT NOT NULL,
+                    provider_id         TEXT NOT NULL,
+                    provider_label      TEXT NOT NULL,
+                    protocol            TEXT NOT NULL,
+                    model               TEXT,
+                    prompt_tokens       INTEGER,
+                    completion_tokens   INTEGER,
+                    total_tokens        INTEGER,
+                    context_window_size INTEGER,
+                    purpose             TEXT NOT NULL DEFAULT 'CHAT',
+                    timestamp_ms        INTEGER NOT NULL,
+                    response_time_ms    INTEGER,
+                    user_id             TEXT,
+                    project_id          TEXT,
+                    FOREIGN KEY (exchange_id) REFERENCES chat_exchanges(id)
+                )
+            """.trimIndent())
+
+                // Aggregation query indexes — one per common GROUP BY / WHERE dimension.
+                // These make dashboard queries (per-provider, per-model, per-day, etc.)
+                // fast without full table scans.
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_metrics_conversation ON metrics(conversation_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_metrics_provider     ON metrics(provider_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_metrics_model        ON metrics(model)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp    ON metrics(timestamp_ms)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_metrics_purpose      ON metrics(purpose)")
+                // Company tier index — unused at Individual launch but exists so
+                // we never need to add it later (adding indexes to large tables is slow).
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_metrics_user         ON metrics(user_id)")
+
                 // Insert default config values if they don't exist yet.
                 // Using INSERT OR IGNORE so this is safe on every startup.
                 val defaults = listOf(
@@ -556,7 +605,7 @@ class DatabaseHelper(private val dbFile: File) {
                 insertConfig.close()
             }
 
-            Dev.info(log, "db.schema.created", "tables" to 11)
+            Dev.info(log, "db.schema.created", "tables" to 13)
         } catch (e: org.sqlite.SQLiteException) {
             if (e.message?.contains("FOREIGN KEY") == true) {
                 Dev.error(log, "db.schema.fk_error", e, "line" to "createSchema")

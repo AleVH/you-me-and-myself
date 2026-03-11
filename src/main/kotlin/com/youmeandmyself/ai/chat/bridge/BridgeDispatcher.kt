@@ -6,10 +6,13 @@ import com.youmeandmyself.ai.chat.orchestrator.ChatResult
 import com.youmeandmyself.ai.library.LibraryPanelHolder
 import com.youmeandmyself.ai.settings.AiProfilesState
 import com.youmeandmyself.dev.Dev
-import com.youmeandmyself.dev.DevMode
-import com.youmeandmyself.storage.BookmarkService
+import com.youmeandmyself.ai.metrics.DefaultContextWindows
+import com.youmeandmyself.ai.metrics.MetricsService
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.storage.TabStateService
+import com.youmeandmyself.ai.settings.MetricsSettingsState
+import com.youmeandmyself.tier.CompositeTierProvider
+import com.youmeandmyself.tier.Feature
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -117,14 +120,43 @@ class BridgeDispatcher(
 
                 emit(chatResultToEvent(result))
 
-                if (result.tokenUsage != null) {
-                    emit(BridgeMessage.UpdateMetricsEvent(
-                        model = result.modelId,
-                        promptTokens = result.tokenUsage.promptTokens,
-                        completionTokens = result.tokenUsage.completionTokens,
-                        totalTokens = result.tokenUsage.effectiveTotal,
-                        estimatedCost = null
-                    ))
+                // ── Metrics Module: record + conditionally emit ──────
+                // Step 1: ALWAYS record to SQLite (data collection is
+                //         unconditional — we want the data even if the
+                //         user hides the bar or is on a lower tier).
+                val metricsEvent = MetricsService.getInstance(project).recordExchange(
+                    exchangeId = result.exchangeId ?: "unknown",
+                    conversationId = result.conversationId,
+                    providerId = result.providerId ?: "unknown",
+                    tokenUsage = result.tokenUsage,
+                    modelId = result.modelId,
+                    purpose = "CHAT",
+                    responseTimeMs = result.responseTimeMs
+                )
+
+                // Step 2: Only emit to frontend if:
+                // - The tier supports metrics display (METRICS_BASIC)
+                // - The user hasn't hidden the metrics bar in settings
+                if (metricsEvent != null) {
+//                    val tierAllowed = CompositeTierProvider.getInstance()
+//                        .canUse(Feature.METRICS_BASIC)
+                    val tierAllowed = try {
+                        CompositeTierProvider.getInstance().canUse(Feature.METRICS_BASIC)
+                    } catch (e: Exception) {
+                        Dev.warn(log, "metrics.tier_check_failed", e)
+                        true // Default to allowed if tier system is broken
+                    }
+                    val userEnabled = MetricsSettingsState.getInstance(project)
+                        .state.showMetricsBar
+
+                    if (tierAllowed && userEnabled) {
+                        emit(metricsEvent)
+                    } else {
+                        Dev.info(log, "metrics.emit_skipped",
+                            "tierAllowed" to tierAllowed,
+                            "userEnabled" to userEnabled
+                        )
+                    }
                 }
 
                 if (result.correctionAvailable) {
@@ -251,7 +283,15 @@ class BridgeDispatcher(
                     BridgeMessage.ProviderInfoDto(
                         id = profile.id,
                         label = profile.label.ifBlank { "Generic LLM" },
-                        protocol = profile.protocol?.name ?: "unknown"
+                        protocol = profile.protocol?.name ?: "unknown",
+                        // Metrics Module: send model name and resolved context window
+                        // so the frontend can show model info and compute the fill bar
+                        // even before the first AI exchange in this session.
+                        model = profile.model,
+                        contextWindowSize = DefaultContextWindows.resolve(
+                            profileContextWindowSize = profile.contextWindowSize,
+                            modelName = profile.model
+                        )
                     )
                 }
 

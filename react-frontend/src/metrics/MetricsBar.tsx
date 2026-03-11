@@ -4,14 +4,14 @@
  * ## Layout (Design Doc §6.1)
  *
  * ┌──────────────────────────────────────────────────────────────────────────┐
- * │ gpt-4o  • P: 1.2k  C: 340  T: 1.5k   ⏱ —  [░░░░░░░░] —  $—   ▾  ⤢  │
+ * │ gpt-4o  • P: 1.2k  C: 340  T: 1.5k   ⏱ 1.2s  [░░░░░░░░] 42%  $—  ▾  ⤢  │
  * └──────────────────────────────────────────────────────────────────────────┘
  *
  * Elements left to right:
  * 1. Model name — truncated with tooltip for full name
  * 2. •/Σ indicator + P:/C:/T: — token counts (click toggles exchange ↔ session)
- * 3. ⏱ response time — PLACEHOLDER (needs Kotlin: responseTimeMs)
- * 4. Context fill bar — PLACEHOLDER (needs Kotlin: contextWindowSize)
+ * 3. ⏱ response time — shows wall-clock AI call duration
+ * 4. Context fill bar — shows context window usage % (color-coded)
  * 5. $— cost — PLACEHOLDER (Pricing Module — post-launch)
  * 6. ▾ collapse toggle — hides/shows the bar content
  * 7. ⤢ expand button — PLACEHOLDER (Metrics Panel — future)
@@ -30,6 +30,15 @@
  * Receives TabMetricsState from ChatApp (via useBridge). The component
  * does NO state management of metrics data — it's purely presentational
  * except for the view toggle and collapse toggle (local UI state only).
+ *
+ * ## Block 2 Updates
+ *
+ * - responseTimeMs now flows from Kotlin via UpdateMetricsEvent
+ * - contextWindowSize now flows from Kotlin via UpdateMetricsEvent
+ * - Placeholder modifiers removed from response time and fill bar
+ *   when real data is available (still shown as placeholders when null)
+ * - Accumulator field names updated to match new MetricsAccumulator type
+ *   (totalPromptTokens, totalCompletionTokens instead of promptTokens, completionTokens)
  *
  * @see types.ts — TabMetricsState, MetricsSnapshot, MetricsAccumulator
  * @see accumulator.ts — formatTokenCount, contextFillPercent, fillBarColor
@@ -113,8 +122,10 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
     const hasSnapshot = snapshot !== null;
     const isSessionView = !hasSnapshot || view === "session";
 
-    const displayPrompt = isSessionView ? session.promptTokens : snapshot!.promptTokens;
-    const displayCompletion = isSessionView ? session.completionTokens : snapshot!.completionTokens;
+    // Block 2: field names match the new MetricsAccumulator type
+    // (totalPromptTokens, totalCompletionTokens instead of promptTokens, completionTokens)
+    const displayPrompt = isSessionView ? session.totalPromptTokens : snapshot!.promptTokens;
+    const displayCompletion = isSessionView ? session.totalCompletionTokens : snapshot!.completionTokens;
     const displayTotal = isSessionView ? session.totalTokens : snapshot!.totalTokens;
 
     // Model name: always from the last exchange (session view doesn't have a single model).
@@ -148,6 +159,12 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
         ? null
         : contextFillPercent(snapshot!.totalTokens, snapshot!.contextWindowSize);
     const fillColor = fillBarColor(fillPct);
+
+    // Response time — show placeholder modifier only when data isn't available
+    const hasResponseTime = hasSnapshot && snapshot!.responseTimeMs !== null;
+
+    // Fill bar — show placeholder modifier only when contextWindowSize isn't available
+    const hasFillData = fillPct !== null;
 
     // View toggle tooltip.
     const viewToggleTooltip = isSessionView
@@ -230,45 +247,41 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
                 )}
             </button>
 
-            {/*
-              * PLACEHOLDER: Response time display.
-              *
-              * NOT YET WIRED — Kotlin bridge does not send responseTimeMs.
-              * To implement:
-              * 1. Add responseTimeMs to UpdateMetricsEvent in BridgeMessage.kt
-              * 2. Populate from provider response timing in AiChatOrchestrator
-              * 3. Pass through bridge event → MetricsSnapshot.responseTimeMs
-              * 4. Replace "—" below with formatted value (e.g., "1.2s")
-              * 5. Remove --placeholder modifier from the class
-              */}
+            {/* Response time — shows real data when available, placeholder when not */}
             <span
-                className="ymm-metrics-bar__response-time ymm-metrics-bar__response-time--placeholder"
-                title="Response time: not wired yet (needs Kotlin: responseTimeMs in UpdateMetricsEvent)"
+                className={`ymm-metrics-bar__response-time${
+                    !hasResponseTime ? " ymm-metrics-bar__response-time--placeholder" : ""
+                }`}
+                title={
+                    hasResponseTime
+                        ? `Response time: ${(snapshot!.responseTimeMs! / 1000).toFixed(1)}s`
+                        : "Response time: waiting for data"
+                }
             >
-                ⏱ {hasSnapshot && snapshot!.responseTimeMs !== null
-                ? `${(snapshot!.responseTimeMs / 1000).toFixed(1)}s`
+                ⏱ {hasResponseTime
+                ? `${(snapshot!.responseTimeMs! / 1000).toFixed(1)}s`
                 : "—"}
             </span>
 
-            {/* Context fill bar — shows fill % when data is available, "—" when not */}
+            {/* Context fill bar — shows real data when available, placeholder when not */}
             <div
                 className={`ymm-metrics-bar__fill-wrapper${
-                    fillPct === null ? " ymm-metrics-bar__fill-wrapper--placeholder" : ""
+                    !hasFillData ? " ymm-metrics-bar__fill-wrapper--placeholder" : ""
                 }`}
                 title={
-                    fillPct !== null
-                        ? `Context window: ${fillPct}% used`
-                        : "Context fill: not wired yet (needs Kotlin: contextWindowSize in UpdateMetricsEvent)"
+                    hasFillData
+                        ? `Context window: ${fillPct!.toFixed(1)}% used`
+                        : "Context fill: waiting for context window size data"
                 }
             >
                 <div className="ymm-metrics-bar__fill-track">
                     <div
                         className={`ymm-metrics-bar__fill-bar ymm-metrics-bar__fill-bar--${fillColor}`}
-                        style={{ width: fillPct !== null ? `${fillPct}%` : "0%" }}
+                        style={{ width: hasFillData ? `${Math.min(fillPct!, 100)}%` : "0%" }}
                     />
                 </div>
                 <span className="ymm-metrics-bar__fill-label">
-                    {fillPct !== null ? `${fillPct}%` : "—"}
+                    {hasFillData ? `${fillPct!.toFixed(0)}%` : "—"}
                 </span>
             </div>
 
@@ -278,13 +291,6 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
               * The Pricing Module converts tokens → cost using time-bucketed
               * rates and user-defined currencies. This placeholder reminds
               * you it's planned. NOT part of launch scope.
-              *
-              * To implement:
-              * 1. Build Pricing Module (post-launch)
-              * 2. Add cost field to a PricingState (separate from MetricsState)
-              * 3. Pass cost data through to MetricsBar as a separate prop
-              * 4. Replace "—" with formatted cost (e.g., "$0.03")
-              * 5. Remove --placeholder modifier from the class
               */}
             <span
                 className="ymm-metrics-bar__cost ymm-metrics-bar__cost--placeholder"
@@ -310,13 +316,7 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
               * - Per-model breakdown table (data already accumulated in session.byModel)
               * - Historical usage charts (requires reading from SQLite)
               * - Cost estimates (requires Pricing Module — post-launch)
-              * - Response time trends (requires responseTimeMs wiring)
-              *
-              * To implement:
-              * 1. Create MetricsPanel.tsx component
-              * 2. Add MetricsPanel to ChatApp layout (toggled by this button)
-              * 3. Wire session.byModel data into breakdown table
-              * 4. Remove --placeholder class and console.warn
+              * - Response time trends
               */}
             <button
                 className="ymm-metrics-bar__expand ymm-metrics-bar__expand--placeholder"

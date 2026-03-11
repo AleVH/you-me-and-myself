@@ -306,7 +306,32 @@ data class AiProfile(
      * Controls temperature, max tokens, prompt template, etc. for summaries.
      * Null = use defaults defined in RequestSettings.summaryDefaults()
      */
-    var summarySettings: RequestSettings? = null
+    var summarySettings: RequestSettings? = null,
+
+    /**
+     * Maximum context window size for this profile's model, in tokens.
+     *
+     * Used by the Metrics Module to compute the context fill percentage
+     * displayed in the MetricsBar. Resolution order:
+     * 1. This field (user's explicit override for this profile)
+     * 2. DefaultContextWindows.lookup(model) (built-in default table)
+     * 3. null → fill bar hidden (graceful degradation)
+     *
+     * Why user-configurable? The same model name can have different context
+     * limits depending on the deployment (enterprise vs. public API, custom
+     * fine-tuned endpoints, provider-specific restrictions). The user knows
+     * their actual limit better than any built-in table.
+     *
+     * Stored as tokens (not characters, not bytes). Common values:
+     * - gpt-4o: 128,000
+     * - gemini-2.5-flash: 1,048,576
+     * - claude-3.5-sonnet: 200,000
+     * - codellama (Ollama): 16,384
+     *
+     * Null = use the built-in default from DefaultContextWindows, or
+     * hide the fill bar if no default exists for this model.
+     */
+    var contextWindowSize: Int? = null
 ) {
     /**
      * Get chat settings, falling back to defaults if not configured.

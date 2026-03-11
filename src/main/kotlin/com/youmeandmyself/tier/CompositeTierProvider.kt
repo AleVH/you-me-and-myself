@@ -42,9 +42,13 @@ class CompositeTierProvider : TierProvider {
          *
          * This is the standard way to access tier information throughout YMM.
          */
+//        fun getInstance(): CompositeTierProvider {
+//            return ApplicationManager.getApplication()
+//                .getService(CompositeTierProvider::class.java)
+//        }
         fun getInstance(): CompositeTierProvider {
             return ApplicationManager.getApplication()
-                .getService(CompositeTierProvider::class.java)
+                .getService(TierProvider::class.java) as CompositeTierProvider
         }
     }
 

@@ -76,7 +76,7 @@ import {
     type OpenConversationResultEvent,
     type TabStateDto, ProviderInfoDto,
 } from "../bridge/types";
-import { createAccumulator, accumulate } from "../metrics";
+import { createAccumulator, accumulate, contextFillPercent } from "../metrics";
 import type {TabMetricsState, MetricsSnapshot} from "../metrics";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -369,10 +369,13 @@ export function useBridge(): BridgeState {
                 isActive: tab.id === activeTabId,
                 hasMessages: tab.messages.length > 0,
                 isThinking: tab.isThinking,
-                // PLACEHOLDER: contextUsagePct not yet computed.
-                // Will be: (tab.metrics?.totalTokens ?? 0) / modelContextLimit * 100
-                // Requires modelContextLimit from provider config.
-                contextUsagePct: null as number | null,
+                // PLACEHOLDER: contextUsagePct not yet computed// Context fill percentage for TabBar indicator chip.
+                // Uses the last exchange's token count and context window.
+                // Null if no data → chip is hidden.
+                contextUsagePct: contextFillPercent(
+                    tab.metricsState.lastExchange?.totalTokens ?? null,
+                    tab.metricsState.lastExchange?.contextWindowSize ?? null
+                ),
                 providerId: tab.providerId,
             };
         })
@@ -494,16 +497,16 @@ export function useBridge(): BridgeState {
                 const targetId = activeTabIdRef.current;
 
                 updateTab(targetId, (tab) => {
-                    // Build snapshot from the bridge event.
-                    // contextWindowSize and responseTimeMs are NOT yet sent by
-                    // Kotlin — null until the backend is enhanced.
+                    // Build snapshot from the enhanced bridge event.
+                    // All fields now come from the Kotlin MetricsService
+                    // via the enhanced UpdateMetricsEvent.
                     const snapshot: MetricsSnapshot = {
                         model: e.model,
                         promptTokens: e.promptTokens,
                         completionTokens: e.completionTokens,
                         totalTokens: e.totalTokens,
-                        contextWindowSize: null,  // NOT YET: Kotlin enhancement needed
-                        responseTimeMs: null,      // NOT YET: Kotlin enhancement needed
+                        contextWindowSize: e.contextWindowSize ?? null,
+                        responseTimeMs: e.responseTimeMs ?? null,
                     };
 
                     return {

@@ -70,7 +70,17 @@ data class ChatResult(
     val candidates: List<TextCandidate>,
     val providerId: String?,
     val contextSummary: String?,
-    val contextTimeMs: Long?
+    val contextTimeMs: Long?,
+    /**
+     * Wall-clock time for the AI provider call in milliseconds.
+     *
+     * Measured in [ChatOrchestrator.send] from before provider.chat()
+     * to after. Used by MetricsService to record response time in the
+     * metrics table and send to the frontend.
+     *
+     * Null for error results or when timing wasn't captured.
+     */
+    val responseTimeMs: Long? = null
 ) {
     companion object {
 
@@ -98,7 +108,8 @@ data class ChatResult(
             candidates = emptyList(),
             providerId = null,
             contextSummary = null,
-            contextTimeMs = null
+            contextTimeMs = null,
+            responseTimeMs = null
         )
     }
 }

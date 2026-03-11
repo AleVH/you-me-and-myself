@@ -1,6 +1,7 @@
 package com.youmeandmyself.tier
 
 import com.youmeandmyself.dev.Dev
+import com.youmeandmyself.dev.DevMode
 
 /**
  * Resolves the user's tier from JetBrains Marketplace licensing.
@@ -106,6 +107,12 @@ class JetBrainsLicenseTierProvider : TierProvider {
      * ```
      */
     private fun resolveTierFromFacade(): Tier {
+        // DEV BYPASS: Skip license check in dev mode so the plugin is usable during development.
+        // Remove or gate behind DevMode.isEnabled() before launch.
+        if (DevMode.isEnabled()) {
+            Dev.info(log, "tier.dev_bypass", "tier" to Tier.INDIVIDUAL_BASIC)
+            return Tier.INDIVIDUAL_BASIC
+        }
         // ── Step 1: Check if LicensingFacade is available ────────────────
         // LicensingFacade populates asynchronously on IDE startup.
         // null means "not ready yet" — NOT "no license."

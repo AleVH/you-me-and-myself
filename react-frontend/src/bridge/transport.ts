@@ -279,11 +279,13 @@ function handleMockCommand(command: BridgeCommand): void {
             simulateEvent(
                 {
                     type: "UPDATE_METRICS",
-                    model: "mock-model",
-                    promptTokens: 42,
-                    completionTokens: 128,
-                    totalTokens: 170,
-                    estimatedCost: "$0.0003",
+                    model: "mock-gpt-4",
+                    promptTokens: 150,
+                    completionTokens: 280,
+                    totalTokens: 430,
+                    contextWindowSize: 128000,
+                    responseTimeMs: 1250,
+                    purpose: "CHAT",
                 },
                 850,
             );
@@ -294,9 +296,9 @@ function handleMockCommand(command: BridgeCommand): void {
                 {
                     type: "PROVIDERS_LIST",
                     providers: [
-                        { id: "mock-1", label: "Mock GPT-4", protocol: "OPENAI" },
-                        { id: "mock-2", label: "Mock Gemini", protocol: "GEMINI" },
-                        { id: "mock-3", label: "Mock DeepSeek", protocol: "OPENAI" },
+                        { id: "mock-1", label: "Mock GPT-4", protocol: "OPENAI", model: "gpt-4o", contextWindowSize: 128000 },
+                        { id: "mock-2", label: "Mock Gemini", protocol: "GEMINI", model: "gemini-2.5-flash", contextWindowSize: 1048576 },
+                        { id: "mock-3", label: "Mock DeepSeek", protocol: "OPENAI", model: "deepseek-chat", contextWindowSize: 64000 },
                     ],
                     selectedId: "mock-1",
                 },

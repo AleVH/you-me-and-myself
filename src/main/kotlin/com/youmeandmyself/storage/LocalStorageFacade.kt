@@ -4,6 +4,7 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.youmeandmyself.ai.providers.parsing.FormatDetector
+import com.youmeandmyself.ai.metrics.MetricsRecord
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.model.AiExchange
 import com.youmeandmyself.storage.model.ExchangeMetadata
@@ -290,6 +291,79 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                     )
                 }
             }
+        }
+    }
+
+    /**
+     * Insert a metrics record into the metrics SQLite table.
+     *
+     * Called by [MetricsService.recordExchange] after every AI call
+     * (chat or summary) that produces token data.
+     *
+     * ## Storage Strategy
+     *
+     * The metrics table is a **secondary index** — the JSONL exchange
+     * record is the source of truth. If this insert fails, the data can
+     * be recovered during a database rebuild by reading the metrics
+     * fields embedded in the JSONL records.
+     *
+     * ## Conflict Handling
+     *
+     * Uses INSERT OR REPLACE so re-recording the same exchange (e.g.,
+     * during a rebuild) overwrites cleanly without errors. The exchange_id
+     * is the primary key.
+     *
+     * ## Thread Safety
+     *
+     * Acquires the write mutex. Called from MetricsService which runs
+     * on Dispatchers.IO via BridgeDispatcher's coroutine scope.
+     *
+     * @param record The metrics record to persist
+     * @see MetricsService.recordExchange — the caller
+     * @see DatabaseHelper.createSchema — defines the metrics table
+     */
+    fun insertMetricsRecord(record: MetricsRecord) {
+        if (mode == StorageMode.OFF) return
+
+        try {
+            val database = requireDb()
+            database.execute(
+                """
+                INSERT OR REPLACE INTO metrics (
+                    exchange_id, conversation_id, provider_id, provider_label,
+                    protocol, model, prompt_tokens, completion_tokens, total_tokens,
+                    context_window_size, purpose, timestamp_ms, response_time_ms,
+                    user_id, project_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                record.exchangeId,
+                record.conversationId,
+                record.providerId,
+                record.providerLabel,
+                record.protocol,
+                record.model,
+                record.promptTokens,
+                record.completionTokens,
+                record.totalTokens,
+                record.contextWindowSize,
+                record.purpose,
+                record.timestampMs,
+                record.responseTimeMs,
+                record.userId,
+                record.projectId
+            )
+
+            Dev.info(log, "metrics.insert",
+                "exchangeId" to record.exchangeId,
+                "model" to (record.model ?: "null"),
+                "total" to (record.totalTokens ?: 0)
+            )
+        } catch (e: Exception) {
+            // Non-fatal: JSONL is the source of truth.
+            // Metrics can be backfilled from JSONL during rebuild.
+            Dev.warn(log, "metrics.insert_failed", e,
+                "exchangeId" to record.exchangeId
+            )
         }
     }
 

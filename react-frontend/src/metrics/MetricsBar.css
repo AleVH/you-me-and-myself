@@ -149,9 +149,9 @@
 }
 
 /*
- * PLACEHOLDER visual treatment — dashed border signals "not wired yet".
- * When contextWindowSize starts flowing from Kotlin, remove this modifier
- * from the JSX and delete this rule.
+ * Placeholder visual treatment — dashed border signals "data not available yet".
+ * Applied dynamically: when contextWindowSize is null, the wrapper gets this
+ * modifier. When real data flows, the modifier is removed automatically.
  */
 .ymm-metrics-bar__fill-wrapper--placeholder .ymm-metrics-bar__fill-track {
     border: 1px dashed #555;
@@ -210,10 +210,9 @@
 }
 
 /*
- * PLACEHOLDER visual treatment — dimmed with dashed underline.
- * Signals "this element exists but data isn't flowing yet."
- * When responseTimeMs starts flowing from Kotlin, remove --placeholder
- * from the JSX and delete this rule.
+ * Placeholder visual treatment — dimmed with dashed underline.
+ * Applied dynamically: when responseTimeMs is null, the element gets
+ * this modifier. When real data flows, the modifier is removed.
  */
 .ymm-metrics-bar__response-time--placeholder {
     opacity: 0.45;

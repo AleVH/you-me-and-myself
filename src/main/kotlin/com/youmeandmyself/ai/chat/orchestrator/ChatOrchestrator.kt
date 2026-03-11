@@ -199,12 +199,18 @@ class ChatOrchestrator(
             )
 
             // ── Step 4: Call AI provider (HTTP only) ─────────────────
+            // Timer brackets the HTTP call so MetricsService can record
+            // wall-clock response time. This measures the full round-trip:
+            // request serialization + network + server processing + response parsing.
+            val callStartMs = System.currentTimeMillis()
             val response = provider.chat(assembled.effectivePrompt)
+            val responseTimeMs = System.currentTimeMillis() - callStartMs
 
             Dev.info(log, "orchestrator.provider_response",
                 "exchangeId" to response.exchangeId,
                 "isError" to response.isError,
-                "rawLength" to (response.rawJson?.length ?: 0)
+                "rawLength" to (response.rawJson?.length ?: 0),
+                "responseTimeMs" to responseTimeMs
             )
 
             // ── Step 5: Conversation bookkeeping ─────────────────────
@@ -253,7 +259,8 @@ class ChatOrchestrator(
                 candidates = response.parsed.metadata.candidates,
                 providerId = provider.id,
                 contextSummary = assembled.contextSummary,
-                contextTimeMs = assembled.contextTimeMs
+                contextTimeMs = assembled.contextTimeMs,
+                responseTimeMs = responseTimeMs
             )
 
         } catch (t: Throwable) {
