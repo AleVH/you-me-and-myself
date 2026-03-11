@@ -280,6 +280,14 @@ class SummaryCache(private val project: Project) {
     private var warmedFromStorage = false
 
     /**
+     * Check if the cache has been warmed from storage.
+     *
+     * Used by LocalSummaryStoreProvider.ensureWarmed() to skip the
+     * warm-up query if it's already been done this session.
+     */
+    fun isWarmed(): Boolean = warmedFromStorage
+
+    /**
      * Warm the cache from external storage results.
      *
      * Called once on first access. The caller (e.g., LocalSummaryStoreProvider

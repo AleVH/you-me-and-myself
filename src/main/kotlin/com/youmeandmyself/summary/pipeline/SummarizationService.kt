@@ -11,6 +11,8 @@ import com.youmeandmyself.storage.model.ExchangePurpose
 import com.youmeandmyself.storage.model.ExchangeRawResponse
 import com.youmeandmyself.storage.model.ExchangeRequest
 import com.youmeandmyself.storage.model.ExchangeTokenUsage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.time.Instant
 
 /**
@@ -161,6 +163,39 @@ class SummarizationService(
         // Index token usage for cost tracking
         indexTokens(response)
 
+        // Cache assistant_text in SQLite so the read path can find it.
+        // saveExchange() intentionally skips assistant_text (it's a lazy-cache
+        // column for chat, where the response arrives via streaming after save).
+        // For summaries, the text is available immediately — cache it now so
+        // LocalSummaryStoreProvider.querySummaryFromDb() returns a result
+        // without needing a separate lazy-load trigger.
+        val summaryText = response.parsed.rawText
+        if (!summaryText.isNullOrBlank()) {
+            try {
+                storage.cacheAssistantText(response.exchangeId, summaryText)
+            } catch (e: Exception) {
+                Dev.warn(log, "summarization.cache_assistant_text_failed", e,
+                    "exchangeId" to response.exchangeId
+                )
+            }
+        }
+
+        // Index file_paths in SQLite so the read path can query by path.
+        // DerivedMetadata.extract() is designed for chat text (detects code blocks,
+        // languages, etc.) — overkill for summaries. We just need the file path
+        // from the caller's metadata map stored in the file_paths column.
+        val filePath = metadata["filePath"]
+        if (!filePath.isNullOrBlank()) {
+            try {
+                indexFilePath(response.exchangeId, filePath)
+            } catch (e: Exception) {
+                Dev.warn(log, "summarization.index_file_path_failed", e,
+                    "exchangeId" to response.exchangeId,
+                    "filePath" to filePath
+                )
+            }
+        }
+
         // Build the result
         return SummarizationResult(
             summaryText = response.parsed.rawText ?: "",
@@ -246,6 +281,33 @@ class SummarizationService(
                 "exchangeId" to response.exchangeId
             )
         }
+    }
+
+    /**
+     * Index the summarized file's path in the file_paths column of chat_exchanges.
+     *
+     * This is a targeted UPDATE — not using DerivedMetadata.extract() because that
+     * method parses assistant text looking for code blocks, languages, etc. For summary
+     * exchanges, we just need to record WHICH file was summarized so the read path
+     * (LocalSummaryStoreProvider.querySummaryFromDb) can find it by path.
+     *
+     * @param exchangeId The exchange to update
+     * @param filePath The absolute path of the file that was summarized
+     */
+    private suspend fun indexFilePath(exchangeId: String, filePath: String) {
+        withContext(Dispatchers.IO) {
+            storage.withDatabase { db ->
+                db.execute(
+                    "UPDATE chat_exchanges SET file_paths = ? WHERE id = ?",
+                    filePath,
+                    exchangeId
+                )
+            }
+        }
+        Dev.info(log, "summarization.file_path_indexed",
+            "exchangeId" to exchangeId,
+            "filePath" to filePath
+        )
     }
 
     companion object {
