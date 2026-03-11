@@ -128,6 +128,22 @@
                 id="com.youmeandmyself.ai.settings.metrics"
                 parentId="com.youmeandmyself.ai.settings"/>
 
+        <!-- ── BudgetChecker — project-level service ───────────────────────── -->
+        <!--
+            Budget enforcement gate: every AI call checks this before execution.
+
+            At launch (Individual Basic), AlwaysAllowBudgetChecker approves everything.
+            Post-launch (Pro/Company tiers), swap serviceImplementation to the real
+            enforcement class — all consumers code against the BudgetChecker interface,
+            so zero caller changes needed.
+
+            Registered with serviceInterface so callers can request BudgetChecker
+            (the interface) and get whatever implementation is active.
+        -->
+        <projectService
+                serviceInterface="com.youmeandmyself.budget.BudgetChecker"
+                serviceImplementation="com.youmeandmyself.budget.AlwaysAllowBudgetChecker"/>
+
     </extensions>
 
     <actions>

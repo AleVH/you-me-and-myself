@@ -4,6 +4,7 @@ import com.intellij.openapi.project.Project
 import com.youmeandmyself.ai.providers.AiProvider
 import com.youmeandmyself.ai.providers.ProviderResponse
 import com.youmeandmyself.dev.Dev
+import com.youmeandmyself.budget.BudgetChecker
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.storage.model.AiExchange
 import com.youmeandmyself.storage.model.ExchangePurpose
@@ -109,6 +110,42 @@ class SummarizationService(
             "metadata" to metadata.toString()
         )
 
+        // ── Budget check ─────────────────────────────────────────────
+        // Gate every summarization call through the budget checker.
+        // At launch, AlwaysAllowBudgetChecker approves everything.
+        // Post-launch, this enforces summary-specific and time-window caps.
+        //
+        // Note: We pass purpose.name (e.g., "FILE_SUMMARY") so the real
+        // implementation can distinguish chat vs summary budgets and apply
+        // the appropriate cap from BudgetConfig (chatTokenCap vs summaryTokenCap).
+        val budgetChecker = project.getService(BudgetChecker::class.java)
+        val budgetStatus = budgetChecker.check(
+            purpose = purpose.name,
+            providerId = provider.id,
+            estimatedTokens = null  // TODO: estimate from content.length when Pricing Module ships
+        )
+
+        Dev.info(log, "summarization.budget_check",
+            "purpose" to purpose.name,
+            "providerId" to provider.id,
+            "allowed" to budgetStatus.allowed,
+            "warning" to budgetStatus.warning
+        )
+
+        if (!budgetStatus.allowed) {
+            // Return an error result instead of calling the AI provider.
+            // The pipeline can inspect isError and decide whether to retry,
+            // queue for later, or surface the message to the user.
+            return SummarizationResult(
+                summaryText = "",
+                isError = true,
+                errorMessage = budgetStatus.reason ?: "Budget limit reached.",
+                exchangeId = "",  // No exchange created — call was blocked
+                tokenUsage = null,
+                metadata = metadata
+            )
+        }
+
         // Call the AI provider (HTTP only — provider returns ProviderResponse)
         val response = provider.summarize(effectivePrompt)
 
@@ -159,7 +196,7 @@ class SummarizationService(
                 id = response.exchangeId,
                 timestamp = Instant.now(),
                 providerId = provider.id,
-                modelId = provider.displayName,
+                modelId = provider.displayName, // BUG (post-launch backlog #1): stores profile display name, not provider-reported model name
                 purpose = purpose,
                 request = ExchangeRequest(
                     input = response.prompt,
@@ -190,6 +227,11 @@ class SummarizationService(
      * Index token usage from the summary response.
      */
     private suspend fun indexTokens(response: ProviderResponse) {
+        // NOTE: This reads from response.parsed.metadata.tokenUsage (the provider's
+        // metadata block), while summarize() reads response.parsed.tokenUsage (the
+        // parsed result's direct field). These may come from different extraction
+        // paths depending on the provider. Both should contain the same data —
+        // if they diverge, investigate the provider's response parser.
         val usage = response.parsed.metadata.tokenUsage ?: return
 
         try {

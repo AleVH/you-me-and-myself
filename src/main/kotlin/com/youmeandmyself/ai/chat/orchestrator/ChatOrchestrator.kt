@@ -7,11 +7,10 @@ import com.youmeandmyself.ai.chat.conversation.ConversationManager
 import com.youmeandmyself.ai.providers.AiProvider
 import com.youmeandmyself.ai.providers.ProviderRegistry
 import com.youmeandmyself.ai.providers.ProviderResponse
-import com.youmeandmyself.ai.providers.parsing.Confidence
-import com.youmeandmyself.ai.providers.parsing.ParseStrategy
 import com.youmeandmyself.ai.providers.parsing.ui.CorrectionFlowHelper
 import com.youmeandmyself.ai.settings.AiProfilesState
 import com.youmeandmyself.dev.Dev
+import com.youmeandmyself.budget.BudgetChecker
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.storage.model.AiExchange
 import com.youmeandmyself.storage.model.DerivedMetadata
@@ -198,6 +197,32 @@ class ChatOrchestrator(
                 "contextTimeMs" to assembled.contextTimeMs
             )
 
+            // ── Step 3B: Budget check ────────────────────────────────────
+            // Gate every AI call through the budget checker. At launch
+            // (Individual Basic), AlwaysAllowBudgetChecker approves everything.
+            // Post-launch, the real implementation enforces session/daily/monthly caps.
+            // This check MUST happen after prompt assembly (so we have the provider)
+            // but BEFORE the HTTP call (so we can abort cheaply).
+            val budgetChecker = project.getService(BudgetChecker::class.java)
+            val budgetStatus = budgetChecker.check(
+                purpose = "CHAT",
+                providerId = provider.id,
+                estimatedTokens = null  // Chat messages: can't predict token count pre-call
+            )
+
+            Dev.info(log, "orchestrator.budget_check",
+                "purpose" to "CHAT",
+                "providerId" to provider.id,
+                "allowed" to budgetStatus.allowed,
+                "warning" to budgetStatus.warning
+            )
+
+            if (!budgetStatus.allowed) {
+                return ChatResult.error(
+                    budgetStatus.reason ?: "Budget limit reached. Check your budget settings."
+                )
+            }
+
             // ── Step 4: Call AI provider (HTTP only) ─────────────────
             // Timer brackets the HTTP call so MetricsService can record
             // wall-clock response time. This measures the full round-trip:
@@ -230,7 +255,7 @@ class ChatOrchestrator(
             indexDerivedMetadata(response)
             indexIdeContext(response.exchangeId, ideContext)
 
-            // ── Step 7: Correction flow ──────────────────────────────
+            // ── Step 8: Correction flow ──────────────────────────────
             // Clear any previous correction context (new message = new state)
             correctionHelper.clearCorrectionContext()
 
@@ -252,7 +277,7 @@ class ChatOrchestrator(
                 exchangeId = response.exchangeId,
                 conversationId = conversationId,
                 tokenUsage = tokenUsage,
-                modelId = modelId ?: provider.displayName,
+                modelId = modelId ?: provider.displayName, // BUG (post-launch backlog #1): fallback uses display name, not model ID
                 correctionAvailable = correctionAvailable,
                 parseStrategy = response.parsed.metadata.parseStrategy,
                 confidence = response.parsed.metadata.confidence,
@@ -461,7 +486,7 @@ class ChatOrchestrator(
                 id = response.exchangeId,
                 timestamp = Instant.now(),
                 providerId = provider.id,
-                modelId = provider.displayName, // TODO: use actual model from profile
+                modelId = provider.displayName, // BUG (post-launch backlog #1): stores profile display name, not provider-reported model name. Fix at ingest time.
                 purpose = purpose,
                 request = ExchangeRequest(
                     input = response.prompt,
