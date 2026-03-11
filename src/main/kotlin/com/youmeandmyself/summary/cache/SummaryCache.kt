@@ -7,8 +7,11 @@ import com.intellij.openapi.project.Project
 import com.youmeandmyself.dev.Dev
 import java.nio.file.Files
 import java.nio.file.Path
+import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
 /**
@@ -17,7 +20,9 @@ import kotlin.math.min
  * ## Purpose
  *
  * Pure cache layer — no AI calls, no config checks, no pipeline logic.
- * Provides nanosecond lookups for summaries during context assembly.
+ * Provides nanosecond lookups for summaries during context assembly,
+ * and manages the summary lifecycle state machine to prevent duplicate
+ * AI calls via single-flight claims.
  *
  * ## Three-Layer Storage Model
  *
@@ -30,15 +35,28 @@ import kotlin.math.min
  * Write path: SummarizationService persists to JSONL + SQLite → updates this cache
  * Startup: warm from SQLite on first access
  *
- * ## Staleness
+ * ## State Machine
  *
- * A summary is "stale" when the file's content hash has changed since summarization.
- * Stale summaries are still returned (better than nothing) but marked as stale
- * so the prompt can annotate them as "may be outdated."
+ * Each entry tracks a [SummaryState]:
+ * - MISSING → no summary, any caller may claim
+ * - GENERATING → claim held, AI call in progress, other callers wait
+ * - READY → summary available
+ * - INVALIDATED → summary exists but code changed, stale synopsis still returned
+ *
+ * See [SummaryState] for the full transition diagram.
+ *
+ * ## Single-Flight Claims
+ *
+ * When a caller wants to generate a summary:
+ * 1. [tryClaim] atomically sets state to GENERATING if eligible
+ * 2. Other callers calling [awaitResult] get a CompletableFuture that resolves
+ *    when the generating caller calls [completeClaim] or [failClaim]
+ * 3. TTL on claims prevents permanent locks from crashes
  *
  * ## Thread Safety
  *
- * All state is in a ConcurrentHashMap. All public methods are safe from any thread.
+ * All state is in ConcurrentHashMaps. All public methods are safe from any thread.
+ * State transitions use [ConcurrentHashMap.compute] for atomicity.
  *
  * @param project The IntelliJ project this cache belongs to
  */
@@ -49,19 +67,42 @@ class SummaryCache(private val project: Project) {
 
     /**
      * A cached entry for a file's summary data.
+     *
+     * @param state Current lifecycle state (see [SummaryState])
+     * @param claimedAt When the GENERATING claim was made (for TTL expiry)
+     * @param dirtyDuringGeneration If true, the file changed while generation was
+     *        in progress. The result will be immediately marked INVALIDATED on completion.
      */
     data class Entry(
         val path: String,
         val languageId: String?,
+        val state: SummaryState = SummaryState.MISSING,
         val summaryVersion: Int = 1,
         val contentHashAtSummary: String? = null,
         val lastSummarizedAt: Instant? = null,
         val headerSample: String? = null,
-        val modelSynopsis: String? = null
+        val modelSynopsis: String? = null,
+        val claimedAt: Instant? = null,
+        val dirtyDuringGeneration: Boolean = false
     )
 
     /** In-memory cache of summaries, keyed by file path. */
     private val entries = ConcurrentHashMap<String, Entry>()
+
+    /**
+     * Futures for in-flight generation — keyed by file path.
+     * Created when a claim is made, completed when generation finishes or fails.
+     * Secondary callers await these instead of duplicating the AI call.
+     */
+    private val inflightFutures = ConcurrentHashMap<String, CompletableFuture<String?>>()
+
+    /**
+     * Default TTL for GENERATING claims (seconds).
+     * If generation hasn't completed within this time, the claim expires
+     * and state resets to MISSING. Generous default for large files on slow providers.
+     */
+    @Volatile
+    var claimTtlSeconds: Long = 120L
 
     // ==================== Read API ====================
 
@@ -72,18 +113,55 @@ class SummaryCache(private val project: Project) {
      * If the cache doesn't have it, returns (null, false) — caller should
      * check SQLite next via LocalSummaryStoreProvider.
      *
+     * State-aware behavior:
+     * - READY: returns synopsis, stale=false (unless hash mismatch)
+     * - INVALIDATED: returns synopsis, stale=true
+     * - GENERATING: returns null (summary not yet available)
+     * - MISSING: returns null
+     *
      * @param path Absolute file path
      * @param currentContentHash Current hash of file content (for staleness check). Null = skip staleness check.
      * @return Pair of (synopsis text or null, is stale flag)
      */
     fun getCachedSynopsis(path: String, currentContentHash: String?): Pair<String?, Boolean> {
-        val current = entries[path]
+        val current = entries[path] ?: return null to false
 
-        val isStale = currentContentHash != null &&
-                current?.contentHashAtSummary != null &&
-                current.contentHashAtSummary != currentContentHash
+        return when (current.state) {
+            SummaryState.MISSING -> null to false
 
-        return current?.modelSynopsis to isStale
+            SummaryState.GENERATING -> null to false
+
+            SummaryState.READY -> {
+                val isStale = currentContentHash != null &&
+                        current.contentHashAtSummary != null &&
+                        current.contentHashAtSummary != currentContentHash
+                current.modelSynopsis to isStale
+            }
+
+            SummaryState.INVALIDATED -> {
+                // Stale summary — still return it, but flag as stale
+                current.modelSynopsis to true
+            }
+        }
+    }
+
+    /**
+     * Get the current state for a file's summary entry.
+     * Returns MISSING if no entry exists.
+     *
+     * Performs lazy TTL check: if GENERATING and claim has expired,
+     * resets to MISSING and unblocks waiters.
+     */
+    fun getState(path: String): SummaryState {
+        val entry = entries[path] ?: return SummaryState.MISSING
+
+        // Lazy TTL check: if GENERATING and claim has expired, reset to MISSING
+        if (entry.state == SummaryState.GENERATING && isClaimExpired(entry)) {
+            expireClaim(path)
+            return SummaryState.MISSING
+        }
+
+        return entry.state
     }
 
     /**
@@ -116,10 +194,193 @@ class SummaryCache(private val project: Project) {
         }
 
         val sample = computeHeaderSample(path, maxChars)
-        val updated = (current ?: Entry(path, languageId)).copy(headerSample = sample)
+        val updated = (current ?: Entry(path = path, languageId = languageId)).copy(
+            headerSample = sample
+        )
         entries[path] = updated
 
         return sample to (sample?.length ?: 0)
+    }
+
+    // ==================== Single-Flight Claims ====================
+
+    /**
+     * Attempt to claim a file for summary generation.
+     *
+     * Atomically transitions the entry to GENERATING if the file is eligible
+     * (state is MISSING, INVALIDATED, or GENERATING with expired TTL).
+     *
+     * Creates a CompletableFuture that secondary callers can await via [awaitResult].
+     *
+     * @param path Absolute file path
+     * @param languageId Programming language (preserved in entry)
+     * @return true if claim was acquired, false if already GENERATING (active) or READY
+     */
+    fun tryClaim(path: String, languageId: String?): Boolean {
+        var claimed = false
+
+        entries.compute(path) { _, curr ->
+            val now = Instant.now()
+
+            when {
+                // No entry — create one in GENERATING state
+                curr == null -> {
+                    claimed = true
+                    Entry(
+                        path = path,
+                        languageId = languageId,
+                        state = SummaryState.GENERATING,
+                        claimedAt = now
+                    )
+                }
+
+                // MISSING or INVALIDATED — eligible for claim
+                curr.state == SummaryState.MISSING || curr.state == SummaryState.INVALIDATED -> {
+                    claimed = true
+                    curr.copy(
+                        state = SummaryState.GENERATING,
+                        claimedAt = now,
+                        dirtyDuringGeneration = false
+                    )
+                }
+
+                // GENERATING but claim has expired — take over
+                curr.state == SummaryState.GENERATING && isClaimExpired(curr) -> {
+                    // Fail the old future so any waiters unblock
+                    inflightFutures.remove(path)?.complete(null)
+
+                    claimed = true
+                    curr.copy(
+                        claimedAt = now,
+                        dirtyDuringGeneration = false
+                    )
+                }
+
+                // GENERATING (active) or READY — cannot claim
+                else -> {
+                    claimed = false
+                    curr
+                }
+            }
+        }
+
+        if (claimed) {
+            // Create the future that waiters will subscribe to
+            inflightFutures[path] = CompletableFuture()
+
+            Dev.info(log, "cache.claimed",
+                "path" to path,
+                "ttlSeconds" to claimTtlSeconds
+            )
+        }
+
+        return claimed
+    }
+
+    /**
+     * Wait for an in-flight generation to complete.
+     *
+     * Called by secondary callers that find the state is GENERATING.
+     * Returns the synopsis when the generating caller completes, or null on timeout.
+     *
+     * @param path Absolute file path
+     * @param timeoutMs Maximum time to wait in milliseconds
+     * @return The generated synopsis, or null if timed out or generation failed
+     */
+    fun awaitResult(path: String, timeoutMs: Long): String? {
+        val future = inflightFutures[path] ?: return null
+
+        return try {
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: Throwable) {
+            // Timeout or interruption — caller can decide to retry later
+            null
+        }
+    }
+
+    /**
+     * Complete a successful generation claim.
+     *
+     * Transitions state to READY (or INVALIDATED if the file changed during generation),
+     * updates the synopsis, and broadcasts the result to any waiters.
+     *
+     * Replaces the old [updateSynopsis] for pipeline-generated summaries.
+     *
+     * @param path Absolute file path
+     * @param languageId Programming language
+     * @param synopsis The AI-generated summary text
+     * @param contentHash The content hash at the time of summarization
+     */
+    fun completeClaim(
+        path: String,
+        languageId: String?,
+        synopsis: String,
+        contentHash: String?
+    ) {
+        val now = Instant.now()
+        var wasDirty = false
+
+        entries.compute(path) { _, curr ->
+            if (curr == null) {
+                // Entry disappeared during generation (file deleted?) — create a READY entry anyway
+                Entry(
+                    path = path,
+                    languageId = languageId,
+                    state = SummaryState.READY,
+                    modelSynopsis = synopsis,
+                    contentHashAtSummary = contentHash,
+                    lastSummarizedAt = now
+                )
+            } else {
+                wasDirty = curr.dirtyDuringGeneration
+                curr.copy(
+                    // If file changed during generation, mark as INVALIDATED immediately
+                    state = if (wasDirty) SummaryState.INVALIDATED else SummaryState.READY,
+                    modelSynopsis = synopsis,
+                    contentHashAtSummary = contentHash,
+                    lastSummarizedAt = now,
+                    claimedAt = null,
+                    dirtyDuringGeneration = false
+                )
+            }
+        }
+
+        // Broadcast result to waiters
+        inflightFutures.remove(path)?.complete(synopsis)
+
+        Dev.info(log, "cache.claim_completed",
+            "path" to path,
+            "synopsisLength" to synopsis.length,
+            "wasDirty" to wasDirty,
+            "resultState" to if (wasDirty) "INVALIDATED" else "READY"
+        )
+    }
+
+    /**
+     * Fail a generation claim (error or timeout).
+     *
+     * Resets state to MISSING (or INVALIDATED if there was a previous synopsis),
+     * and broadcasts null to any waiters so they unblock.
+     *
+     * @param path Absolute file path
+     */
+    fun failClaim(path: String) {
+        entries.compute(path) { _, curr ->
+            if (curr == null) return@compute null
+
+            curr.copy(
+                // If we had a synopsis before, go to INVALIDATED so the stale one is still usable.
+                // If no previous synopsis, go to MISSING.
+                state = if (curr.modelSynopsis != null) SummaryState.INVALIDATED else SummaryState.MISSING,
+                claimedAt = null,
+                dirtyDuringGeneration = false
+            )
+        }
+
+        // Unblock waiters with null (generation failed)
+        inflightFutures.remove(path)?.complete(null)
+
+        Dev.info(log, "cache.claim_failed", "path" to path)
     }
 
     // ==================== Write API ====================
@@ -127,7 +388,8 @@ class SummaryCache(private val project: Project) {
     /**
      * Update the cache with a newly generated summary.
      *
-     * Called by SummaryPipeline after SummarizationService successfully generates a summary.
+     * Called by non-pipeline paths (e.g., storage warm-up corrections).
+     * For pipeline-generated summaries, use [completeClaim] instead.
      *
      * @param path Absolute file path
      * @param languageId Programming language
@@ -144,9 +406,12 @@ class SummaryCache(private val project: Project) {
         entries.compute(path) { _, curr ->
             val base = curr ?: Entry(path = path, languageId = languageId)
             base.copy(
+                state = SummaryState.READY,
                 modelSynopsis = synopsis,
                 contentHashAtSummary = contentHash,
-                lastSummarizedAt = now
+                lastSummarizedAt = now,
+                claimedAt = null,
+                dirtyDuringGeneration = false
             )
         }
 
@@ -179,6 +444,7 @@ class SummaryCache(private val project: Project) {
         entries.putIfAbsent(path, Entry(
             path = path,
             languageId = languageId,
+            state = SummaryState.READY,
             modelSynopsis = synopsis,
             contentHashAtSummary = contentHash,
             lastSummarizedAt = summarizedAt
@@ -191,38 +457,61 @@ class SummaryCache(private val project: Project) {
      * Update staleness tracking when a file's content changes.
      *
      * Called by VfsSummaryWatcher when it detects file modifications.
+     *
+     * State transitions:
+     * - READY → INVALIDATED (code changed, summary is stale)
+     * - GENERATING → stays GENERATING but sets dirtyDuringGeneration=true
+     *   (don't interrupt in-progress generation; result will be marked INVALIDATED on completion)
+     * - MISSING → no-op (nothing to invalidate)
+     * - INVALIDATED → no-op (already stale)
+     *
      * The summary isn't deleted — stale summaries are still useful.
-     * Marks the entry as stale by clearing the contentHashAtSummary
-     * so the next getCachedSynopsis() call with the new hash will
-     * detect the mismatch.
      *
      * @param path Absolute file path
      * @param newHash The new content hash from VfsSummaryWatcher
      */
     fun onHashChange(path: String, newHash: String) {
-        val current = entries[path] ?: return
+        entries.compute(path) { _, curr ->
+            if (curr == null) return@compute null
 
-        // If the hash matches what we have, file hasn't actually changed
-        // (e.g., save without modification)
-        if (current.contentHashAtSummary == newHash) return
+            // If the hash matches, file hasn't actually changed (e.g., save without modification)
+            if (curr.contentHashAtSummary == newHash) return@compute curr
 
-        // Don't clear the synopsis — stale is better than nothing.
-        // The staleness is detected by getCachedSynopsis() when it
-        // compares currentContentHash with contentHashAtSummary.
-        Dev.info(log, "cache.stale",
-            "path" to path,
-            "oldHash" to (current.contentHashAtSummary?.take(8) ?: "NONE"),
-            "newHash" to newHash.take(8)
-        )
+            when (curr.state) {
+                SummaryState.READY -> {
+                    Dev.info(log, "cache.stale",
+                        "path" to path,
+                        "oldHash" to (curr.contentHashAtSummary?.take(8) ?: "NONE"),
+                        "newHash" to newHash.take(8)
+                    )
+                    curr.copy(state = SummaryState.INVALIDATED)
+                }
+
+                SummaryState.GENERATING -> {
+                    // Don't interrupt generation — mark dirty so completeClaim
+                    // will set the result to INVALIDATED instead of READY
+                    Dev.info(log, "cache.dirty_during_generation",
+                        "path" to path,
+                        "newHash" to newHash.take(8)
+                    )
+                    curr.copy(dirtyDuringGeneration = true)
+                }
+
+                // MISSING or INVALIDATED — nothing to do
+                else -> curr
+            }
+        }
     }
 
     // ==================== Cleanup ====================
 
     /**
      * Remove all cached data for a deleted file.
+     * Also fails any in-flight claim so waiters unblock.
      */
     fun onFileDeleted(path: String) {
         entries.remove(path)
+        inflightFutures.remove(path)?.complete(null)
         Dev.info(log, "cache.removed", "path" to path)
     }
 
@@ -235,14 +524,53 @@ class SummaryCache(private val project: Project) {
 
     /**
      * Clear the entire cache. Used for testing or full reset.
+     * Also fails all in-flight claims.
      */
     fun clear() {
         val size = entries.size
         entries.clear()
+
+        // Unblock all waiters
+        inflightFutures.values.forEach { it.complete(null) }
+        inflightFutures.clear()
+
         Dev.info(log, "cache.cleared", "entriesRemoved" to size)
     }
 
-    // ==================== Helpers ====================
+    // ==================== TTL Helpers ====================
+
+    /**
+     * Check if a GENERATING claim has exceeded its TTL.
+     */
+    private fun isClaimExpired(entry: Entry): Boolean {
+        val claimed = entry.claimedAt ?: return true // No timestamp = treat as expired
+        return Duration.between(claimed, Instant.now()).seconds >= claimTtlSeconds
+    }
+
+    /**
+     * Expire a stale GENERATING claim — reset to MISSING/INVALIDATED and unblock waiters.
+     * Called lazily from [getState] when a TTL violation is detected.
+     */
+    private fun expireClaim(path: String) {
+        entries.compute(path) { _, curr ->
+            if (curr == null || curr.state != SummaryState.GENERATING) return@compute curr
+
+            Dev.info(log, "cache.claim_expired",
+                "path" to path,
+                "claimedAt" to curr.claimedAt.toString()
+            )
+
+            curr.copy(
+                state = if (curr.modelSynopsis != null) SummaryState.INVALIDATED else SummaryState.MISSING,
+                claimedAt = null,
+                dirtyDuringGeneration = false
+            )
+        }
+
+        inflightFutures.remove(path)?.complete(null)
+    }
+
+    // ==================== File Helpers ====================
 
     /**
      * Read the first N characters of a file.
@@ -294,6 +622,8 @@ class SummaryCache(private val project: Project) {
      * or an initializer) provides the data — SummaryCache doesn't know
      * where it came from.
      *
+     * All warmed entries arrive as READY — they have valid summaries from storage.
+     *
      * @param summaries Map of filePath → Entry data from storage
      */
     fun warmFromStorage(summaries: Map<String, Entry>) {
@@ -301,7 +631,13 @@ class SummaryCache(private val project: Project) {
         synchronized(this) {
             if (warmedFromStorage) return
             for ((path, entry) in summaries) {
-                entries.putIfAbsent(path, entry)
+                // Ensure warmed entries have READY state
+                val readyEntry = if (entry.state != SummaryState.READY) {
+                    entry.copy(state = SummaryState.READY)
+                } else {
+                    entry
+                }
+                entries.putIfAbsent(path, readyEntry)
             }
             warmedFromStorage = true
             Dev.info(log, "cache.warmed", "entries" to summaries.size)

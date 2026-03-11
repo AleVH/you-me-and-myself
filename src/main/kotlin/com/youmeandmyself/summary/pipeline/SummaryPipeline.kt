@@ -7,6 +7,7 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.summary.cache.SummaryCache
+import com.youmeandmyself.summary.cache.SummaryState
 import com.youmeandmyself.summary.config.ConfigChangeListener
 import com.youmeandmyself.summary.config.SummaryConfig
 import com.youmeandmyself.summary.config.SummaryConfigService
@@ -35,7 +36,8 @@ import kotlinx.coroutines.launch
  * - Evaluates whether a file should be summarized (kill switch, mode, budget, scope, dry-run)
  * - Manages the [SummaryQueue] for ordered, deduplicated processing
  * - Processes queue items by delegating to [SummarizationService]
- * - Updates [SummaryCache] after successful generation
+ * - Uses single-flight claims via [SummaryCache] to prevent duplicate AI calls
+ * - Updates [SummaryCache] after successful generation via [SummaryCache.completeClaim]
  * - Reacts to config changes (kill switch off → cancel all queued work)
  *
  * ## What This Class Does NOT Do
@@ -99,8 +101,9 @@ class SummaryPipeline(private val project: Project) : Disposable {
      *
      * 1. Check SummaryCache for cached synopsis
      * 2. If cache hit: return it (even if stale)
-     * 3. If cache miss + autoGenerate: evaluate config and potentially enqueue
-     * 4. Return (null, false) if nothing available
+     * 3. If state is GENERATING: don't re-enqueue, return null (caller can await if needed)
+     * 4. If cache miss + autoGenerate: evaluate config and potentially enqueue
+     * 5. Return (null, false) if nothing available
      *
      * @param path Absolute file path
      * @param languageId Programming language (for prompt customization)
@@ -129,6 +132,13 @@ class SummaryPipeline(private val project: Project) : Disposable {
         // If we have a synopsis, return it (even if stale)
         if (synopsis != null) {
             return synopsis to isStale
+        }
+
+        // If already generating, don't re-enqueue — avoid duplicate work
+        val state = cache.getState(path)
+        if (state == SummaryState.GENERATING) {
+            Dev.info(log, "pipeline.already_generating", "path" to path)
+            return null to false
         }
 
         // Evaluate whether we should enqueue generation
@@ -177,16 +187,20 @@ class SummaryPipeline(private val project: Project) : Disposable {
      * @param newHash New content hash
      */
     fun onFileChanged(path: String, newHash: String) {
-        // Update cache staleness
+        // Update cache staleness (handles READY → INVALIDATED and GENERATING dirty flag)
         cache.onHashChange(path, newHash)
 
         // Optionally enqueue a staleness refresh if in SMART_BACKGROUND mode
         val config = configService.getConfig()
         if (config.isActive && config.mode == SummaryMode.SMART_BACKGROUND && config.hasBudget) {
-            // Only re-enqueue if we had a summary for this file before
-            val (existing, _) = cache.getCachedSynopsis(path, newHash)
-            if (existing != null) {
-                evaluateAndEnqueue(path, null, newHash, SummaryTrigger.STALENESS_REFRESH)
+            // Only re-enqueue if the file is INVALIDATED (had a summary, now stale)
+            // and not currently being generated
+            val state = cache.getState(path)
+            if (state == SummaryState.INVALIDATED) {
+                val (existing, _) = cache.getCachedSynopsis(path, newHash)
+                if (existing != null) {
+                    evaluateAndEnqueue(path, null, newHash, SummaryTrigger.STALENESS_REFRESH)
+                }
             }
         }
     }
@@ -351,31 +365,57 @@ class SummaryPipeline(private val project: Project) : Disposable {
     /**
      * Execute summarization by delegating to SummarizationService.
      *
+     * Uses single-flight claims to prevent duplicate AI calls:
+     * 1. tryClaim() — if already GENERATING, await the result instead
+     * 2. On success → completeClaim() (sets READY, broadcasts to waiters)
+     * 3. On failure → failClaim() (resets state, unblocks waiters)
+     *
      * This is the ONLY place where summarization actually happens.
      * SummarizationService handles: prompt building, provider call,
      * JSONL persistence, SQLite persistence, token indexing.
-     *
-     * After success, this method updates SummaryCache so the result
-     * is available for immediate reads.
      */
     private suspend fun executeSummarization(request: SummaryRequest) {
         val path = request.filePath
         val languageId = request.languageId
 
+        // --- Single-flight claim ---
+        val claimed = cache.tryClaim(path, languageId)
+        if (!claimed) {
+            // Another coroutine is already generating this file.
+            // Await its result instead of making a duplicate AI call.
+            Dev.info(log, "pipeline.awaiting_inflight", "path" to path)
+            val result = cache.awaitResult(path, cache.claimTtlSeconds * 1000)
+            if (result != null) {
+                Dev.info(log, "pipeline.inflight_result_received",
+                    "path" to path,
+                    "synopsisLength" to result.length
+                )
+            } else {
+                Dev.info(log, "pipeline.inflight_result_timeout", "path" to path)
+            }
+            return
+        }
+
+        // --- We hold the claim — proceed with generation ---
         try {
             // Get the summary provider
             val provider = com.youmeandmyself.ai.providers.ProviderRegistry.selectedSummaryProvider(project)
             if (provider == null) {
                 Dev.warn(log, "pipeline.no_provider", null, "path" to path)
+                cache.failClaim(path)
                 return
             }
 
             // Get source text for the prompt
             val (headerSample, _) = cache.ensureHeaderSample(path, languageId, 1_500)
-            val sourceText = headerSample ?: return
+            val sourceText = headerSample ?: run {
+                cache.failClaim(path)
+                return
+            }
 
             if (sourceText.isBlank()) {
                 Dev.warn(log, "pipeline.empty_source", null, "path" to path)
+                cache.failClaim(path)
                 return
             }
 
@@ -415,8 +455,8 @@ class SummaryPipeline(private val project: Project) : Disposable {
                     .trim()
                     .let { if (it.startsWith("Summary: ", ignoreCase = true)) it.substringAfter(": ").trim() else it }
 
-                // Update the in-memory cache
-                cache.updateSynopsis(
+                // Complete the claim — sets READY (or INVALIDATED if dirty), broadcasts to waiters
+                cache.completeClaim(
                     path = path,
                     languageId = languageId,
                     synopsis = cleanSummary,
@@ -438,10 +478,12 @@ class SummaryPipeline(private val project: Project) : Disposable {
                     "path" to path,
                     "error" to (result.errorMessage ?: "empty summary")
                 )
+                cache.failClaim(path)
             }
 
         } catch (e: Throwable) {
             Dev.warn(log, "pipeline.error", e, "path" to path)
+            cache.failClaim(path)
         }
     }
 
