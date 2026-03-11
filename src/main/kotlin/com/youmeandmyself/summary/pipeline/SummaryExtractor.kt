@@ -19,7 +19,7 @@ import kotlinx.serialization.json.*
  * ## Why Separate From SummaryStore?
  *
  * Separation of concerns:
- * - SummaryStore: orchestration (when to summarize, caching, staleness)
+ * - SummaryPipeline: orchestration (when to summarize, caching, staleness)
  * - SummaryExtractor: the "how" of summarization (prompts, extraction)
  *
  * This makes both classes easier to test and modify independently.

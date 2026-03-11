@@ -97,7 +97,7 @@
         <postStartupActivity implementation="com.youmeandmyself.storage.StorageInitializer"/>
 
         <!-- Summarization: config, cache, pipeline, file-change watcher -->
-        <projectService serviceImplementation="com.youmeandmyself.context.summary.config.SummaryConfigService"/>
+        <projectService serviceImplementation="com.youmeandmyself.summary.config.SummaryConfigService"/>
         <projectService serviceImplementation="com.youmeandmyself.summary.cache.SummaryCache"/>
         <projectService serviceImplementation="com.youmeandmyself.summary.pipeline.SummaryPipeline"/>
         <projectService serviceImplementation="com.youmeandmyself.summary.watcher.VfsSummaryWatcher"/>

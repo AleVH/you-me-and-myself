@@ -9,7 +9,7 @@ import java.time.Instant
  *
  * Centralizes all summary config types in one place. These are used by:
  * - SummaryConfigService (reads/writes config)
- * - SummaryStore (checks before summarizing)
+ * - SummaryPipeline (checks config before summarizing)
  * - SummaryConfigurable (settings UI)
  * - SummaryCommandHandler (slash commands)
  * - SummaryQueue (queue management)

@@ -1,4 +1,3 @@
-// File: src/main/kotlin/com/youmeandmyself/context/orchestrator/VfsSummaryWatcher.kt
 package com.youmeandmyself.summary.watcher
 
 import com.intellij.openapi.components.Service
@@ -24,7 +23,7 @@ import java.security.MessageDigest
 /**
  * Project-level VFS watcher that keeps summary cache and pipeline in sync with file changes.
  *
- * ## ResponsibilitiesF
+ * ## Responsibilities
  *
  * - Listen to VFS events (create, content change, move/rename, delete)
  * - Compute a stable content hash for changed files (cheap SHA-256 streaming)
