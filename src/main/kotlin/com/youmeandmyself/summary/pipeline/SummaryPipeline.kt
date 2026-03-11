@@ -54,6 +54,13 @@ import kotlinx.coroutines.launch
  *
  * There is NO direct provider.summarize() call in this class.
  *
+ * ## Queue Processing
+ *
+ * The queue is processed sequentially — one item at a time. After each item
+ * completes (success or failure), [processNextInQueue] re-triggers itself to
+ * drain remaining items. This ensures the queue doesn't go dead after the
+ * first item.
+ *
  * @param project The IntelliJ project this pipeline belongs to
  */
 @Service(Service.Level.PROJECT)
@@ -332,6 +339,16 @@ class SummaryPipeline(private val project: Project) : Disposable {
      * Launches a coroutine to handle the actual summarization.
      * Re-checks kill switch, dry-run, and budget before executing
      * (these could have changed between enqueue and processing).
+     *
+     * ## Queue Drain
+     *
+     * After each item completes (success or failure), this method calls itself
+     * again to process the next item. This ensures the entire queue is drained
+     * sequentially. Processing stops when the queue is empty or when config
+     * checks (kill switch, budget) prevent further execution.
+     *
+     * Previous bug: this method was only called once per enqueue, so if
+     * multiple items were queued, only the first one ever got processed.
      */
     private fun processNextInQueue() {
         scope.launch {
@@ -348,6 +365,8 @@ class SummaryPipeline(private val project: Project) : Disposable {
             if (configService.isDryRun()) {
                 Dev.info(log, "pipeline.process.dryrun_skip",
                     "path" to request.filePath)
+                // Still drain the queue — dry-run items should be skipped, not block others
+                processNextInQueue()
                 return@launch
             }
 
@@ -358,7 +377,13 @@ class SummaryPipeline(private val project: Project) : Disposable {
                 return@launch
             }
 
-            executeSummarization(request)
+            try {
+                executeSummarization(request)
+            } finally {
+                // QUEUE DRAIN: After each item completes (success or failure),
+                // process the next one. This ensures the queue doesn't go dead.
+                processNextInQueue()
+            }
         }
     }
 

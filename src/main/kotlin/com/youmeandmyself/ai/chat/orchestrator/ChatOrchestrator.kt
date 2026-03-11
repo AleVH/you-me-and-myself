@@ -780,7 +780,11 @@ class ChatOrchestrator(
         ): ChatOrchestrator {
             return ChatOrchestrator(
                 project = project,
-                contextAssembler = ContextAssembler(project, summaryStore),
+                contextAssembler = ContextAssembler(
+                    project,
+                    summaryStore,
+                    com.youmeandmyself.summary.config.SummaryConfigService.getInstance(project)
+                ),
                 correctionHelper = correctionHelper,
                 conversationManager = ConversationManager.getInstance(project),
                 storage = LocalStorageFacade.getInstance(project)

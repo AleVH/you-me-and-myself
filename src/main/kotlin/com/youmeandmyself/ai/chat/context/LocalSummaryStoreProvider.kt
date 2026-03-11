@@ -4,6 +4,8 @@ import com.intellij.openapi.project.Project
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.summary.cache.SummaryCache
+import com.youmeandmyself.summary.config.SummaryConfigService
+import com.youmeandmyself.summary.config.SummaryMode
 import com.youmeandmyself.summary.pipeline.SummaryPipeline
 import java.time.Instant
 
@@ -33,6 +35,13 @@ import java.time.Instant
  * before querying. If storage isn't ready yet (IDE just started, initializer hasn't
  * finished), methods return null/empty gracefully.
  *
+ * ## Summary Generation Gating (Defense-in-Depth)
+ *
+ * [suggestSummarization] checks [SummaryConfigService] before enqueuing work.
+ * This is a safety net — the caller ([ContextAssembler]) also checks config before
+ * calling. Double-gating ensures that even if a future caller forgets the check,
+ * no unsanctioned work runs.
+ *
  * @param project The IntelliJ project for storage access
  */
 class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProvider {
@@ -49,6 +58,10 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
 
     private val pipeline: SummaryPipeline by lazy {
         SummaryPipeline.getInstance(project)
+    }
+
+    private val configService: SummaryConfigService by lazy {
+        SummaryConfigService.getInstance(project)
     }
 
     /**
@@ -305,21 +318,73 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
     /**
      * Suggest that a file should be summarized.
      *
+     * ## Defense-in-Depth Config Gate
+     *
+     * This method checks [SummaryConfigService] before enqueuing ANY work:
+     * - Kill switch off → no-op (logged)
+     * - Mode is OFF → no-op (logged)
+     * - Mode is ON_DEMAND or SMART_BACKGROUND → allowed (user has opted in)
+     * - Mode is SUMMARIZE_PATH → no-op (path-based mode has its own trigger)
+     *
+     * This gate exists as a safety net. The primary caller ([ContextAssembler])
+     * also checks config before calling this method. Double-gating ensures that
+     * even if a future caller forgets the check, no unsanctioned AI calls happen.
+     *
+     * ## Behavior When Allowed
+     *
      * For the individual tier, this is a fire-and-forget hint to the local
-     * summarization pipeline. The pipeline (CodeSummarizationPipeline) will
-     * decide whether to act based on its queue, budget, and configuration.
+     * summarization pipeline. The pipeline ([SummaryPipeline]) will further
+     * evaluate the request against budget, scope patterns, and dry-run mode
+     * before deciding whether to actually make an AI call.
      *
      * In company tier, this would also create a claim in the shared system.
+     *
+     * @param filePath The file that needs a summary
+     * @param projectId The project context
      */
     override suspend fun suggestSummarization(filePath: String, projectId: String) {
+        // Defense-in-depth: check config before enqueuing anything
+        val config = configService.getConfig()
+
+        if (!config.enabled) {
+            Dev.info(log, "summary_store.suggest_blocked",
+                "filePath" to filePath,
+                "reason" to "kill switch off"
+            )
+            return
+        }
+
+        when (config.mode) {
+            SummaryMode.OFF -> {
+                Dev.info(log, "summary_store.suggest_blocked",
+                    "filePath" to filePath,
+                    "reason" to "mode is OFF"
+                )
+                return
+            }
+            SummaryMode.SUMMARIZE_PATH -> {
+                Dev.info(log, "summary_store.suggest_blocked",
+                    "filePath" to filePath,
+                    "reason" to "SUMMARIZE_PATH has its own trigger"
+                )
+                return
+            }
+            SummaryMode.ON_DEMAND,
+            SummaryMode.SMART_BACKGROUND -> {
+                // Allowed — proceed to enqueue
+            }
+        }
+
         pipeline.requestSummary(
             path = filePath,
             languageId = null,
             currentContentHash = null
         )
+
         Dev.info(log, "summary_store.suggest",
             "filePath" to filePath,
             "projectId" to projectId,
+            "mode" to config.mode.name,
             "action" to "enqueued_via_pipeline"
         )
     }

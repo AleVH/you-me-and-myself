@@ -19,6 +19,8 @@ import com.youmeandmyself.context.orchestrator.detectors.ProjectStructureDetecto
 import com.youmeandmyself.context.orchestrator.detectors.RelevantFilesDetector
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.LocalStorageFacade
+import com.youmeandmyself.summary.config.SummaryConfigService
+import com.youmeandmyself.summary.config.SummaryMode
 import kotlinx.coroutines.CoroutineScope
 import java.nio.charset.Charset
 
@@ -41,16 +43,26 @@ import java.nio.charset.Charset
  * 2. **IDE context gathering**: Uses [ContextOrchestrator] to collect project language,
  *    frameworks, build system, and relevant files (with a time budget).
  *
- * 3. **Summary inclusion**: Reads code summaries from [SummaryStoreProvider] for relevant
- *    files. In individual tier, these are local summaries only. In company tier, this
- *    includes shared summaries from other team members.
+ * 3. **Summary enrichment** (READ PATH): For each file in the context bundle, checks
+ *    [SummaryStoreProvider] for an existing summary. If a summary exists AND is
+ *    meaningfully shorter than the raw content (saves tokens), replaces the raw entry
+ *    with the summary. If no summary exists and the file would benefit from one,
+ *    fires a generation suggestion (gated by [SummaryConfigService] — only when the
+ *    user has opted into automatic summarization).
  *
- * 4. **Claim coordination** (company tier): If a summary is missing and another developer
- *    is currently generating it, the assembler can wait briefly. If no one is generating,
- *    it signals the pipeline to start summarization (fire-and-forget).
- *
- * 5. **Prompt formatting**: Combines all context into a structured prompt with clear
+ * 4. **Prompt formatting**: Combines all context into a structured prompt with clear
  *    sections ([Context], [Files], etc.) that the AI can parse.
+ *
+ * ## Summary Philosophy
+ *
+ * Summaries are an **invisible optimization layer**. The user never sees summaries
+ * directly — they see the AI's response, which was informed by summaries instead of
+ * raw code. The plugin never wastes tokens when a summary offers a better option,
+ * but also never summarizes tiny files where the summary wouldn't save anything.
+ *
+ * The enrichment step is the READ PATH only. It checks for existing summaries and
+ * uses them. Generation suggestions are a lightweight side effect, gated by config,
+ * so that summaries get built up over time for next time.
  *
  * ## Conversation History
  *
@@ -65,12 +77,18 @@ import java.nio.charset.Charset
  *
  * @param project The IntelliJ project for IDE introspection
  * @param summaryStore Provider for reading code summaries (local or shared, based on tier)
+ * @param summaryConfig Summary configuration service for checking mode/enabled state.
+ *                       Used to gate summary generation suggestions — the read path
+ *                       (checking existing summaries) always runs regardless of config.
  */
 class ContextAssembler(
     private val project: Project,
-    private val summaryStore: SummaryStoreProvider
+    private val summaryStore: SummaryStoreProvider,
+    private val summaryConfig: SummaryConfigService
 ) {
     private val log = Dev.logger(ContextAssembler::class.java)
+
+
 
     // ── Public API ───────────────────────────────────────────────────────
 
@@ -80,7 +98,8 @@ class ContextAssembler(
      * This is the main entry point. It:
      * 1. Checks if context would be useful for this message
      * 2. If yes, gathers IDE context within a time budget
-     * 3. Formats everything into the final prompt string
+     * 3. Enriches files with summaries where beneficial
+     * 4. Formats everything into the final prompt string
      *
      * @param userInput The raw text the user typed
      * @param scope Coroutine scope for context gathering (respects cancellation)
@@ -120,18 +139,21 @@ class ContextAssembler(
             "timeMs" to metrics.totalMillis
         )
 
-        // Step 3.5: Enrich files with summaries where available
+        // Step 4: Enrich files with summaries where beneficial
+        // This is the READ PATH — checks for existing summaries and uses them
+        // when they save tokens. Also fires generation suggestions for missing
+        // summaries if the user has opted into automatic summarization.
         val enrichedBundle = enrichWithSummaries(bundle)
 
-        // Step 4: Format the context into a structured prompt section
+        // Step 5: Format the context into a structured prompt section
         val contextNote = formatContextNote(enrichedBundle)
         val manifest = enrichedBundle.manifestLine()
         val filesBlock = enrichedBundle.filesSection()
 
-        // Step 5: If the user refers to "this file", include the full file content
+        // Step 6: If the user refers to "this file", include the full file content
         val fileBlock = buildCurrentFileBlock(userInput, editorFile)
 
-        // Step 6: Assemble the final prompt with all context sections
+        // Step 7: Assemble the final prompt with all context sections
         val effectivePrompt = buildString {
             appendLine(contextNote)
             appendLine(manifest)
@@ -286,24 +308,41 @@ class ContextAssembler(
         return orchestrator.gather(request, scope)
     }
 
-    // ── Summary Enrichment ───────────────────────────────────────────────
+    // ── Summary Enrichment (READ PATH) ──────────────────────────────────
 
     /**
-     * Enrich a ContextBundle by replacing large RAW files with summaries where available.
+     * Enrich a ContextBundle by replacing files with summaries where beneficial.
      *
-     * For each file in the bundle that is marked as RAW and truncated (too large
-     * to include in full), checks [SummaryStoreProvider] for an existing summary.
-     * If a summary exists, replaces the RAW entry with a SUMMARY entry containing
-     * the synopsis and optional header sample.
+     * ## Logic
      *
-     * Files that are NOT truncated stay as RAW — no point using a summary when
-     * the full content fits within the budget.
+     * For EVERY file in the bundle (not just truncated ones):
+     * 1. Check [SummaryStoreProvider] for an existing summary
+     * 2. If summary exists AND is meaningfully shorter than raw (saves tokens) → use it
+     * 3. If summary exists but file is tiny (summary doesn't save much) → keep raw
+     * 4. If no summary exists AND summary service is enabled → suggest generation
+     *    (fire-and-forget, gated by [SummaryConfigService] mode)
+     * 5. If no summary exists AND summary service is disabled → keep raw
      *
-     * If a summary is missing for a truncated file, fires a suggestion to the
-     * pipeline so it may be generated for next time.
+     * ## Token Efficiency
+     *
+     * A summary is considered "beneficial" if its size (synopsis + headerSample) is
+     * less than [SUMMARY_BENEFIT_RATIO] (50%) of the raw file size. Below that ratio,
+     * the raw content is kept because the token savings are negligible and raw is
+     * more accurate.
+     *
+     * ## Side Effects
+     *
+     * The only side effect is the generation suggestion (step 4), which is:
+     * - Fire-and-forget (doesn't block context assembly)
+     * - Gated by config (only fires when user has opted into automatic summarization)
+     * - Defense-in-depth gated again inside [SummaryStoreProvider.suggestSummarization]
+     *
+     * The suggestion ensures summaries get built up over time, so they're available
+     * on future requests. The user never sees this — they see the AI's response,
+     * which next time will be informed by the summary instead of raw code.
      *
      * @param bundle The context bundle with all-RAW files from MergePolicy
-     * @return A new bundle with truncated files replaced by summaries where available
+     * @return A new bundle with files replaced by summaries where beneficial
      */
     private suspend fun enrichWithSummaries(bundle: ContextBundle): ContextBundle {
         if (bundle.files.isEmpty()) return bundle
@@ -314,60 +353,125 @@ class ContextAssembler(
             project.basePath ?: project.name
         }
 
-        // Collect paths of truncated files — only these benefit from summaries
-        val truncatedPaths = bundle.files
-            .filter { it.kind == ContextKind.RAW && it.truncated }
-            .map { it.path }
+        // Batch fetch summaries for ALL file paths (not just truncated)
+        val allPaths = bundle.files.map { it.path }
+        val summaries = summaryStore.getSummaries(allPaths, projectId)
 
-        if (truncatedPaths.isEmpty()) return bundle
-
-        // Batch fetch summaries for all truncated files
-        val summaries = summaryStore.getSummaries(truncatedPaths, projectId)
+        // Determine if summary generation suggestions are allowed.
+        // This is checked ONCE for the whole batch — avoids repeated config lookups.
+        val suggestionsAllowed = isSummaryGenerationAllowed()
 
         Dev.info(log, "context.enrichment",
-            "truncatedFiles" to truncatedPaths.size,
-            "summariesFound" to summaries.size
+            "totalFiles" to allPaths.size,
+            "summariesFound" to summaries.size,
+            "suggestionsAllowed" to suggestionsAllowed
         )
 
-        // Rebuild the files list, replacing truncated RAW with SUMMARY where available
+        // Rebuild the files list, replacing with summaries where beneficial
         var totalChars = 0
+        var summariesUsed = 0
+        var suggestionsQueued = 0
+
         val enrichedFiles = bundle.files.map { cf ->
             val summary = summaries[cf.path]
 
-            if (cf.truncated && summary != null) {
-                // Replace with summary
+            if (summary != null) {
+                // Summary exists — check if it's worth using (saves tokens)
                 val synopsisChars = (summary.headerSample?.length ?: 0) + summary.synopsis.length
-                totalChars += synopsisChars
-                cf.copy(
-                    kind = ContextKind.SUMMARY,
-                    charCount = synopsisChars,
-                    truncated = false,
-                    headerSample = summary.headerSample,
-                    modelSynopsis = summary.synopsis,
-                    isStale = summary.isStale,
-                    source = if (summary.isShared) "shared-summary" else "local-summary"
-                )
+                val rawChars = cf.charCount
+
+                if (synopsisChars < rawChars * SUMMARY_BENEFIT_RATIO) {
+                    // Summary is meaningfully shorter — use it
+                    summariesUsed++
+                    totalChars += synopsisChars
+                    cf.copy(
+                        kind = ContextKind.SUMMARY,
+                        charCount = synopsisChars,
+                        truncated = false,
+                        headerSample = summary.headerSample,
+                        modelSynopsis = summary.synopsis,
+                        isStale = summary.isStale,
+                        source = if (summary.isShared) "shared-summary" else "local-summary"
+                    )
+                } else {
+                    // Summary doesn't save enough tokens — keep raw
+                    totalChars += cf.charCount
+                    cf
+                }
             } else {
-                // Keep as RAW
+                // No summary exists — keep raw, optionally suggest generation
                 totalChars += cf.charCount
 
-                // If truncated but no summary exists, suggest generation
-                if (cf.truncated && summary == null) {
-                    try {
-                        summaryStore.suggestSummarization(cf.path, projectId)
-                    } catch (_: Throwable) {
-                        // Fire-and-forget — don't block context assembly
-                    }
+                if (suggestionsAllowed) {
+                    suggestGeneration(cf.path, projectId)
+                    suggestionsQueued++
                 }
 
                 cf
             }
         }
 
+        Dev.info(log, "context.enrichment.done",
+            "summariesUsed" to summariesUsed,
+            "suggestionsQueued" to suggestionsQueued,
+            "rawKept" to (enrichedFiles.size - summariesUsed),
+            "totalChars" to totalChars
+        )
+
         return bundle.copy(
             files = enrichedFiles,
             totalChars = totalChars
         )
+    }
+
+    /**
+     * Check whether summary generation suggestions are allowed by config.
+     *
+     * Generation suggestions are ONLY allowed when:
+     * 1. The summary system is enabled (kill switch is on)
+     * 2. The mode allows automatic generation (SMART_BACKGROUND or ON_DEMAND)
+     *
+     * If mode is OFF, no suggestions at all.
+     * If mode is ON_DEMAND, suggestions are allowed because the user's chat message
+     * IS the demand — they asked a code question, the system should prepare summaries.
+     * If mode is SMART_BACKGROUND, suggestions are allowed as background optimization.
+     *
+     * @return true if suggestSummarization() calls are permitted
+     */
+    private fun isSummaryGenerationAllowed(): Boolean {
+        val config = summaryConfig.getConfig()
+
+        if (!config.enabled) return false
+
+        return when (config.mode) {
+            SummaryMode.OFF -> false
+            SummaryMode.ON_DEMAND -> true
+            SummaryMode.SMART_BACKGROUND -> true
+            SummaryMode.SUMMARIZE_PATH -> false // path-based mode has its own trigger
+        }
+    }
+
+    /**
+     * Fire-and-forget suggestion to generate a summary for a file.
+     *
+     * This is a lightweight hint to the pipeline. It does NOT block context assembly.
+     * The pipeline will evaluate the request against budget, scope, and other config
+     * before deciding whether to actually generate.
+     *
+     * Defense-in-depth: [SummaryStoreProvider.suggestSummarization] has its own config
+     * gate, so even if this method is called incorrectly, the pipeline won't run
+     * unsanctioned work.
+     *
+     * @param filePath The file that would benefit from a summary
+     * @param projectId Current project ID
+     */
+    private suspend fun suggestGeneration(filePath: String, projectId: String) {
+        try {
+            summaryStore.suggestSummarization(filePath, projectId)
+        } catch (e: Throwable) {
+            // Fire-and-forget — log but don't block context assembly
+            Dev.warn(log, "context.suggest_failed", e, "filePath" to filePath)
+        }
     }
 
     // ── Prompt Formatting ────────────────────────────────────────────────
@@ -537,6 +641,14 @@ class ContextAssembler(
     // ── Constants ────────────────────────────────────────────────────────
 
     companion object {
+        /**
+         * Ratio threshold: use a summary only if its size is less than this fraction
+         * of the raw file size. At 0.5, a summary must be less than half the raw size
+         * to be worth using. Below this threshold, the raw content is more useful
+         * because the token savings are negligible.
+         */
+        private const val SUMMARY_BENEFIT_RATIO = 0.5
+
         /**
          * Maximum time (ms) to spend gathering IDE context.
          * If detectors take longer, partial results are used.
