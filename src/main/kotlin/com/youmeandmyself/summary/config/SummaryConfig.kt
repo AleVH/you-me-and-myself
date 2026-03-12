@@ -31,7 +31,11 @@ import java.time.Instant
  *
  * - mode = OFF → never burn tokens without explicit user consent
  * - enabled = false → kill switch starts in safe position
- * - dryRun = true → plan-only mode, no API calls (safe for development/testing)
+ * - dryRun = false → new projects can generate summaries when the user opts in.
+ *   Previously defaulted to true, which silently prevented summary generation
+ *   for all new projects even when the user explicitly enabled summarization.
+ *   The user must still set mode != OFF and enabled = true before any summaries
+ *   are generated, so dryRun=false does not cause unexpected API calls.
  * - All budget fields nullable → null means unlimited/unset
  *
  * ## Thread Safety
@@ -58,7 +62,7 @@ data class SummaryConfig(
     val includePatterns: List<String> = emptyList(),
     val excludePatterns: List<String> = emptyList(),
     val minFileLines: Int? = null,
-    val dryRun: Boolean = true
+    val dryRun: Boolean = false
 ) {
 
     /**

@@ -427,11 +427,54 @@ class ConversationManager(private val project: Project) {
     /**
      * Build the conversation history for sending to an AI provider.
      *
-     * Phase A: Simple verbatim — sends the last N turns as-is.
-     * Phase B: Will add smart compression (summarize older turns).
+     * ## Current Implementation (Phase A — Verbatim)
+     *
+     * Sends the last [verbatimWindow] exchanges as-is. Each exchange produces
+     * two turns (USER + ASSISTANT). With the default window of 5, this means
+     * up to 10 turns in the messages array.
+     *
+     * This is simple, predictable, and sufficient for launch. Most interactive
+     * chat sessions stay within 5 exchanges of relevant context.
+     *
+     * ## Future Implementation (Phase B — Smart Compression)
+     *
+     * Phase B will add intelligent history management for long conversations.
+     * The compressed history format will be:
+     *
+     *   [CONVERSATION_SUMMARY of older turns] + [verbatim recent turns]
+     *
+     * ### Phase B Components (all "not started" as of this writing):
+     *
+     * B1. CONVERSATION_SUMMARY purpose + prompt templates
+     *     → New ExchangePurpose enum value: CONVERSATION_SUMMARY
+     *     → Prompt templates that instruct the AI to compress N turns into
+     *       a concise summary preserving key decisions, code references, and context
+     *     → Connected to: ExchangePurpose enum, prompt template system
+     *
+     * B2. History compression engine (this method becomes the entry point)
+     *     → When conversation length > verbatimWindow, summarize older turns
+     *     → The summary is stored as a CONVERSATION_SUMMARY exchange in JSONL
+     *     → On next buildHistory() call, the summary is loaded as a SYSTEM turn
+     *       (TurnRole.SYSTEM) followed by the verbatim recent turns
+     *     → Connected to: this method, ConversationTurn, TurnRole.SYSTEM
+     *
+     * B3. Configuration UI (Settings → YMM Assistant → History)
+     *     → verbatimWindow: how many recent exchanges to keep verbatim (default 5)
+     *     → maxHistoryTokens: total token budget for history (global default)
+     *     → Per-conversation override via conversations.max_history_tokens_override
+     *       (column already exists in the conversations table, nullable,
+     *        null = inherit global, -1 = unlimited, >0 = specific cap)
+     *     → Connected to: this method (reads config), SummaryConfigService, settings UI
+     *
+     * B4. Cost awareness metrics
+     *     → MetricsBar turns red/amber as conversation history approaches
+     *       the model's context window limit
+     *     → Connected to: MetricsBar (React), MetricsService, DefaultContextWindows
      *
      * @param conversationId The conversation to build history for
-     * @param verbatimWindow How many recent turns to include verbatim
+     * @param verbatimWindow How many recent exchanges to include verbatim (default 5).
+     *   Each exchange produces 2 turns (user + assistant), so window=5 means up to 10 turns.
+     *   Phase B will make this configurable per-conversation via the settings UI.
      * @return List of ConversationTurns ready for the provider, or empty if no history
      */
     fun buildHistory(conversationId: String?, verbatimWindow: Int = 5): List<ConversationTurn> {
@@ -439,6 +482,37 @@ class ConversationManager(private val project: Project) {
 
         val exchanges = loadExchanges(conversationId)
         if (exchanges.isEmpty()) return emptyList()
+
+        // ── PHASE B PLACEHOLDER: Compression check ──────────────────────
+        // When Phase B is implemented, this is where the compression logic hooks in:
+        //
+        // 1. Check if a CONVERSATION_SUMMARY exchange exists for this conversation
+        //    (query: purpose = 'CONVERSATION_SUMMARY' AND conversation_id = ?)
+        //
+        // 2. If a summary exists AND it covers turns older than the verbatim window:
+        //    → Load the summary text
+        //    → Create a SYSTEM turn: ConversationTurn(TurnRole.SYSTEM, summaryText)
+        //    → Prepend it before the verbatim turns
+        //    → Result: [SYSTEM summary] + [verbatim recent turns]
+        //
+        // 3. If conversation length exceeds verbatimWindow and no summary exists
+        //    (or the summary is stale):
+        //    → Trigger async summarization of older turns
+        //    → For THIS request, still use verbatim-only (don't block on summarization)
+        //    → Next request will pick up the newly generated summary
+        //
+        // 4. Check per-conversation max_history_tokens_override:
+        //    → If set, respect the token budget (may need to summarize more aggressively)
+        //    → If null, use the global default from SummaryConfigService
+        //
+        // For now: verbatim-only. This log line confirms the path taken.
+        Dev.info(log, "conversation.build_history",
+            "conversationId" to conversationId,
+            "totalExchanges" to exchanges.size,
+            "verbatimWindow" to verbatimWindow,
+            "compressionMode" to "verbatim_only"  // Phase B: will show "compressed" or "mixed"
+        )
+        // ────────────────────────────────────────────────────────────────────
 
         // Phase A: take the last N exchanges and convert to turns
         val recentExchanges = exchanges.takeLast(verbatimWindow)

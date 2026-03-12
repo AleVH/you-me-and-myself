@@ -29,32 +29,48 @@ data class ConversationTurn(
 )
 
 /**
- * Role in a conversation turn.
+ * Role in a conversation turn — provider-agnostic.
  *
- * Maps directly to the "role" field in provider API messages:
- * - USER → "user" in OpenAI/Gemini/etc.
- * - ASSISTANT → "assistant" in OpenAI, "model" in Gemini
- * - SYSTEM → "system" in OpenAI (used for conversation summary injection)
+ * This enum represents the LOGICAL role of a message in a conversation.
+ * It deliberately has NO vendor-specific methods (no toOpenAiRole, no toGeminiRole).
+ *
+ * ## Provider-Agnostic Principle
+ *
+ * TurnRole is a shared model class used across the codebase (storage, orchestrator,
+ * conversation manager). Putting vendor-specific role mappings here would leak
+ * protocol knowledge into the data layer, violating the agnostic architecture.
+ *
+ * ## Where Role Mapping Lives
+ *
+ * Protocol-specific role strings (e.g., "user"/"assistant"/"system" for OpenAI,
+ * "user"/"model" for Gemini) are mapped inside [GenericLlmProvider], which is
+ * the ONLY class that knows about specific API protocols. The mapping is done
+ * via private extension functions on TurnRole within GenericLlmProvider.
+ *
+ * ## Adding New Roles
+ *
+ * If a new role is needed (e.g., TOOL for function-calling responses), add the
+ * enum value here and add its protocol mappings in GenericLlmProvider. No other
+ * files need to change.
+ *
+ * @see GenericLlmProvider for protocol-specific role mapping
  */
 enum class TurnRole {
+    /** Message from the user. Maps to "user" in all known protocols. */
     USER,
+
+    /** Response from the AI model. Maps to "assistant" (OpenAI) or "model" (Gemini). */
     ASSISTANT,
-    SYSTEM;
 
     /**
-     * Convert to the provider-specific role string.
-     * OpenAI protocol uses "user"/"assistant"/"system".
-     * Gemini protocol uses "user"/"model" (no system — injected as user turn).
+     * System instruction or injected context.
+     *
+     * Used for:
+     * - Conversation summary injection (Phase B: compressed history as system context)
+     * - System prompt from AiProfile (Block 4: persona/instructions)
+     *
+     * Maps to "system" in OpenAI. Gemini has no system role — GenericLlmProvider
+     * handles this by sending SYSTEM content as "user" with a "[System] " prefix.
      */
-    fun toOpenAiRole(): String = when (this) {
-        USER -> "user"
-        ASSISTANT -> "assistant"
-        SYSTEM -> "system"
-    }
-
-    fun toGeminiRole(): String = when (this) {
-        USER -> "user"
-        ASSISTANT -> "model"
-        SYSTEM -> "user"  // Gemini has no system role; send as user with clear framing
-    }
+    SYSTEM
 }

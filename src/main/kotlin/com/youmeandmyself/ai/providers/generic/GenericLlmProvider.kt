@@ -14,6 +14,21 @@ package com.youmeandmyself.ai.providers.generic
  * - The mutable `capturedContext` field is GONE (was a concurrency hazard).
  * - The `project` constructor parameter is GONE (no storage access needed).
  * - Returns ProviderResponse instead of ParsedResponse.
+ *
+ * PHASE A3 — CONVERSATION HISTORY
+ * - chat() now accepts List<ConversationTurn> for multi-turn context.
+ * - Each protocol method builds a messages/contents array from history + current prompt.
+ * - Helper methods buildMessageArray() and buildContentArray() centralize
+ *   the history-to-protocol conversion so protocol methods stay clean.
+ * - IDE context is ONLY on the current prompt (last message). Historical turns
+ *   carry whatever was stored at the time.
+ *
+ * BLOCK 4 PLACEHOLDER — SYSTEM PROMPT
+ * - When Block 4 is implemented, a systemPrompt parameter will be added to chat().
+ * - The system prompt will be injected as the FIRST message in the array:
+ *   - OpenAI/Custom: role="system"
+ *   - Gemini: role="user" with "[System] " prefix (Gemini has no system role)
+ * - Search for "BLOCK 4" comments to find all injection points.
  */
 
 import com.youmeandmyself.ai.net.HttpClientFactory
@@ -29,7 +44,9 @@ import com.youmeandmyself.ai.settings.ApiProtocol
 import com.youmeandmyself.ai.settings.CustomProtocolConfig
 import com.youmeandmyself.ai.settings.RequestSettings
 import com.youmeandmyself.dev.Dev
+import com.youmeandmyself.storage.model.ConversationTurn
 import com.youmeandmyself.storage.model.ExchangeTokenUsage
+import com.youmeandmyself.storage.model.TurnRole
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -99,27 +116,243 @@ class GenericLlmProvider(
     }
 
     /**
-     * Send a chat prompt. Uses [chatSettings] for request parameters.
+     * Send a chat prompt with optional conversation history.
+     *
+     * Uses [chatSettings] for request parameters. When [history] is non-empty,
+     * builds a multi-message request with previous turns followed by the current prompt.
+     *
+     * @param prompt The current user message (may include IDE context from ContextAssembler)
+     * @param history Previous conversation turns. Empty = single-message request.
      */
-    override suspend fun chat(prompt: String): ProviderResponse {
+    override suspend fun chat(
+        prompt: String,
+        history: List<ConversationTurn>
+    ): ProviderResponse {
         val settings = chatSettings ?: RequestSettings.chatDefaults()
         return when (protocol) {
-            ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings)
-            ApiProtocol.GEMINI        -> requestGemini(prompt, settings)
-            ApiProtocol.CUSTOM        -> requestCustom(prompt, settings)
+            ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings, history)
+            ApiProtocol.GEMINI        -> requestGemini(prompt, settings, history)
+            ApiProtocol.CUSTOM        -> requestCustom(prompt, settings, history)
         }
     }
 
     /**
      * Send a summarization prompt. Uses [summarySettings] for request parameters.
+     *
+     * Summarization is always single-shot — no history needed. Each summary
+     * request is self-contained (file content + prompt template).
      */
     override suspend fun summarize(prompt: String): ProviderResponse {
         val settings = summarySettings ?: RequestSettings.summaryDefaults()
         return when (protocol) {
-            ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings)
-            ApiProtocol.GEMINI        -> requestGemini(prompt, settings)
-            ApiProtocol.CUSTOM        -> requestCustom(prompt, settings)
+            ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings, emptyList())
+            ApiProtocol.GEMINI        -> requestGemini(prompt, settings, emptyList())
+            ApiProtocol.CUSTOM        -> requestCustom(prompt, settings, emptyList())
         }
+    }
+
+    // ==================== History → Protocol Conversion ====================
+
+    // ── Private role mapping ────────────────────────────────────────────
+    //
+    // TurnRole is a provider-agnostic enum in the shared model layer.
+    // Protocol-specific role strings are mapped HERE — the only place in
+    // the codebase that knows about specific API formats.
+    //
+    // If a new protocol is added (e.g., Cohere, Mistral), add a mapping
+    // method here. TurnRole itself never changes for protocol reasons.
+    // ────────────────────────────────────────────────────────────────────
+
+    /**
+     * Map a [TurnRole] to the OpenAI protocol role string.
+     *
+     * OpenAI (and OpenAI-compatible providers like Together, Groq, Ollama)
+     * use: "user", "assistant", "system".
+     */
+    private fun TurnRole.toOpenAiRoleString(): String = when (this) {
+        TurnRole.USER -> "user"
+        TurnRole.ASSISTANT -> "assistant"
+        TurnRole.SYSTEM -> "system"
+    }
+
+    /**
+     * Map a [TurnRole] to the Gemini protocol role string.
+     *
+     * Gemini uses: "user", "model". There is NO "system" role —
+     * SYSTEM turns are mapped to "user" and the caller is responsible
+     * for adding a "[System] " prefix to the content so the model can
+     * distinguish system instructions from actual user messages.
+     *
+     * @see buildContentArray for how SYSTEM turns are handled
+     */
+    private fun TurnRole.toGeminiRoleString(): String = when (this) {
+        TurnRole.USER -> "user"
+        TurnRole.ASSISTANT -> "model"
+        TurnRole.SYSTEM -> "user"  // Gemini has no system role; framed as user with prefix
+    }
+
+    // ── Message/content array builders ──────────────────────────────────
+
+    /**
+     * Build the message array for OpenAI-compatible protocols.
+     *
+     * Used by both OPENAI_COMPAT and CUSTOM protocols (Custom uses OpenAI's
+     * request body format with different auth/URL).
+     *
+     * Message order:
+     *   1. [BLOCK 4 — system prompt will go here as role="system"]
+     *   2. History turns mapped via [toOpenAiRoleString]
+     *   3. Current prompt as final "user" message
+     *
+     * ## Why IDE context is only on the last message
+     *
+     * IDE context (from ContextAssembler) reflects the CURRENT state of the editor —
+     * what file is open, cursor position, selected text. Historical turns already have
+     * whatever context was attached when they were originally sent. Re-attaching
+     * current IDE context to old turns would be misleading (the user wasn't looking
+     * at the same file back then).
+     *
+     * ## BLOCK 4 PLACEHOLDER — System Prompt
+     *
+     * When AiProfile.systemPrompt is wired through (Block 4), insert it as the
+     * first message: OpenAiMessage(role = "system", content = systemPrompt).
+     * This gives the AI its persona/instructions before any conversation turns.
+     * The system prompt comes from the user's profile settings and is NOT part
+     * of conversation history — it's injected fresh on every request.
+     *
+     * @param history Previous conversation turns (may be empty)
+     * @param currentPrompt The current user message with fresh IDE context
+     * @return Complete messages list ready for the request body
+     */
+    private fun buildMessageArray(
+        history: List<ConversationTurn>,
+        currentPrompt: String
+    ): List<OpenAiMessage> {
+        val messages = mutableListOf<OpenAiMessage>()
+
+        // ── BLOCK 4 PLACEHOLDER: System prompt injection point ──────────
+        // When Block 4 is implemented, the system prompt from AiProfile will be
+        // passed as a parameter to chat() and then to this method. Insert it here:
+        //
+        //   if (!systemPrompt.isNullOrBlank()) {
+        //       messages.add(OpenAiMessage(role = "system", content = systemPrompt))
+        //   }
+        //
+        // The system prompt defines the AI's persona and instructions. It goes
+        // BEFORE history so the AI processes it as its foundational context.
+        // Connected to: AiProfile.systemPrompt (settings UI), ChatOrchestrator (passes it through)
+        // ────────────────────────────────────────────────────────────────────
+
+        // History turns — each ConversationTurn maps to one message
+        for (turn in history) {
+            messages.add(OpenAiMessage(
+                role = turn.role.toOpenAiRoleString(),
+                content = turn.content
+            ))
+        }
+
+        // Current prompt — always the final "user" message with fresh IDE context
+        messages.add(OpenAiMessage(role = "user", content = currentPrompt))
+
+        return messages
+    }
+
+    /**
+     * Build the content array for the Gemini protocol.
+     *
+     * Message order:
+     *   1. [BLOCK 4 — system prompt will go here as role="user" with "[System] " prefix]
+     *   2. History turns mapped via [toGeminiRoleString]
+     *   3. Current prompt as final "user" content
+     *
+     * ## Gemini-Specific Constraints
+     *
+     * - Gemini has NO "system" role. SYSTEM turns are sent as "user" with a
+     *   "[System] " prefix so the AI can distinguish them from actual user messages.
+     * - Gemini requires alternating user/model turns. If history has consecutive
+     *   same-role turns (e.g., two user messages), they are merged into one content
+     *   block to avoid API errors. This can happen when SYSTEM turns (mapped to "user")
+     *   are adjacent to USER turns.
+     *
+     * ## BLOCK 4 PLACEHOLDER — System Prompt
+     *
+     * When AiProfile.systemPrompt is wired through (Block 4), insert it as the
+     * first content with role="user" and prefix "[System Instructions] ".
+     * Gemini has no native system role, so we frame it clearly for the model.
+     * Connected to: AiProfile.systemPrompt (settings UI), ChatOrchestrator (passes it through)
+     *
+     * @param history Previous conversation turns (may be empty)
+     * @param currentPrompt The current user message with fresh IDE context
+     * @return Complete contents list ready for the Gemini request body
+     */
+    private fun buildContentArray(
+        history: List<ConversationTurn>,
+        currentPrompt: String
+    ): List<GeminiContent> {
+        // Build a flat list of (role, text) pairs first, then merge consecutive same-role entries
+        val rawPairs = mutableListOf<Pair<String, String>>()
+
+        // ── BLOCK 4 PLACEHOLDER: System prompt injection point ──────────
+        // When Block 4 is implemented, insert the system prompt here:
+        //
+        //   if (!systemPrompt.isNullOrBlank()) {
+        //       rawPairs.add("user" to "[System Instructions] $systemPrompt")
+        //   }
+        //
+        // Gemini has no "system" role — we use "user" with a clear prefix so the
+        // model treats it as instructions, not conversation. The prefix is important
+        // because the first history turn might also be "user", and Gemini requires
+        // alternating roles — the merge logic below handles this automatically.
+        // Connected to: AiProfile.systemPrompt (settings UI), ChatOrchestrator (passes it through)
+        // ────────────────────────────────────────────────────────────────────
+
+        // History turns
+        for (turn in history) {
+            val role = turn.role.toGeminiRoleString()
+            val text = if (turn.role == TurnRole.SYSTEM) {
+                // Gemini has no system role — prefix so the model knows this is a system instruction
+                "[System] ${turn.content}"
+            } else {
+                turn.content
+            }
+            rawPairs.add(role to text)
+        }
+
+        // Current prompt — final "user" entry
+        rawPairs.add("user" to currentPrompt)
+
+        // Merge consecutive same-role entries (Gemini requires alternating user/model)
+        // This happens when a SYSTEM turn (mapped to "user") is followed by a USER turn,
+        // or when buildHistory returns adjacent same-role turns for any reason.
+        val mergedContents = mutableListOf<GeminiContent>()
+        var currentRole: String? = null
+        var currentTexts = mutableListOf<String>()
+
+        for ((role, text) in rawPairs) {
+            if (role == currentRole) {
+                // Same role as previous — accumulate text
+                currentTexts.add(text)
+            } else {
+                // New role — flush previous
+                if (currentRole != null && currentTexts.isNotEmpty()) {
+                    mergedContents.add(GeminiContent(
+                        role = currentRole,
+                        parts = listOf(GeminiPart(text = currentTexts.joinToString("\n\n")))
+                    ))
+                }
+                currentRole = role
+                currentTexts = mutableListOf(text)
+            }
+        }
+        // Flush the last group
+        if (currentRole != null && currentTexts.isNotEmpty()) {
+            mergedContents.add(GeminiContent(
+                role = currentRole,
+                parts = listOf(GeminiPart(text = currentTexts.joinToString("\n\n")))
+            ))
+        }
+
+        return mergedContents
     }
 
     // ==================== Response Handling ====================
@@ -211,17 +444,23 @@ class GenericLlmProvider(
      *
      * Works with: OpenAI, Together, Groq, Anyscale, local Ollama with OpenAI adapter,
      * and any provider that implements the OpenAI chat completions endpoint.
+     *
+     * When history is provided, builds a multi-message request via [buildMessageArray].
+     * When history is empty, sends a single "user" message (backwards compatible).
      */
     private suspend fun requestOpenAiCompat(
         prompt: String,
-        settings: RequestSettings
+        settings: RequestSettings,
+        history: List<ConversationTurn>
     ): ProviderResponse {
         val url = normalizeBaseUrl(baseUrl) + "/v1/chat/completions"
         val m = model ?: "gpt-4o-mini"
 
+        val messages = buildMessageArray(history, prompt)
+
         val payload = OpenAiChatRequest(
             model = m,
-            messages = listOf(OpenAiMessage(role = "user", content = prompt)),
+            messages = messages,
             temperature = settings.temperature,
             max_tokens = settings.maxTokens,
             top_p = settings.topP,
@@ -235,6 +474,8 @@ class GenericLlmProvider(
             "temperature" to settings.temperature,
             "maxTokens" to settings.maxTokens,
             "promptLength" to prompt.length,
+            "historyTurns" to history.size,
+            "totalMessages" to messages.size,
             "promptPreview" to Dev.preview(prompt, 200)
         )
 
@@ -274,19 +515,27 @@ class GenericLlmProvider(
      *
      * Gemini uses a different request shape (contents/parts) and auth mechanism
      * (API key in query parameter instead of Bearer token).
+     *
+     * When history is provided, builds a multi-turn contents array via [buildContentArray].
+     * Handles Gemini's alternating-role requirement by merging consecutive same-role turns.
      */
     private suspend fun requestGemini(
         prompt: String,
-        settings: RequestSettings
+        settings: RequestSettings,
+        history: List<ConversationTurn>
     ): ProviderResponse {
         val m = requireNotNull(model) { "Model required for GEMINI" }
         val url = normalizeBaseUrl(baseUrl) + "/v1beta/models/$m:generateContent"
+
+        val contents = buildContentArray(history, prompt)
 
         Dev.info(log, "gemini.request",
             "url" to url,
             "temperature" to settings.temperature,
             "maxTokens" to settings.maxTokens,
             "promptLength" to prompt.length,
+            "historyTurns" to history.size,
+            "totalContents" to contents.size,
             "promptPreview" to Dev.preview(prompt, 200)
         )
 
@@ -312,7 +561,7 @@ class GenericLlmProvider(
                 url { parameters.append("key", apiKey) }
                 contentType(ContentType.Application.Json)
                 setBody(GeminiRequest(
-                    contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = prompt)))),
+                    contents = contents,
                     generationConfig = generationConfig.takeIf { it.hasSettings() }
                 ))
             }
@@ -350,18 +599,24 @@ class GenericLlmProvider(
      *
      * For providers that use OpenAI's request format but have custom
      * authentication (different header name, different URL path, etc.)
+     *
+     * Uses the same [buildMessageArray] helper as the OpenAI path since the
+     * request body format is OpenAI-compatible.
      */
     private suspend fun requestCustom(
         prompt: String,
-        settings: RequestSettings
+        settings: RequestSettings,
+        history: List<ConversationTurn>
     ): ProviderResponse {
         val cfg = custom ?: CustomProtocolConfig()
         val url = normalizeBaseUrl(baseUrl) + cfg.chatPath
         val m = model ?: "gpt-4o-mini"
 
+        val messages = buildMessageArray(history, prompt)
+
         val payload = OpenAiChatRequest(
             model = m,
-            messages = listOf(OpenAiMessage(role = "user", content = prompt)),
+            messages = messages,
             temperature = settings.temperature,
             max_tokens = settings.maxTokens,
             top_p = settings.topP,
@@ -375,6 +630,8 @@ class GenericLlmProvider(
             "temperature" to settings.temperature,
             "maxTokens" to settings.maxTokens,
             "promptLength" to prompt.length,
+            "historyTurns" to history.size,
+            "totalMessages" to messages.size,
             "promptPreview" to Dev.preview(prompt, 200)
         )
 
@@ -444,7 +701,10 @@ class GenericLlmProvider(
     )
 
     @Serializable
-    private data class GeminiContent(val parts: List<GeminiPart>)
+    private data class GeminiContent(
+        val role: String? = null,
+        val parts: List<GeminiPart>
+    )
 
     @Serializable
     private data class GeminiPart(val text: String? = null)

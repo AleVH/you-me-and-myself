@@ -1,5 +1,7 @@
 package com.youmeandmyself.ai.providers
 
+import com.youmeandmyself.storage.model.ConversationTurn
+
 /**
  * Interface for AI providers — the HTTP abstraction layer.
  *
@@ -22,6 +24,16 @@ package com.youmeandmyself.ai.providers
  * Previously returned [ParsedResponse]. Now returns [ProviderResponse] which
  * wraps ParsedResponse + raw JSON + HTTP status + prompt. The orchestrator
  * needs all of these to persist the complete exchange.
+ *
+ * ## Conversation History (Phase A3)
+ *
+ * The [chat] method accepts an optional [history] parameter — a list of
+ * [ConversationTurn] objects representing previous turns in the conversation.
+ * When provided, the provider builds a multi-message request (messages[] for
+ * OpenAI, contents[] for Gemini) instead of a single-message request.
+ *
+ * History is assembled by [ChatOrchestrator] using [ConversationManager.buildHistory()].
+ * The provider never fetches history itself — it's a pure HTTP client.
  *
  * ## Implementations
  *
@@ -52,16 +64,49 @@ interface AiProvider {
      * Uses chat-specific request settings (higher temperature, longer responses).
      * The prompt may include IDE context assembled by [ContextAssembler].
      *
+     * ## History (Phase A3)
+     *
+     * When [history] is non-empty, the provider builds a multi-message request:
+     * - OpenAI/Custom: messages = [{history turns...}, {current prompt as "user"}]
+     * - Gemini: contents = [{history turns...}, {current prompt}]
+     *
+     * Historical turns preserve whatever content was stored at the time (including
+     * any IDE context that was part of the original prompt). Only the current
+     * message (the [prompt] parameter) carries fresh IDE context.
+     *
+     * ## BLOCK 4 PLACEHOLDER — System Prompt Injection
+     *
+     * Block 4 will add a `systemPrompt: String? = null` parameter here.
+     * When provided, the system prompt will be inserted as the FIRST message
+     * in the messages array with role "system" (OpenAI/Custom) or as a framed
+     * "user" message (Gemini, which has no system role).
+     *
+     * The system prompt comes from AiProfile.systemPrompt (a per-profile
+     * configurable field set in Settings → YMM Assistant → Profiles).
+     * ChatOrchestrator will read it from the active profile and pass it here.
+     *
+     * Message order when Block 4 is implemented:
+     *   [system prompt] → [history turns] → [current user message with IDE context]
+     *
      * @param prompt The complete prompt to send (user input + any context)
+     * @param history Previous conversation turns for multi-turn context.
+     *   Empty list = single-message request (backwards compatible).
+     *   Assembled by ChatOrchestrator via ConversationManager.buildHistory().
      * @return [ProviderResponse] with raw JSON, HTTP status, and parsed content
      */
-    suspend fun chat(prompt: String): ProviderResponse
+    suspend fun chat(
+        prompt: String,
+        history: List<ConversationTurn> = emptyList()
+    ): ProviderResponse
 
     /**
      * Send a summarization request to the AI provider.
      *
      * Uses summary-specific request settings (lower temperature, shorter responses).
      * Called by [SummarizationService] for both code and conversation summarization.
+     *
+     * NOTE: Summarization is always single-shot — no history parameter needed.
+     * Each summary request is self-contained (file content + prompt template).
      *
      * @param prompt The summarization prompt (content + template)
      * @return [ProviderResponse] with raw JSON, HTTP status, and parsed content

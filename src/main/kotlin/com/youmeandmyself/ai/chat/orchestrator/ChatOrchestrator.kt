@@ -18,6 +18,7 @@ import com.youmeandmyself.storage.model.ExchangePurpose
 import com.youmeandmyself.storage.model.ExchangeRawResponse
 import com.youmeandmyself.storage.model.ExchangeRequest
 import com.youmeandmyself.storage.model.ExchangeTokenUsage
+import com.youmeandmyself.storage.model.ConversationTurn
 import com.youmeandmyself.storage.model.IdeContext
 import com.youmeandmyself.storage.model.IdeContextCapture
 import kotlinx.coroutines.CoroutineScope
@@ -223,19 +224,96 @@ class ChatOrchestrator(
                 )
             }
 
+            // ── Step 3C: Build conversation history (Phase A3) ────────
+            // Retrieves the last N turns from the active conversation so the
+            // AI provider receives multi-turn context. Without this, every
+            // message is standalone and the AI cannot reference previous turns.
+            //
+            // ## How it works
+            //
+            // 1. ConversationManager.buildHistory() reads the last `verbatimWindow`
+            //    exchanges from SQLite and converts them to ConversationTurn objects
+            //    (USER + ASSISTANT pairs).
+            // 2. The history is passed to provider.chat() which builds a protocol-
+            //    specific messages array: [history turns...] + [current prompt].
+            // 3. IDE context (from ContextAssembler) is ONLY on the current prompt.
+            //    Historical turns carry whatever context was attached when they were
+            //    originally sent — this is correct because IDE context reflects the
+            //    editor state at the time of each message.
+            //
+            // ## verbatimWindow
+            //
+            // Currently hardcoded at 5 (last 5 exchanges = up to 10 turns).
+            // This is passed explicitly rather than buried as a magic number so
+            // it's easy to find and make configurable later. The conversations
+            // table has a `max_history_tokens_override` column (nullable) that
+            // will be used by Phase B for per-conversation configuration.
+            //
+            // ── PHASE B PLACEHOLDER: Smart History Compression ──────────
+            // Phase B will add intelligent history management:
+            //
+            // 1. CONVERSATION_SUMMARY purpose type in ExchangePurpose enum
+            //    → allows storing conversation summaries as special exchanges
+            //
+            // 2. History compression engine in ConversationManager:
+            //    → When a conversation exceeds the verbatim window, older turns
+            //      are summarized into a CONVERSATION_SUMMARY exchange
+            //    → The compressed history becomes: [summary of old turns] +
+            //      [verbatim recent turns] + [current message]
+            //    → This keeps token usage bounded while preserving long-term context
+            //
+            // 3. Configuration UI (Settings → YMM Assistant → History):
+            //    → verbatimWindow: how many recent turns to keep verbatim (default 5)
+            //    → maxHistoryTokens: total token budget for history (global default)
+            //    → Per-conversation override via conversations.max_history_tokens_override
+            //
+            // 4. Cost awareness in MetricsBar:
+            //    → Bar turns red/amber as conversation history grows toward the
+            //      context window limit, alerting the user before they hit it
+            //
+            // Connected to: ConversationManager.buildHistory() (compression logic),
+            //   ExchangePurpose.CONVERSATION_SUMMARY (new enum value),
+            //   SummaryConfigService (configuration), MetricsBar (UI feedback)
+            //
+            // For now: verbatim-only, last 5 exchanges. This is sufficient for
+            // launch and covers the vast majority of interactive chat sessions.
+            // ────────────────────────────────────────────────────────────────
+            val verbatimWindow = 5  // Phase B: will be configurable per-conversation
+            val history = conversationManager.buildHistory(currentConversationId, verbatimWindow)
+
+            Dev.info(log, "orchestrator.history_built",
+                "conversationId" to (currentConversationId ?: "none"),
+                "historyTurns" to history.size,
+                "verbatimWindow" to verbatimWindow,
+                "compressionMode" to "verbatim_only"  // Phase B: will show "compressed" when summarization is active
+            )
+
             // ── Step 4: Call AI provider (HTTP only) ─────────────────
             // Timer brackets the HTTP call so MetricsService can record
             // wall-clock response time. This measures the full round-trip:
             // request serialization + network + server processing + response parsing.
+            //
+            // The provider receives:
+            //   - history: previous conversation turns (Phase A3)
+            //   - assembled.effectivePrompt: current user message with fresh IDE context
+            //
+            // BLOCK 4 PLACEHOLDER — System Prompt:
+            // When Block 4 is implemented, the system prompt from AiProfile will also
+            // be passed here. ChatOrchestrator will read it from the active profile:
+            //   val systemPrompt = profileState.profiles.find { it.id == provider.id }?.systemPrompt
+            // And pass it to: provider.chat(assembled.effectivePrompt, history, systemPrompt)
+            // The provider inserts it as the first message in the messages array.
+            // Connected to: AiProfile.systemPrompt (settings), GenericLlmProvider (injection)
             val callStartMs = System.currentTimeMillis()
-            val response = provider.chat(assembled.effectivePrompt)
+            val response = provider.chat(assembled.effectivePrompt, history)
             val responseTimeMs = System.currentTimeMillis() - callStartMs
 
             Dev.info(log, "orchestrator.provider_response",
                 "exchangeId" to response.exchangeId,
                 "isError" to response.isError,
                 "rawLength" to (response.rawJson?.length ?: 0),
-                "responseTimeMs" to responseTimeMs
+                "responseTimeMs" to responseTimeMs,
+                "historyTurns" to history.size
             )
 
             // ── Step 5: Conversation bookkeeping ─────────────────────

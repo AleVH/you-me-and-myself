@@ -460,8 +460,6 @@ class BridgeDispatcher(
 
                 val messages = orchestrator.loadConversationHistory(command.conversationId)
 
-                val firstAssistant = messages.firstOrNull { it.role == "assistant" }
-
                 emit(BridgeMessage.ConversationHistoryEvent(
                     tabId = command.tabId,
                     conversationId = command.conversationId,
@@ -591,8 +589,6 @@ class BridgeDispatcher(
 
                     // Also send conversation history for the new tab
                     val messages = orchestrator.loadConversationHistory(command.conversationId)
-
-                    val firstAssistant = messages.firstOrNull { it.role == "assistant" }
 
                     emit(BridgeMessage.ConversationHistoryEvent(
                         tabId = newTabId,
