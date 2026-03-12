@@ -233,6 +233,27 @@ object BridgeMessage {
         val conversationId: String
     ) : Command()
 
+    // ── Dev: Dev Command ─────────────────────────────────────────
+
+    /**
+     * User typed a /dev-* command in the chat input.
+     *
+     * The frontend intercepts /dev- prefixed messages and sends them
+     * as DEV_COMMAND instead of SEND_MESSAGE. The backend routes to
+     * DevCommandHandler, which processes the command and sends back
+     * DEV_OUTPUT events rendered as system messages in chat.
+     *
+     * Only active when dev mode is enabled (-Dymm.devMode=true).
+     * If dev mode is off, the backend returns a single DEV_OUTPUT
+     * saying dev mode is disabled.
+     */
+    @Serializable
+    @SerialName("DEV_COMMAND")
+    data class DevCommand(
+        override val type: String = "DEV_COMMAND",
+        val text: String
+    ) : Command()
+
     // ═══════════════════════════════════════════════════════════════════
     //  EVENTS (Backend → Frontend)
     // ═══════════════════════════════════════════════════════════════════
@@ -466,6 +487,21 @@ object BridgeMessage {
         val title: String = "New Chat"
     ) : Event()
 
+    // ── Dev: Dev Output Event ────────────────────────────────────
+
+    /**
+     * Output from a dev command, rendered as a system message in chat.
+     *
+     * Sent by BridgeDispatcher after DevCommandHandler processes a
+     * /dev-* command. The frontend renders this the same as
+     * SystemMessageEvent but with "DEV" level styling.
+     */
+    @Serializable
+    data class DevOutputEvent(
+        override val type: String = "DEV_OUTPUT",
+        val content: String
+    ) : Event()
+
     // ═══════════════════════════════════════════════════════════════════
     //  SHARED DTOs
     // ═══════════════════════════════════════════════════════════════════
@@ -534,6 +570,8 @@ object BridgeMessage {
                 "BOOKMARK_CODE_BLOCK" -> json.decodeFromString<BookmarkCodeBlock>(jsonString)
                 // R5: Cross-panel conversation open
                 "OPEN_CONVERSATION" -> json.decodeFromString<OpenConversation>(jsonString)
+                // Dev command
+                "DEV_COMMAND" -> json.decodeFromString<DevCommand>(jsonString)
                 else -> {
                     Dev.warn(log, "bridge.parse.unknown_command", null,
                         "type" to (typeField ?: "null")
@@ -566,6 +604,8 @@ object BridgeMessage {
             // R5
             is BookmarkResultEvent -> json.encodeToString(BookmarkResultEvent.serializer(), event)
             is OpenConversationResultEvent -> json.encodeToString(OpenConversationResultEvent.serializer(), event)
+            // Dev
+            is DevOutputEvent -> json.encodeToString(DevOutputEvent.serializer(), event)
         }
     }
 }

@@ -149,6 +149,10 @@ export const CommandType = {
     TOGGLE_STAR: "TOGGLE_STAR",
     BOOKMARK_CODE_BLOCK: "BOOKMARK_CODE_BLOCK",
     OPEN_CONVERSATION: "OPEN_CONVERSATION",
+
+    // ── Dev Commands ──────────────────────────────────────────────
+    /** User typed a /dev-* command. @see BridgeMessage.DevCommand */
+    DEV_COMMAND: "DEV_COMMAND",
 } as const;
 
 export type CommandType = (typeof CommandType)[keyof typeof CommandType];
@@ -314,6 +318,17 @@ export interface OpenConversationCommand {
 }
 
 /**
+ * User typed a /dev-* command. Mirrors BridgeMessage.DevCommand.
+ *
+ * Frontend intercepts /dev- prefixed input and sends as DEV_COMMAND
+ * instead of SEND_MESSAGE. Only functional when dev mode is enabled.
+ */
+export interface DevCommandCommand {
+    type: typeof CommandType.DEV_COMMAND;
+    text: string;
+}
+
+/**
  * Union of all command types.
  *
  * The transport layer serializes this to JSON before sending.
@@ -335,7 +350,8 @@ export type BridgeCommand =
     | LoadConversationCommand
     | ToggleStarCommand
     | BookmarkCodeBlockCommand
-    | OpenConversationCommand;
+    | OpenConversationCommand
+    | DevCommandCommand;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  EVENT TYPES (Backend → Frontend)
@@ -401,6 +417,10 @@ export const EventType = {
     STAR_UPDATED: "STAR_UPDATED",
     BOOKMARK_RESULT: "BOOKMARK_RESULT",
     OPEN_CONVERSATION_RESULT: "OPEN_CONVERSATION_RESULT",
+
+    // ── Dev Events ───────────────────────────────────────────────
+    /** Dev command output, rendered as system message. */
+    DEV_OUTPUT: "DEV_OUTPUT",
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
@@ -717,6 +737,15 @@ export interface OpenConversationResultEvent {
 }
 
 /**
+ * Dev command output. Mirrors BridgeMessage.DevOutputEvent.
+ * Rendered as a system message in the chat UI.
+ */
+export interface DevOutputEvent {
+    type: typeof EventType.DEV_OUTPUT;
+    content: string;
+}
+
+/**
  * Union of all event types.
  *
  * The transport layer deserializes incoming JSON into one of these.
@@ -736,4 +765,5 @@ export type BridgeEvent =
     | ConversationHistoryEvent
     | StarUpdatedEvent
     | BookmarkResultEvent
-    | OpenConversationResultEvent;
+    | OpenConversationResultEvent
+    | DevOutputEvent;

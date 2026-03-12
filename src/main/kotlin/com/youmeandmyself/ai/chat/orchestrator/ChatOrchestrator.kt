@@ -92,7 +92,7 @@ import java.time.Instant
 class ChatOrchestrator(
     private val project: Project,
     private val contextAssembler: ContextAssembler,
-    private val correctionHelper: CorrectionFlowHelper,
+    internal val correctionHelper: CorrectionFlowHelper,
     private val conversationManager: ConversationManager,
     private val storage: LocalStorageFacade
 ) {

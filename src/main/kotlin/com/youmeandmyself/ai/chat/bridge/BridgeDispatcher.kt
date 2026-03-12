@@ -6,6 +6,8 @@ import com.youmeandmyself.ai.chat.orchestrator.ChatResult
 import com.youmeandmyself.ai.library.LibraryPanelHolder
 import com.youmeandmyself.ai.settings.AiProfilesState
 import com.youmeandmyself.dev.Dev
+import com.youmeandmyself.dev.DevCommandHandler
+import com.youmeandmyself.ai.providers.parsing.ui.CorrectionFlowHelper
 import com.youmeandmyself.ai.metrics.DefaultContextWindows
 import com.youmeandmyself.ai.metrics.MetricsService
 import com.youmeandmyself.storage.LocalStorageFacade
@@ -55,6 +57,14 @@ class BridgeDispatcher(
     private val scope = CoroutineScope(Dispatchers.IO)
     private val tabStateService = TabStateService.getInstance(project)
     private val storage = LocalStorageFacade.getInstance(project)
+    private val devCommandHandler: DevCommandHandler by lazy {
+        DevCommandHandler(
+            project = project,
+            correctionHelper = orchestrator.correctionHelper,
+            scope = scope,
+            sendEvent = sendEvent
+        )
+    }
 
     /**
      * Dispatch a command from the frontend.
@@ -86,6 +96,8 @@ class BridgeDispatcher(
             is BridgeMessage.BookmarkCodeBlock -> handleBookmarkCodeBlock(command)
             // R5: Cross-panel conversation open (TEMPORARY)
             is BridgeMessage.OpenConversation -> handleOpenConversation(command)
+            // Dev commands
+            is BridgeMessage.DevCommand -> handleDevCommand(command)
         }
     }
 
@@ -604,6 +616,25 @@ class BridgeDispatcher(
                 ))
             }
         }
+    }
+
+    // ── Dev: Command Handler ─────────────────────────────────────
+
+    /**
+     * Handle DEV_COMMAND — route /dev-* commands to DevCommandHandler.
+     *
+     * DevCommandHandler output goes back through DEV_OUTPUT events,
+     * rendered as system messages in the chat UI.
+     */
+    private fun handleDevCommand(command: BridgeMessage.DevCommand) {
+        if (!com.youmeandmyself.dev.DevMode.isEnabled()) {
+            emit(BridgeMessage.DevOutputEvent(
+                content = "Dev mode is not enabled. Start IDE with -Dymm.devMode=true"
+            ))
+            return
+        }
+
+        devCommandHandler.handleIfDevCommand(command.text)
     }
 
     // ── Helpers ──────────────────────────────────────────────────────

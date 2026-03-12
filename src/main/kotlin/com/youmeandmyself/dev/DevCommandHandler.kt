@@ -62,7 +62,8 @@ import com.youmeandmyself.storage.model.IdeContextCapture
 class DevCommandHandler(
     private val project: Project,
     private val correctionHelper: CorrectionFlowHelper,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val sendEvent: ((String) -> Unit)? = null
 ) {
     private val log = Dev.logger(DevCommandHandler::class.java)
 
@@ -76,12 +77,20 @@ class DevCommandHandler(
      * @param message The dev output text to display
      */
     private fun output(message: String) {
-        // Every line gets logged so output is visible in idea.log
         Dev.info(log, "dev.output", "message" to message)
 
-        // TODO: When reconnected, send through chosen output channel:
-        // Option A: sendEvent(DevOutputEvent(message))
-        // Option B: devConsolePanel.append(message)
+        // Send through bridge if wired
+        sendEvent?.let { send ->
+            try {
+                val event = com.youmeandmyself.ai.chat.bridge.BridgeMessage.DevOutputEvent(
+                    content = message
+                )
+                val json = com.youmeandmyself.ai.chat.bridge.BridgeMessage.serializeEvent(event)
+                send(json)
+            } catch (e: Exception) {
+                Dev.warn(log, "dev.output.bridge_failed", e)
+            }
+        }
     }
 
     /**

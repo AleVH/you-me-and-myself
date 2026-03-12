@@ -74,6 +74,7 @@ import {
     type StarUpdatedEvent,
     type BookmarkResultEvent,
     type OpenConversationResultEvent,
+    type DevOutputEvent,
     type TabStateDto, ProviderInfoDto,
 } from "../bridge/types";
 import { createAccumulator, accumulate, contextFillPercent } from "../metrics";
@@ -784,6 +785,37 @@ export function useBridge(): BridgeState {
             }),
         );
 
+        // DEV_OUTPUT → active tab (same as SYSTEM_MESSAGE)
+        unsubscribers.push(
+            onEvent(EventType.DEV_OUTPUT, (event: BridgeEvent) => {
+                const e = event as DevOutputEvent;
+                const targetId = activeTabIdRef.current;
+
+                setTabMap((prev) => {
+                    const tab = prev.get(targetId);
+                    if (!tab) return prev;
+
+                    const newMsg: ChatMessage = {
+                        id: `msg-${Date.now()}-${++idCounter.current}`,
+                        role: "system",
+                        content: e.content,
+                        timestamp: new Date().toISOString(),
+                        isError: false,
+                        exchangeId: null,
+                        correctionAvailable: false,
+                        isStarred: false,
+                    };
+
+                    const next = new Map(prev);
+                    next.set(targetId, {
+                        ...tab,
+                        messages: [...tab.messages, newMsg],
+                    });
+                    return next;
+                });
+            }),
+        );
+
         if (!isJcefMode()) {
             sendCommand({ type: CommandType.REQUEST_PROVIDERS });
             sendCommand({ type: CommandType.REQUEST_TAB_STATE });
@@ -804,6 +836,18 @@ export function useBridge(): BridgeState {
      */
     const sendMessage = useCallback(
         (text: string) => {
+            // ── Dev command intercept ────────────────────────────
+            // /dev-* commands route to DevCommandHandler on the backend,
+            // not to the AI provider. No user message bubble, no thinking
+            // indicator — output comes back as DEV_OUTPUT events.
+            if (text.toLowerCase().startsWith("/dev")) {
+                sendCommand({
+                    type: CommandType.DEV_COMMAND,
+                    text,
+                });
+                return;
+            }
+
             const targetId = activeTabIdRef.current;
             let convId: string | null = null;
             let tabProviderId: string | null = null;
