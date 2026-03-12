@@ -23,12 +23,12 @@ package com.youmeandmyself.ai.providers.generic
  * - IDE context is ONLY on the current prompt (last message). Historical turns
  *   carry whatever was stored at the time.
  *
- * BLOCK 4 PLACEHOLDER — SYSTEM PROMPT
- * - When Block 4 is implemented, a systemPrompt parameter will be added to chat().
- * - The system prompt will be injected as the FIRST message in the array:
+ * SYSTEM PROMPT (Block 4)
+ * - chat() accepts a systemPrompt parameter (from AssistantProfileService).
+ * - The system prompt is injected as the FIRST message in the array:
  *   - OpenAI/Custom: role="system"
- *   - Gemini: role="user" with "[System] " prefix (Gemini has no system role)
- * - Search for "BLOCK 4" comments to find all injection points.
+ *   - Gemini: role="user" with "[System Instructions] " prefix (Gemini has no system role)
+ * - buildMessageArray() and buildContentArray() handle the injection.
  */
 
 import com.youmeandmyself.ai.net.HttpClientFactory
@@ -126,13 +126,14 @@ class GenericLlmProvider(
      */
     override suspend fun chat(
         prompt: String,
-        history: List<ConversationTurn>
+        history: List<ConversationTurn>,
+        systemPrompt: String?
     ): ProviderResponse {
         val settings = chatSettings ?: RequestSettings.chatDefaults()
         return when (protocol) {
-            ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings, history)
-            ApiProtocol.GEMINI        -> requestGemini(prompt, settings, history)
-            ApiProtocol.CUSTOM        -> requestCustom(prompt, settings, history)
+            ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings, history, systemPrompt)
+            ApiProtocol.GEMINI        -> requestGemini(prompt, settings, history, systemPrompt)
+            ApiProtocol.CUSTOM        -> requestCustom(prompt, settings, history, systemPrompt)
         }
     }
 
@@ -226,22 +227,19 @@ class GenericLlmProvider(
      */
     private fun buildMessageArray(
         history: List<ConversationTurn>,
-        currentPrompt: String
+        currentPrompt: String,
+        systemPrompt: String? = null
     ): List<OpenAiMessage> {
         val messages = mutableListOf<OpenAiMessage>()
 
-        // ── BLOCK 4 PLACEHOLDER: System prompt injection point ──────────
-        // When Block 4 is implemented, the system prompt from AiProfile will be
-        // passed as a parameter to chat() and then to this method. Insert it here:
-        //
-        //   if (!systemPrompt.isNullOrBlank()) {
-        //       messages.add(OpenAiMessage(role = "system", content = systemPrompt))
-        //   }
-        //
-        // The system prompt defines the AI's persona and instructions. It goes
-        // BEFORE history so the AI processes it as its foundational context.
-        // Connected to: AiProfile.systemPrompt (settings UI), ChatOrchestrator (passes it through)
-        // ────────────────────────────────────────────────────────────────────
+        // ── System prompt (Block 4 — Assistant Profile) ─────────────────
+        // The summarized assistant profile is injected as the first message
+        // with role="system". This gives the AI its persona and behavioural
+        // instructions BEFORE any conversation history.
+        // Source: AssistantProfileService.getSystemPrompt() → ChatOrchestrator → here
+        if (!systemPrompt.isNullOrBlank()) {
+            messages.add(OpenAiMessage(role = "system", content = systemPrompt))
+        }
 
         // History turns — each ConversationTurn maps to one message
         for (turn in history) {
@@ -287,24 +285,20 @@ class GenericLlmProvider(
      */
     private fun buildContentArray(
         history: List<ConversationTurn>,
-        currentPrompt: String
+        currentPrompt: String,
+        systemPrompt: String? = null
     ): List<GeminiContent> {
         // Build a flat list of (role, text) pairs first, then merge consecutive same-role entries
         val rawPairs = mutableListOf<Pair<String, String>>()
 
-        // ── BLOCK 4 PLACEHOLDER: System prompt injection point ──────────
-        // When Block 4 is implemented, insert the system prompt here:
-        //
-        //   if (!systemPrompt.isNullOrBlank()) {
-        //       rawPairs.add("user" to "[System Instructions] $systemPrompt")
-        //   }
-        //
-        // Gemini has no "system" role — we use "user" with a clear prefix so the
-        // model treats it as instructions, not conversation. The prefix is important
-        // because the first history turn might also be "user", and Gemini requires
-        // alternating roles — the merge logic below handles this automatically.
-        // Connected to: AiProfile.systemPrompt (settings UI), ChatOrchestrator (passes it through)
-        // ────────────────────────────────────────────────────────────────────
+        // ── System prompt (Block 4 — Assistant Profile) ─────────────────
+        // Gemini has no "system" role — inject as "user" with a clear prefix so
+        // the model treats it as instructions, not conversation. The merge logic
+        // below handles consecutive same-role entries (system prompt + first user turn).
+        // Source: AssistantProfileService.getSystemPrompt() → ChatOrchestrator → here
+        if (!systemPrompt.isNullOrBlank()) {
+            rawPairs.add("user" to "[System Instructions] $systemPrompt")
+        }
 
         // History turns
         for (turn in history) {
@@ -451,12 +445,13 @@ class GenericLlmProvider(
     private suspend fun requestOpenAiCompat(
         prompt: String,
         settings: RequestSettings,
-        history: List<ConversationTurn>
+        history: List<ConversationTurn>,
+        systemPrompt: String? = null
     ): ProviderResponse {
         val url = normalizeBaseUrl(baseUrl) + "/v1/chat/completions"
         val m = model ?: "gpt-4o-mini"
 
-        val messages = buildMessageArray(history, prompt)
+        val messages = buildMessageArray(history, prompt, systemPrompt)
 
         val payload = OpenAiChatRequest(
             model = m,
@@ -522,12 +517,13 @@ class GenericLlmProvider(
     private suspend fun requestGemini(
         prompt: String,
         settings: RequestSettings,
-        history: List<ConversationTurn>
+        history: List<ConversationTurn>,
+        systemPrompt: String? = null
     ): ProviderResponse {
         val m = requireNotNull(model) { "Model required for GEMINI" }
         val url = normalizeBaseUrl(baseUrl) + "/v1beta/models/$m:generateContent"
 
-        val contents = buildContentArray(history, prompt)
+        val contents = buildContentArray(history, prompt, systemPrompt)
 
         Dev.info(log, "gemini.request",
             "url" to url,
@@ -606,13 +602,14 @@ class GenericLlmProvider(
     private suspend fun requestCustom(
         prompt: String,
         settings: RequestSettings,
-        history: List<ConversationTurn>
+        history: List<ConversationTurn>,
+        systemPrompt: String? = null
     ): ProviderResponse {
         val cfg = custom ?: CustomProtocolConfig()
         val url = normalizeBaseUrl(baseUrl) + cfg.chatPath
         val m = model ?: "gpt-4o-mini"
 
-        val messages = buildMessageArray(history, prompt)
+        val messages = buildMessageArray(history, prompt, systemPrompt)
 
         val payload = OpenAiChatRequest(
             model = m,

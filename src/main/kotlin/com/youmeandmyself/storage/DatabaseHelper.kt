@@ -20,24 +20,25 @@ import java.sql.ResultSet
  *
  * If the database is ever lost or corrupted, it can be fully rebuilt from JSONL.
  *
- * ## Schema: 12 Tables
+ * ## Schema: 14 Tables
  *
  * Created on first run, all tables exist from day one even if some features
  * (summaries, bookmarks) haven't been built yet. This avoids future migrations.
  *
- * 1.  projects          — registry of known projects
- * 2.  chat_exchanges    — metadata about AI conversations (points to JSONL)
- * 3.  code_elements     — map of codebase structure (files, classes, methods)
- * 4.  summaries         — metadata about generated summaries (points to JSONL)
- * 5.  summary_hierarchy — parent/child relationships between summaries
- * 6.  summary_config    — per-project summarization settings
- * 7.  collections       — user-created groups for bookmarks
- * 8.  bookmarks         — saved items (chat or summary) with cached content
- * 9.  bookmark_tags     — tags on bookmarks for filtering
- * 10. storage_config    — global plugin settings (retention, cleanup thresholds)
- * 11. open_tabs         — persisted chat tab state for restore on IDE restart
- * 12. code_bookmarks    — saved code blocks from chat responses
- * 13. metrics           — per-exchange token usage metrics for the Metrics Module
+ * 1.  projects                     — registry of known projects
+ * 2.  chat_exchanges               — metadata about AI conversations (points to JSONL)
+ * 3.  code_elements                — map of codebase structure (files, classes, methods)
+ * 4.  summaries                    — metadata about generated summaries (points to JSONL)
+ * 5.  summary_hierarchy            — parent/child relationships between summaries
+ * 6.  summary_config               — per-project summarization settings
+ * 7.  collections                  — user-created groups for bookmarks
+ * 8.  bookmarks                    — saved items (chat or summary) with cached content
+ * 9.  bookmark_tags                — tags on bookmarks for filtering
+ * 10. storage_config               — global plugin settings (retention, cleanup thresholds)
+ * 11. open_tabs                    — persisted chat tab state for restore on IDE restart
+ * 12. code_bookmarks               — saved code blocks from chat responses
+ * 13. metrics                      — per-exchange token usage metrics for the Metrics Module
+ * 14. assistant_profile_summary    — stores the summarized version of the user's assistant profile
  *
  * ## Thread Safety
  *
@@ -285,6 +286,7 @@ class DatabaseHelper(private val dbFile: File) {
                     stmt.execute("DROP TABLE IF EXISTS storage_config")
                     stmt.execute("DROP TABLE IF EXISTS projects")
                     stmt.execute("DROP TABLE IF EXISTS open_tabs")
+                    stmt.execute("DROP TABLE IF EXISTS assistant_profile_summary")
                 }
 
                 // ── Table 1: projects ──
@@ -585,6 +587,36 @@ class DatabaseHelper(private val dbFile: File) {
                 // we never need to add it later (adding indexes to large tables is slow).
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_metrics_user         ON metrics(user_id)")
 
+                // ── Table 14: assistant_profile_summary ──
+                // Stores the summarized version of the user's assistant profile.
+                //
+                // The assistant profile is GLOBAL (not per-project) — this is a user-level
+                // personality configuration that applies across all projects.
+                //
+                // At launch: single row with id='active'.
+                // Future (multi-profile): id becomes a real key, one row per profile.
+                //
+                // No project_id column — deliberately omitted because the assistant profile
+                // is not project-scoped. If per-project overrides are added later, that would
+                // be a separate table or a new column.
+                //
+                // source_hash enables change detection: compare against the hash of the
+                // current profile.yaml content to skip unnecessary re-summarization.
+                stmt.execute("""
+                CREATE TABLE IF NOT EXISTS assistant_profile_summary (
+                    id                  TEXT PRIMARY KEY,
+                    source_hash         TEXT NOT NULL,
+                    summary_text        TEXT NOT NULL,
+                    provider_id         TEXT NOT NULL,
+                    model_id            TEXT NOT NULL,
+                    full_tokens         INTEGER,
+                    summary_tokens      INTEGER,
+                    generated_at        TEXT NOT NULL,
+                    raw_file            TEXT NOT NULL,
+                    raw_available       INTEGER NOT NULL DEFAULT 1
+                )
+            """.trimIndent())
+
                 // Insert default config values if they don't exist yet.
                 // Using INSERT OR IGNORE so this is safe on every startup.
                 val defaults = listOf(
@@ -592,7 +624,11 @@ class DatabaseHelper(private val dbFile: File) {
                     "cleanup_suggestion_threshold_mb" to "2048",
                     "last_cleanup_suggestion" to null,
                     "storage_root_path" to StorageConfig.DEFAULT_ROOT.absolutePath,
-                    "keep_tabs" to "true"
+                    "keep_tabs" to "true",
+                    // ── Assistant Profile (Block 4) ──────────────────────────
+                    "assistant_profile_enabled" to "true",
+                    "assistant_profile_fallback_full" to "false",
+                    "assistant_profile_file_path" to null  // null = use default path ({storage-root}/profile/profile.yaml)
                 )
                 val insertConfig = conn.prepareStatement(
                     "INSERT OR IGNORE INTO storage_config (config_key, config_value) VALUES (?, ?)"
@@ -605,7 +641,7 @@ class DatabaseHelper(private val dbFile: File) {
                 insertConfig.close()
             }
 
-            Dev.info(log, "db.schema.created", "tables" to 13)
+            Dev.info(log, "db.schema.created", "tables" to 14)
         } catch (e: org.sqlite.SQLiteException) {
             if (e.message?.contains("FOREIGN KEY") == true) {
                 Dev.error(log, "db.schema.fk_error", e, "line" to "createSchema")

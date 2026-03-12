@@ -36,7 +36,8 @@ object FeatureMatrix {
         Feature.SUMMARY_PERSISTENT,
         Feature.PROFILE_BASIC,
         Feature.BUDGET_ENFORCEMENT,
-        Feature.BACKGROUND_SUMMARIZER
+        Feature.BACKGROUND_SUMMARIZER,
+        Feature.ASSISTANT_PROFILE
     )
 
     // ── Individual Pro: advanced individual features ─────────────────────

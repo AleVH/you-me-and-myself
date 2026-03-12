@@ -74,29 +74,34 @@ interface AiProvider {
      * any IDE context that was part of the original prompt). Only the current
      * message (the [prompt] parameter) carries fresh IDE context.
      *
-     * ## BLOCK 4 PLACEHOLDER — System Prompt Injection
+     * ## System Prompt (Block 4)
      *
-     * Block 4 will add a `systemPrompt: String? = null` parameter here.
-     * When provided, the system prompt will be inserted as the FIRST message
-     * in the messages array with role "system" (OpenAI/Custom) or as a framed
-     * "user" message (Gemini, which has no system role).
+     * When [systemPrompt] is provided, it is inserted as the FIRST message in the
+     * messages array:
+     * - OpenAI/Custom: role="system", content=systemPrompt
+     * - Gemini: role="user", content="[System Instructions] $systemPrompt"
+     *   (Gemini has no native system role)
      *
-     * The system prompt comes from AiProfile.systemPrompt (a per-profile
-     * configurable field set in Settings → YMM Assistant → Profiles).
-     * ChatOrchestrator will read it from the active profile and pass it here.
+     * The system prompt comes from the Assistant Profile system — a user-authored
+     * personality profile that is automatically summarized and prepended to every request.
+     * ChatOrchestrator reads it from AssistantProfileService.getSystemPrompt().
      *
-     * Message order when Block 4 is implemented:
+     * Message order:
      *   [system prompt] → [history turns] → [current user message with IDE context]
      *
      * @param prompt The complete prompt to send (user input + any context)
      * @param history Previous conversation turns for multi-turn context.
      *   Empty list = single-message request (backwards compatible).
      *   Assembled by ChatOrchestrator via ConversationManager.buildHistory().
+     * @param systemPrompt Optional system prompt from the Assistant Profile.
+     *   When non-null, injected as the first message before history and prompt.
+     *   Null = no system prompt (backwards compatible).
      * @return [ProviderResponse] with raw JSON, HTTP status, and parsed content
      */
     suspend fun chat(
         prompt: String,
-        history: List<ConversationTurn> = emptyList()
+        history: List<ConversationTurn> = emptyList(),
+        systemPrompt: String? = null
     ): ProviderResponse
 
     /**

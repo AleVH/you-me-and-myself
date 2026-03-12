@@ -189,17 +189,46 @@ object SummaryExtractor {
     """.trimMargin()
 
     /**
-     * PROFILE_SUMMARY template (placeholder).
+     * PROFILE_SUMMARY template.
      *
-     * TODO (Block 4): Will take profile YAML sections, produce a concise faithful summary
-     * preserving all directives. Triggered by the Profile system on profile edit.
-     * Uses SummarizationService with PROFILE_SUMMARY purpose.
+     * Summarizes the user's assistant profile YAML into a concise directive set
+     * that is prepended to every API request's system prompt.
      *
-     * @see com.youmeandmyself.summary.consumers.ProfileSummarizer
+     * ## Design Principles
+     *
+     * - **Faithful:** Every directive in the original must appear in the summary.
+     *   Omitting a directive is worse than a longer summary.
+     * - **Concise:** Merge overlapping instructions, remove redundancy, compress
+     *   verbose explanations into direct commands.
+     * - **Structured:** Preserve section grouping so the AI can distinguish between
+     *   e.g. communication style and coding conventions.
+     * - **No interpretation:** The summary must not add, infer, or reframe directives.
+     *   If the user says "never use tabs", the summary says "never use tabs" — not
+     *   "prefers spaces" (which loses the emphasis).
+     *
+     * ## {content} Placeholder
+     *
+     * SummarizationService replaces {content} with the full profile text
+     * (all sections concatenated with labels via AssistantProfileData.toFullText).
+     *
+     * @see com.youmeandmyself.summary.consumers.AssistantProfileSummarizer
      */
     private val PROFILE_TEMPLATE = """
-        |TODO: Profile summary template — not implemented yet (Block 4).
-        |Will summarize user's AI profile YAML, preserving all directives faithfully.
+        |You are summarizing an AI assistant's personality profile. This profile contains
+        |the user's directives for how the AI should behave across all conversations.
+        |
+        |Your task: produce a concise version that preserves EVERY directive faithfully.
+        |
+        |Rules:
+        |1. Every instruction in the original MUST appear in your summary. Do not omit anything.
+        |2. Merge overlapping or redundant instructions into single clear statements.
+        |3. Use direct imperative language ("Use 4-space indentation" not "The user prefers 4-space indentation").
+        |4. Preserve the section structure (keep section headings).
+        |5. Do not add, infer, or reinterpret directives beyond what is explicitly stated.
+        |6. Do not include meta-commentary about the summarization process.
+        |7. Output ONLY the summarized profile — no preamble, no explanation.
+        |
+        |Profile to summarize:
         |
         |{content}
     """.trimMargin()

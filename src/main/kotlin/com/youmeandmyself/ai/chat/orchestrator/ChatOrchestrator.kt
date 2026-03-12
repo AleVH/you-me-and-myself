@@ -18,7 +18,7 @@ import com.youmeandmyself.storage.model.ExchangePurpose
 import com.youmeandmyself.storage.model.ExchangeRawResponse
 import com.youmeandmyself.storage.model.ExchangeRequest
 import com.youmeandmyself.storage.model.ExchangeTokenUsage
-import com.youmeandmyself.storage.model.ConversationTurn
+import com.youmeandmyself.profile.AssistantProfileService
 import com.youmeandmyself.storage.model.IdeContext
 import com.youmeandmyself.storage.model.IdeContextCapture
 import kotlinx.coroutines.CoroutineScope
@@ -297,15 +297,34 @@ class ChatOrchestrator(
             //   - history: previous conversation turns (Phase A3)
             //   - assembled.effectivePrompt: current user message with fresh IDE context
             //
-            // BLOCK 4 PLACEHOLDER — System Prompt:
-            // When Block 4 is implemented, the system prompt from AiProfile will also
-            // be passed here. ChatOrchestrator will read it from the active profile:
-            //   val systemPrompt = profileState.profiles.find { it.id == provider.id }?.systemPrompt
-            // And pass it to: provider.chat(assembled.effectivePrompt, history, systemPrompt)
-            // The provider inserts it as the first message in the messages array.
-            // Connected to: AiProfile.systemPrompt (settings), GenericLlmProvider (injection)
+            // ── System prompt from Assistant Profile ─────────────────────
+            // The summarized assistant profile is prepended to every request as the
+            // system prompt. This gives the AI its persona/instructions before any
+            // conversation history.
+            //
+            // AssistantProfileService.getSystemPrompt() returns:
+            // - The cached summary text (hot path — no DB/disk access)
+            // - The full profile text if fallback is enabled and summary is unavailable
+            // - null if the feature is disabled, unavailable, or no profile exists
+            //
+            // The provider injects it as the FIRST message:
+            // - OpenAI/Custom: role="system"
+            // - Gemini: role="user" with "[System Instructions] " prefix
+            val systemPrompt = try {
+                AssistantProfileService.getInstance(project).getSystemPrompt()
+            } catch (e: Exception) {
+                Dev.warn(log, "orchestrator.system_prompt_failed", e)
+                null
+            }
+
+            if (systemPrompt != null) {
+                Dev.info(log, "orchestrator.system_prompt_attached",
+                    "length" to systemPrompt.length
+                )
+            }
+
             val callStartMs = System.currentTimeMillis()
-            val response = provider.chat(assembled.effectivePrompt, history)
+            val response = provider.chat(assembled.effectivePrompt, history, systemPrompt)
             val responseTimeMs = System.currentTimeMillis() - callStartMs
 
             Dev.info(log, "orchestrator.provider_response",

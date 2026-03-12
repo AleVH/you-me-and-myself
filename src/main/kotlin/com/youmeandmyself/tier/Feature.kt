@@ -71,5 +71,8 @@ enum class Feature(val description: String) {
 
     // ── Background Processing ────────────────────────────────────────────
     /** Automatic background summarization of code changes. */
-    BACKGROUND_SUMMARIZER("Background summarization")
+    BACKGROUND_SUMMARIZER("Background summarization"),
+
+    // ── Assistant Profile ─────────────────────────────────────────────
+    ASSISTANT_PROFILE("Assistant profile personality system"),
 }

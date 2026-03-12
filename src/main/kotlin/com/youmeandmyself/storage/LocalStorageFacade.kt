@@ -1863,4 +1863,142 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             }.firstOrNull()
         }
     }
+
+    // ==================== Assistant Profile ====================
+
+    /**
+     * Load the assistant profile summary from the assistant_profile_summary table.
+     *
+     * Returns the stored summary + source hash for the given profile id.
+     * At launch, only id="active" is used (single global profile).
+     *
+     * @param profileId The profile identifier (default "active")
+     * @return The stored summary data, or null if no summary exists
+     */
+    fun loadAssistantProfileSummary(profileId: String = "active"): AssistantProfileSummaryRow? {
+        return withReadableDatabase { db ->
+            db.queryOne(
+                "SELECT summary_text, source_hash, provider_id, model_id, full_tokens, summary_tokens, generated_at FROM assistant_profile_summary WHERE id = ?",
+                profileId
+            ) { rs ->
+                AssistantProfileSummaryRow(
+                    summaryText = rs.getString("summary_text"),
+                    sourceHash = rs.getString("source_hash"),
+                    providerId = rs.getString("provider_id"),
+                    modelId = rs.getString("model_id"),
+                    fullTokens = rs.getInt("full_tokens").let { if (rs.wasNull()) null else it },
+                    summaryTokens = rs.getInt("summary_tokens").let { if (rs.wasNull()) null else it },
+                    generatedAt = rs.getString("generated_at")
+                )
+            }
+        }
+    }
+
+    /**
+     * Save (upsert) the assistant profile summary.
+     *
+     * Uses INSERT OR REPLACE since the id is fixed at "active" (single profile).
+     * When multi-profile is supported, this becomes a standard upsert by id.
+     *
+     * @param profileId The profile identifier (default "active")
+     * @param summaryText The AI-generated summary text
+     * @param sourceHash SHA-256 hash of the source profile.yaml content
+     * @param providerId The provider that generated the summary
+     * @param modelId The model used for summarization
+     * @param fullTokens Token count of the full profile (null if unavailable)
+     * @param summaryTokens Token count of the summary (null if unavailable)
+     * @param rawFile Reference to the JSONL exchange entry
+     */
+    fun saveAssistantProfileSummary(
+        profileId: String = "active",
+        summaryText: String,
+        sourceHash: String,
+        providerId: String,
+        modelId: String,
+        fullTokens: Int?,
+        summaryTokens: Int?,
+        rawFile: String
+    ) {
+        withDatabase { db ->
+            db.execute(
+                """INSERT OR REPLACE INTO assistant_profile_summary 
+                   (id, source_hash, summary_text, provider_id, model_id, 
+                    full_tokens, summary_tokens, generated_at, raw_file, raw_available)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, 1)""".trimIndent(),
+                profileId,
+                sourceHash,
+                summaryText,
+                providerId,
+                modelId,
+                fullTokens,
+                summaryTokens,
+                rawFile
+            )
+        }
+    }
+
+    // ==================== Storage Config Access ====================
+
+    /**
+     * Read a value from the storage_config table.
+     *
+     * General-purpose config reader. Used by AssistantProfileService for profile
+     * settings, and available for any future config key reads.
+     *
+     * @param key The config key to look up
+     * @return The config value, or null if the key doesn't exist
+     */
+    fun getConfigValue(key: String): String? {
+        return withReadableDatabase { db ->
+            db.queryOne(
+                "SELECT config_value FROM storage_config WHERE config_key = ?",
+                key
+            ) { rs ->
+                rs.getString("config_value")
+            }
+        }
+    }
+
+    /**
+     * Write a value to the storage_config table (insert or update).
+     *
+     * General-purpose config writer. Uses INSERT OR REPLACE so it works for
+     * both new keys and existing keys.
+     *
+     * @param key The config key
+     * @param value The config value (null to store SQL NULL)
+     */
+    fun setConfigValue(key: String, value: String?) {
+        withDatabase { db ->
+            db.execute(
+                "INSERT OR REPLACE INTO storage_config (config_key, config_value) VALUES (?, ?)",
+                key,
+                value
+            )
+        }
+    }
 }
+
+/**
+ * Row data from the assistant_profile_summary table.
+ *
+ * Returned by [LocalStorageFacade.loadAssistantProfileSummary].
+ * Contains the cached summary and metadata for change detection.
+ *
+ * @property summaryText The AI-generated summary
+ * @property sourceHash SHA-256 hash of the profile.yaml content that was summarized
+ * @property providerId Which provider generated this summary
+ * @property modelId Which model was used
+ * @property fullTokens Token count of the full profile (null if unavailable)
+ * @property summaryTokens Token count of the summary (null if unavailable)
+ * @property generatedAt ISO timestamp of when the summary was generated
+ */
+data class AssistantProfileSummaryRow(
+    val summaryText: String,
+    val sourceHash: String,
+    val providerId: String,
+    val modelId: String,
+    val fullTokens: Int?,
+    val summaryTokens: Int?,
+    val generatedAt: String
+)
