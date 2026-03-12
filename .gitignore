@@ -26,3 +26,9 @@ IDLE
 # Local / working documentation (not versioned)
 docs/
 
+# Database files
+identifier.sqlite
+
+# Frontend build artifacts and dependencies
+react-frontend/dist/
+react-frontend/node_modules/
