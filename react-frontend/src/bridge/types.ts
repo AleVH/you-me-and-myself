@@ -153,6 +153,21 @@ export const CommandType = {
     // ── Dev Commands ──────────────────────────────────────────────
     /** User typed a /dev-* command. @see BridgeMessage.DevCommand */
     DEV_COMMAND: "DEV_COMMAND",
+
+    // ── Block 5C: Frontend Logging ──────────────────────────────
+    /**
+     * Frontend log entry routed to the IDE's idea.log via Dev.info/warn/error.
+     *
+     * Replaces dead console.log calls inside JCEF. The backend tags these
+     * as "react.{source}" so they're easily identifiable in idea.log.
+     * In Vite dev mode, log.ts falls back to native console methods instead
+     * of sending this command.
+     *
+     * @see log.ts — frontend utility that sends these
+     * @see BridgeMessage.FrontendLog — Kotlin command class
+     * @see BridgeDispatcher.handleFrontendLog — Kotlin handler
+     */
+    FRONTEND_LOG: "FRONTEND_LOG",
 } as const;
 
 export type CommandType = (typeof CommandType)[keyof typeof CommandType];
@@ -172,6 +187,22 @@ export interface SendMessageCommand {
     text: string;
     conversationId: string | null;
     providerId: string | null;
+    /**
+     * Context bypass mode for this message.
+     *
+     * Controls whether the backend's ContextAssembler gathers IDE context
+     * before sending the prompt to the AI provider.
+     *
+     * - null / "OFF": Normal flow — full context gathering runs.
+     * - "FULL": Skip all context gathering (steps 1-4). System prompt and
+     *   conversation history still flow (handled by orchestrator, not assembler).
+     * - "SELECTIVE": Pro-tier per-component bypass. Currently a STUB — treated
+     *   as OFF until Phase C wires the ContextLever component.
+     *
+     * @see ContextAssembler.assemble — checks this field for early return
+     * @see Feature.CONTEXT_SELECTIVE_BYPASS — tier gate for SELECTIVE mode
+     */
+    bypassMode: string | null;
 }
 
 /** User confirms heuristic was correct. Mirrors BridgeMessage.ConfirmCorrection. */
@@ -329,6 +360,24 @@ export interface DevCommandCommand {
 }
 
 /**
+ * Frontend log entry. Mirrors BridgeMessage.FrontendLog.
+ *
+ * Sent by log.ts to route React-side logs to idea.log via the
+ * Dev logging system. The backend tags these as "react.{source}".
+ *
+ * @see log.ts — sends these commands
+ */
+export interface FrontendLogCommand {
+    type: typeof CommandType.FRONTEND_LOG;
+    /** Log severity: "INFO", "WARN", or "ERROR". */
+    level: string;
+    /** Human-readable log message (may include formatted context data). */
+    message: string;
+    /** The React module or component that produced this log (e.g., "useBridge"). */
+    source: string;
+}
+
+/**
  * Union of all command types.
  *
  * The transport layer serializes this to JSON before sending.
@@ -351,7 +400,8 @@ export type BridgeCommand =
     | ToggleStarCommand
     | BookmarkCodeBlockCommand
     | OpenConversationCommand
-    | DevCommandCommand;
+    | DevCommandCommand
+    | FrontendLogCommand;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  EVENT TYPES (Backend → Frontend)

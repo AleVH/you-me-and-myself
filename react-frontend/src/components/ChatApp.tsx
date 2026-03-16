@@ -10,11 +10,15 @@
  * ├──────────────────────────────┤
  * │  TabBar (conversation tabs)  │  ← R4: tab bar with +/× buttons
  * ├──────────────────────────────┤
+ * │  Collapse toolbar            │  ← shown when 2+ assistant messages
+ * ├──────────────────────────────┤
  * │                              │
  * │  MessageList (scrollable)    │  ← flex-grow, auto-scroll
  * │    └── ThinkingIndicator     │  ← inside scroll area
  * │    └── ScrollToBottom btn    │  ← R4: floating when scrolled up
  * │                              │
+ * ├──────────────────────────────┤
+ * │  ContextDialStrip            │  ← Block 5: bypass mode toggle
  * ├──────────────────────────────┤
  * │  InputBar (text + send)      │  ← fixed at bottom
  * └──────────────────────────────┘
@@ -30,6 +34,11 @@
  *
  * - Passes scrollPosition and onBookmarkCodeBlock to MessageList
  * - R5: Bookmark/Library integration, code block save-to-library
+ *
+ * ## Block 5 Changes
+ *
+ * - ContextDialStrip between MessageList and InputBar for bypass mode control
+ * - bridge.bypassMode / bridge.setBypassMode for per-tab context bypass
  */
 import { useBridge } from "../hooks/useBridge";
 import MessageList from "./MessageList";
@@ -37,6 +46,7 @@ import InputBar from "./InputBar";
 import ProviderSelector from "./ProviderSelector";
 import MetricsBar from "../metrics/MetricsBar";
 import TabBar from "./TabBar";
+import ContextDialStrip from "./context/ContextDialStrip";
 
 function ChatApp() {
     const bridge = useBridge();
@@ -87,6 +97,14 @@ function ChatApp() {
                 onScrolledUpChange={bridge.setScrolledUp}
                 onScrollPositionChange={bridge.saveScrollPosition}
                 onToggleCollapse={bridge.toggleCollapse}
+            />
+
+            {/* Block 5: Context bypass mode toggle — sits above the input
+                bar so the user sees the current mode before sending. */}
+            <ContextDialStrip
+                mode={bridge.bypassMode}
+                onModeChange={bridge.setBypassMode}
+                canUseSelective={false} /* Basic tier — SELECTIVE gated behind Pro */
             />
 
             <InputBar

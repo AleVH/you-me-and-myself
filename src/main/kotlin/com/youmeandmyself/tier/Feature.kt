@@ -58,6 +58,19 @@ enum class Feature(val description: String) {
     /** Token budget caps per session/day/month with automatic enforcement. */
     BUDGET_ENFORCEMENT("Token budget enforcement"),
 
+    // ── Context Control ────────────────────────────────────────────────────
+    /**
+     * Per-component context bypass (SELECTIVE mode).
+     *
+     * Allows Pro-tier users to selectively disable individual context
+     * detectors (e.g., skip project structure but keep current file) via
+     * the ContextLever UI. Basic-tier users only get OFF/FULL toggle.
+     *
+     * @see ContextAssembler.assemble — checks bypassMode parameter
+     * @see ContextDial — React component (Phase C) that sets the mode
+     */
+    CONTEXT_SELECTIVE_BYPASS("Per-component context bypass (Pro)"),
+
     // ── Context & Branching ──────────────────────────────────────────────
     /** Smart conversation branching (Lite/Thread/Deep modes). */
     CONTEXT_BRANCHING("Conversation branching"),

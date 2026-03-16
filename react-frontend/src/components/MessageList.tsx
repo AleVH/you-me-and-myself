@@ -46,6 +46,7 @@ import { renderMarkdown } from "../rendering/markdownRenderer";
 import { renderMermaidBlocks } from "../rendering/mermaidRenderer";
 import SystemMessage from "./SystemMessage";
 import ThinkingIndicator from "./ThinkingIndicator";
+import { log } from "../utils/log";
 
 interface MessageListProps {
     messages: ChatMessage[];
@@ -226,7 +227,7 @@ function MessageList({
                         fallbackCopy(code, target);
                     }
                 } catch (err) {
-                    console.error("[YMM] Failed to decode code for copy:", err);
+                    log.error("MessageList", "Failed to decode code for copy", { error: String(err) });
                 }
                 return;
             }

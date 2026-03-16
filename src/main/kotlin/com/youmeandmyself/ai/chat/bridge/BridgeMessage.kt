@@ -64,6 +64,13 @@ object BridgeMessage {
      * providerId: the profile ID to use for this tab's conversation.
      *   If null, falls back to the globally selected chat provider.
      *   Set by the frontend from the per-tab provider selection.
+     * bypassMode: controls whether ContextAssembler gathers IDE context.
+     *   null / "OFF" = normal flow (full context gathering).
+     *   "FULL" = skip all context gathering (system prompt + history still flow).
+     *   "SELECTIVE" = Pro-tier per-component bypass (STUB — treated as OFF).
+     *
+     * @see ContextAssembler.assemble — checks bypassMode for early return
+     * @see Feature.CONTEXT_SELECTIVE_BYPASS — tier gate for SELECTIVE mode
      */
     @Serializable
     @SerialName("SEND_MESSAGE")
@@ -71,7 +78,8 @@ object BridgeMessage {
         override val type: String = "SEND_MESSAGE",
         val text: String,
         val conversationId: String? = null,
-        val providerId: String? = null
+        val providerId: String? = null,
+        val bypassMode: String? = null
     ) : Command()
 
     @Serializable
@@ -252,6 +260,35 @@ object BridgeMessage {
     data class DevCommand(
         override val type: String = "DEV_COMMAND",
         val text: String
+    ) : Command()
+
+    // ── Block 5C: Frontend Logging ──────────────────────────────
+
+    /**
+     * Log entry from the React frontend, routed to idea.log via [Dev].
+     *
+     * console.log is dead inside JCEF — the embedded Chromium doesn't
+     * expose DevTools in production. The frontend's log.ts utility sends
+     * FRONTEND_LOG commands instead, and this handler routes them to the
+     * standard IDE logging system.
+     *
+     * Tagged as "react.{source}" in idea.log for easy filtering:
+     *   react.useBridge — CHAT_RESULT received {exchangeId=abc}
+     *   react.ChatApp — mounted with 3 tabs
+     *
+     * @see BridgeDispatcher.handleFrontendLog — routing handler
+     * @see log.ts — React-side utility that sends these
+     */
+    @Serializable
+    @SerialName("FRONTEND_LOG")
+    data class FrontendLog(
+        override val type: String = "FRONTEND_LOG",
+        /** Severity: "INFO", "WARN", or "ERROR". */
+        val level: String,
+        /** The log message (may include formatted context). */
+        val message: String,
+        /** React module or component name (e.g., "useBridge"). */
+        val source: String = "unknown"
     ) : Command()
 
     // ═══════════════════════════════════════════════════════════════════
@@ -572,6 +609,8 @@ object BridgeMessage {
                 "OPEN_CONVERSATION" -> json.decodeFromString<OpenConversation>(jsonString)
                 // Dev command
                 "DEV_COMMAND" -> json.decodeFromString<DevCommand>(jsonString)
+                // Block 5C: Frontend logging
+                "FRONTEND_LOG" -> json.decodeFromString<FrontendLog>(jsonString)
                 else -> {
                     Dev.warn(log, "bridge.parse.unknown_command", null,
                         "type" to (typeField ?: "null")

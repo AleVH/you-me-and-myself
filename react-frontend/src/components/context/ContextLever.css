@@ -1,0 +1,110 @@
+/**
+ * ContextLever styles — horizontal slider for per-component bypass.
+ *
+ * ## Theme
+ *
+ * Darcula dark palette. Green → amber → red gradient on the track
+ * to indicate context richness (green = more context, red = less).
+ *
+ * ## BEM Naming
+ *
+ * .ymm-context-lever              — outer container (inline row)
+ * .ymm-context-lever__track       — the gradient bar
+ * .ymm-context-lever__snap        — individual snap position marker
+ * .ymm-context-lever__snap--active — currently selected snap
+ * .ymm-context-lever__handle      — draggable thumb
+ * .ymm-context-lever__label       — current level text
+ * .ymm-context-lever__stub        — "Coming soon" overlay badge
+ */
+
+/* ── Container ───────────────────────────────────────────────────── */
+
+.ymm-context-lever {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    position: relative;
+}
+
+/* ── Track ────────────────────────────────────────────────────────── */
+
+.ymm-context-lever__track {
+    position: relative;
+    width: 120px;
+    height: 8px;
+    border-radius: 4px;
+    cursor: pointer;
+
+    /* Green (full context) → Amber (partial) → Red (minimal) */
+    background: linear-gradient(to left, #6a9955, #dcdcaa, #f44747);
+}
+
+/* ── Snap markers ─────────────────────────────────────────────────── */
+
+.ymm-context-lever__snap {
+    position: absolute;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.3);
+    pointer-events: none;
+}
+
+.ymm-context-lever__snap--active {
+    background: rgba(255, 255, 255, 0.8);
+}
+
+/* ── Draggable handle ─────────────────────────────────────────────── */
+
+.ymm-context-lever__handle {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #d4d4d4;
+    border: 2px solid #1e1e1e;
+    cursor: grab;
+    transition: left 0.15s ease, box-shadow 0.15s ease;
+    touch-action: none; /* Prevent scroll on drag */
+}
+
+.ymm-context-lever__handle:hover {
+    box-shadow: 0 0 4px rgba(86, 156, 214, 0.5);
+}
+
+.ymm-context-lever__handle:active {
+    cursor: grabbing;
+    box-shadow: 0 0 6px rgba(86, 156, 214, 0.7);
+}
+
+.ymm-context-lever__handle:focus-visible {
+    outline: 1px solid #569cd6;
+    outline-offset: 2px;
+}
+
+/* ── Level label ──────────────────────────────────────────────────── */
+
+.ymm-context-lever__label {
+    font-size: 11px;
+    color: #808080;
+    white-space: nowrap;
+    min-width: 48px;
+}
+
+/* ── Stub overlay badge ──────────────────────────────────────────── */
+
+.ymm-context-lever__stub {
+    font-size: 9px;
+    color: #1e1e1e;
+    background: #dcdcaa;
+    padding: 1px 4px;
+    border-radius: 3px;
+    white-space: nowrap;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+}

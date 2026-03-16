@@ -1,0 +1,94 @@
+/**
+ * ContextDialStrip styles — compact bar for context bypass controls.
+ *
+ * ## Theme
+ *
+ * Darcula dark palette. Sits between MessageList and InputBar.
+ * Blends with the surrounding surfaces using matching background.
+ *
+ * ## BEM Naming
+ *
+ * .ymm-context-strip              — outer container
+ * .ymm-context-strip--expanded    — expanded state modifier
+ * .ymm-context-strip__row         — primary row (dial + label + toggle)
+ * .ymm-context-strip__label       — mode display text
+ * .ymm-context-strip__label--off  — OFF mode color
+ * .ymm-context-strip__label--full — FULL mode color
+ * .ymm-context-strip__label--selective — SELECTIVE mode color
+ * .ymm-context-strip__expand      — expand/collapse toggle button
+ * .ymm-context-strip__detail      — expanded detail row (lever)
+ */
+
+/* ── Container ───────────────────────────────────────────────────── */
+
+.ymm-context-strip {
+    /* Match the InputBar's surface color for visual cohesion */
+    background: #252526;
+    border-top: 1px solid #333333;
+    padding: 4px 8px;
+    flex-shrink: 0; /* Never collapse in the flex layout */
+}
+
+/* ── Primary row ─────────────────────────────────────────────────── */
+
+.ymm-context-strip__row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 24px; /* Compact — matches dial height */
+}
+
+/* ── Mode label ──────────────────────────────────────────────────── */
+
+.ymm-context-strip__label {
+    font-size: 11px;
+    font-family: system-ui, -apple-system, sans-serif;
+    white-space: nowrap;
+    flex: 1; /* Push expand button to the right */
+    transition: color 0.2s ease;
+}
+
+/* Mode-specific label colors */
+.ymm-context-strip__label--off {
+    color: #808080;
+}
+
+.ymm-context-strip__label--full {
+    color: #569cd6;
+}
+
+.ymm-context-strip__label--selective {
+    color: #dcdcaa;
+}
+
+/* ── Expand/collapse toggle ──────────────────────────────────────── */
+
+.ymm-context-strip__expand {
+    background: none;
+    border: none;
+    color: #808080;
+    font-size: 14px;
+    cursor: pointer;
+    padding: 2px 4px;
+    line-height: 1;
+    border-radius: 3px;
+    transition: color 0.15s ease, background 0.15s ease;
+}
+
+.ymm-context-strip__expand:hover {
+    color: #d4d4d4;
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.ymm-context-strip__expand:focus-visible {
+    outline: 1px solid #569cd6;
+    outline-offset: 1px;
+}
+
+/* ── Detail row (expanded lever area) ────────────────────────────── */
+
+.ymm-context-strip__detail {
+    padding: 4px 0 2px 32px; /* Left-pad to align with label text past the dial */
+    border-top: 1px solid #333333;
+    margin-top: 4px;
+}

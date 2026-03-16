@@ -79,6 +79,7 @@ import {
 } from "../bridge/types";
 import { createAccumulator, accumulate, contextFillPercent } from "../metrics";
 import type {TabMetricsState, MetricsSnapshot} from "../metrics";
+import { log } from "../utils/log";
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CONSTANTS
@@ -111,6 +112,19 @@ export interface ChatMessage {
     correctionAvailable: boolean;
     /** R4: Whether this exchange is starred (favourite). Only meaningful for assistant messages. */
     isStarred: boolean;
+    /**
+     * Block 5C: Human-readable manifest of what context was attached.
+     * e.g., "[Context: 5 files (3 raw, 2 summaries), ~12400 chars]"
+     * Null for user messages, system messages, and exchanges with no context.
+     * Phase 1 (launch): rendered as compact text in ContextBadgeTray.
+     * Phase 2 (post-launch): replaced by structured contextFiles list.
+     */
+    contextSummary: string | null;
+    /**
+     * Block 5C: How long context assembly took in milliseconds.
+     * Null when no context was gathered.
+     */
+    contextTimeMs: number | null;
 }
 
 /**
@@ -140,6 +154,21 @@ export interface TabData {
      * Ephemeral — not saved to backend (resets on IDE restart).
      */
     collapsedIds: Set<string>;
+    /**
+     * Context bypass mode for this tab's next SEND_MESSAGE.
+     *
+     * Controls whether the backend's ContextAssembler gathers IDE context.
+     * - "OFF":       Normal flow — full context gathering runs (default).
+     * - "FULL":      Skip all context gathering. System prompt + history still flow.
+     * - "SELECTIVE": Per-component bypass (Pro tier, STUB — treated as OFF).
+     *
+     * Ephemeral — not persisted to SQLite or TabStateDto. Resets to "OFF"
+     * on IDE restart. Set by the ContextDial in the ContextDialStrip.
+     *
+     * @see ContextDialStrip — React component that reads/writes this
+     * @see ContextAssembler.assemble — backend checks bypassMode
+     */
+    bypassMode: "OFF" | "FULL" | "SELECTIVE";
 }
 
 /** R4: Lightweight tab descriptor for the TabBar component. */
@@ -244,6 +273,18 @@ export interface BridgeState {
 
     // R5: Bookmark command
     bookmarkCodeBlock: (exchangeId: string, blockIndex: number) => void;
+
+    // Block 5C: Context bypass
+    /**
+     * Active tab's context bypass mode.
+     * Read by ContextDialStrip to show the current state.
+     */
+    bypassMode: "OFF" | "FULL" | "SELECTIVE";
+    /**
+     * Update the active tab's bypass mode.
+     * Called by ContextDialStrip when the user clicks the ContextDial.
+     */
+    setBypassMode: (mode: "OFF" | "FULL" | "SELECTIVE") => void;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -286,13 +327,16 @@ function createTab(data?: Partial<TabData>): TabData {
         historyLoaded: data?.historyLoaded ?? true,
         providerId: data?.providerId ?? null,
         collapsedIds: data?.collapsedIds ?? new Set(),
+        bypassMode: "OFF",
     };
 
-    console.log(
-        `[YMM] createTab: tabId=${tab.id}, conversationId=${conversationId}, ` +
-        `source=${data?.conversationId ? "loaded" : "generated"}, ` +
-        `messages=${tab.messages.length}, providerId=${tab.providerId ?? "global"}`
-    );
+    log.info("useBridge", "createTab", {
+        tabId: tab.id,
+        conversationId,
+        source: data?.conversationId ? "loaded" : "generated",
+        messages: tab.messages.length,
+        providerId: tab.providerId ?? "global",
+    });
 
     return tab;
 }
@@ -359,6 +403,7 @@ export function useBridge(): BridgeState {
     };
     const activeScrollPosition = activeTab?.scrollPosition ?? 0;
     const activeCollapsedIds = activeTab?.collapsedIds ?? new Set<string>();
+    const activeBypassMode = activeTab?.bypassMode ?? "OFF";
 
     const tabs= tabOrder
         .map((id) => {
@@ -433,7 +478,7 @@ export function useBridge(): BridgeState {
     // ── Event Subscriptions ──────────────────────────────────────────
 
     useEffect(() => {
-        console.log("[YMM] useBridge useEffect registered — build 20260305b");
+        log.info("useBridge", "useEffect registered — build 20260316a");
         const unsubscribers: Array<() => void> = [];
 
         // CHAT_RESULT → active tab
@@ -447,9 +492,11 @@ export function useBridge(): BridgeState {
                     if (!tab) return prev;
 
                     if (e.conversationId && tab.conversationId && e.conversationId !== tab.conversationId) {
-                        console.warn(
-                            `[YMM] conversationId mismatch! tab=${tab.conversationId}, backend=${e.conversationId}, tabId=${targetId}`
-                        );
+                        log.warn("useBridge", "conversationId mismatch", {
+                            tab: tab.conversationId,
+                            backend: e.conversationId,
+                            tabId: targetId,
+                        });
                     }
 
                     const newMsg: ChatMessage = {
@@ -461,6 +508,9 @@ export function useBridge(): BridgeState {
                         exchangeId: e.exchangeId,
                         correctionAvailable: e.correctionAvailable,
                         isStarred: false,
+                        // Block 5C: capture context metadata from backend
+                        contextSummary: e.contextSummary ?? null,
+                        contextTimeMs: e.contextTimeMs ?? null,
                     };
 
                     const next = new Map(prev);
@@ -540,6 +590,8 @@ export function useBridge(): BridgeState {
                         exchangeId: null,
                         correctionAvailable: false,
                         isStarred: false,
+                        contextSummary: null,  // system messages carry no context
+                        contextTimeMs: null,
                     };
 
                     const next = new Map(prev);
@@ -614,6 +666,7 @@ export function useBridge(): BridgeState {
                         historyLoaded: dto.conversationId === null,
                         providerId: dto.providerId ?? null,
                         collapsedIds: new Set(),
+                        bypassMode: "OFF",
                     });
                     newOrder.push(dto.id);
                     if (dto.isActive) newActiveId = dto.id;
@@ -647,13 +700,13 @@ export function useBridge(): BridgeState {
             onEvent(EventType.OPEN_CONVERSATION_RESULT, (event: BridgeEvent) => {
                 const e = event as OpenConversationResultEvent;
 
-                console.log(`[YMM] OPEN_CONVERSATION_RESULT: conversationId=${e.conversationId}, tabId=${e.tabId}`);
+                log.info("useBridge", "OPEN_CONVERSATION_RESULT", { conversationId: e.conversationId, tabId: e.tabId });
 
                 // Debounce: ignore if we processed this conversationId within the last 500ms
                 const now = Date.now();
                 const lastOpened = recentlyOpenedConversations.get(e.conversationId);
                 if (lastOpened && now - lastOpened < 500) {
-                    console.log(`[YMM] Ignoring duplicate OPEN_CONVERSATION_RESULT for ${e.conversationId} (within 500ms)`);
+                    log.info("useBridge", "Ignoring duplicate OPEN_CONVERSATION_RESULT (within 500ms)", { conversationId: e.conversationId });
                     return;
                 }
                 recentlyOpenedConversations.set(e.conversationId, now);
@@ -665,7 +718,7 @@ export function useBridge(): BridgeState {
                     for (const [id] of prev) {
                         const tab = prev.get(id);
                         if (tab && tab.conversationId === e.conversationId) {
-                            console.log(`[YMM] OPEN_CONVERSATION_RESULT: existing tab found: ${id}`);
+                            log.info("useBridge", "OPEN_CONVERSATION_RESULT: existing tab found", { tabId: id });
                             setActiveTabId(id);
                             setIsScrolledUp(false);
                             return prev; // No tabMap change — just switch
@@ -673,7 +726,7 @@ export function useBridge(): BridgeState {
                     }
 
                     // No existing tab — create one
-                    console.log(`[YMM] OPEN_CONVERSATION_RESULT: creating new tab: ${e.tabId}`);
+                    log.info("useBridge", "OPEN_CONVERSATION_RESULT: creating new tab", { tabId: e.tabId });
                     const newTab = createTab({
                         id: e.tabId,
                         conversationId: e.conversationId,
@@ -711,6 +764,12 @@ export function useBridge(): BridgeState {
                         exchangeId: msg.exchangeId,
                         correctionAvailable: false,
                         isStarred: msg.isStarred,
+                        // Historical messages don't carry context metadata
+                        // (HistoryMessageDto doesn't include it). Phase 2: add
+                        // context info to HistoryMessageDto if historical context
+                        // display is needed.
+                        contextSummary: null,
+                        contextTimeMs: null,
                     }));
 
                     // Seed the session accumulator from historical token data.
@@ -778,9 +837,9 @@ export function useBridge(): BridgeState {
             onEvent(EventType.BOOKMARK_RESULT, (event: BridgeEvent) => {
                 const e = event as BookmarkResultEvent;
                 if (e.success) {
-                    console.log(`[YMM] Bookmarked exchange ${e.exchangeId}`);
+                    log.info("useBridge", "Bookmarked exchange", { exchangeId: e.exchangeId });
                 } else {
-                    console.warn(`[YMM] Bookmark failed for exchange ${e.exchangeId}: ${e.error}`);
+                    log.warn("useBridge", "Bookmark failed", { exchangeId: e.exchangeId, error: e.error });
                 }
             }),
         );
@@ -804,6 +863,8 @@ export function useBridge(): BridgeState {
                         exchangeId: null,
                         correctionAvailable: false,
                         isStarred: false,
+                        contextSummary: null,  // dev output carries no context
+                        contextTimeMs: null,
                     };
 
                     const next = new Map(prev);
@@ -851,12 +912,17 @@ export function useBridge(): BridgeState {
             const targetId = activeTabIdRef.current;
             let convId: string | null = null;
             let tabProviderId: string | null = null;
+            let tabBypassMode: string | null = null;
 
             setTabMap((prev) => {
                 const tab = prev.get(targetId);
                 if (!tab) return prev;
                 convId = tab.conversationId;
                 tabProviderId = tab.providerId;
+                // Capture the tab's bypass mode for the SendMessageCommand.
+                // "OFF" is sent as null (backend default) to avoid noise on
+                // every message when bypass is not active.
+                tabBypassMode = tab.bypassMode === "OFF" ? null : tab.bypassMode;
 
                 const newMsg: ChatMessage = {
                     id: `msg-${Date.now()}-${++idCounter.current}`,
@@ -867,6 +933,8 @@ export function useBridge(): BridgeState {
                     exchangeId: null,
                     correctionAvailable: false,
                     isStarred: false,
+                    contextSummary: null,  // user messages don't carry context
+                    contextTimeMs: null,
                 };
 
                 const title = tab.messages.length === 0 ? titleFromMessage(text) : tab.title;
@@ -876,16 +944,19 @@ export function useBridge(): BridgeState {
                 return next;
             });
 
-            console.log(
-                `[YMM] sendMessage: conversationId=${convId}, tabId=${targetId}, ` +
-                `providerId=${tabProviderId ?? "global"}`
-            );
+            log.info("useBridge", "sendMessage", {
+                conversationId: convId,
+                tabId: targetId,
+                providerId: tabProviderId ?? "global",
+                bypassMode: tabBypassMode ?? "OFF",
+            });
 
             sendCommand({
                 type: CommandType.SEND_MESSAGE,
                 text,
                 conversationId: convId,
                 providerId: tabProviderId,
+                bypassMode: tabBypassMode,
             });
             persistTabState();
         },
@@ -920,10 +991,10 @@ export function useBridge(): BridgeState {
      */
     const newConversation = useCallback(() => {
         if (tabOrder.length >= DEFAULT_MAX_TABS) {
-            console.warn(
-                `[YMM] newConversation blocked: already at max tabs (${DEFAULT_MAX_TABS}). ` +
-                `Close a tab first. Max configurable in Settings → YMM Assistant → General (not yet implemented).`
-            );
+            log.warn("useBridge", "newConversation blocked: max tabs reached", {
+                maxTabs: DEFAULT_MAX_TABS,
+                currentTabs: tabOrder.length,
+            });
             return;
         }
 
@@ -1032,10 +1103,12 @@ export function useBridge(): BridgeState {
             updateTab(tabId, (tab) => ({ ...tab, title: trimmed }));
 
             // PLACEHOLDER: sendCommand({ type: CommandType.RENAME_TAB, tabId, title: trimmed });
-            console.warn(
-                `[YMM] renameTab: local title updated to "${trimmed}" for tab ${tabId}. ` +
-                `RENAME_TAB backend command not yet implemented — add to CommandType and handle in BridgeDispatcher.kt.`
-            );
+            // PLACEHOLDER: RENAME_TAB backend command not yet implemented.
+            // Add to CommandType and handle in BridgeDispatcher.kt.
+            log.warn("useBridge", "renameTab: local only (RENAME_TAB not implemented)", {
+                tabId,
+                title: trimmed,
+            });
 
             persistTabState();
         },
@@ -1067,10 +1140,10 @@ export function useBridge(): BridgeState {
                 });
             }
 
-            console.log(
-                `[YMM] switchTabProvider: tabId=${tabId}, ` +
-                `providerId=${providerId ?? "global (reverted)"}`
-            );
+            log.info("useBridge", "switchTabProvider", {
+                tabId,
+                providerId: providerId ?? "global (reverted)",
+            });
 
             persistTabState();
         },
@@ -1141,6 +1214,23 @@ export function useBridge(): BridgeState {
         }));
     }, [updateTab]);
 
+    /**
+     * Update the active tab's context bypass mode.
+     *
+     * Called by ContextDialStrip when the user clicks the ContextDial.
+     * The new mode is stored in TabData.bypassMode (ephemeral) and
+     * included in the next SEND_MESSAGE command.
+     *
+     * @see ContextDialStrip — calls this on dial click
+     * @see sendMessage — reads bypassMode from TabData
+     */
+    const setBypassMode = useCallback((mode: "OFF" | "FULL" | "SELECTIVE") => {
+        updateTab(activeTabIdRef.current, (tab) => ({
+            ...tab,
+            bypassMode: mode,
+        }));
+    }, [updateTab]);
+
     return {
         messages: activeMessages,
         isThinking: activeIsThinking,
@@ -1171,5 +1261,7 @@ export function useBridge(): BridgeState {
         collapseAll,
         expandAll,
         bookmarkCodeBlock,
+        bypassMode: activeBypassMode,
+        setBypassMode,
     };
 }

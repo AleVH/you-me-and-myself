@@ -134,6 +134,19 @@
                              id="com.youmeandmyself.ai.settings.assistantProfile"
                              displayName="Assistant Profile"/>
 
+        <!-- ── ContextSettingsState — project-level persistent state ──────── -->
+        <!-- Stores context control preferences (contextEnabled, defaultBypassMode).
+             Persisted to ymmContextSettings.xml in the project config dir.
+             STUB: not yet read by ContextAssembler — per-message bypassMode is the
+             only active context control at launch. -->
+        <projectService serviceImplementation="com.youmeandmyself.ai.settings.ContextSettingsState"/>
+
+        <!-- Context settings: Tools → YMM Assistant → Context (Block 5) -->
+        <projectConfigurable instance="com.youmeandmyself.ai.settings.ContextConfigurable"
+                             parentId="com.youmeandmyself.ai.settings"
+                             id="com.youmeandmyself.ai.settings.context"
+                             displayName="Context"/>
+
         <!-- ── BudgetChecker — project-level service ───────────────────────── -->
         <!--
             Budget enforcement gate: every AI call checks this before execution.

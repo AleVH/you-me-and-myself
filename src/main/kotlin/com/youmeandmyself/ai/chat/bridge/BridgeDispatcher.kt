@@ -98,6 +98,8 @@ class BridgeDispatcher(
             is BridgeMessage.OpenConversation -> handleOpenConversation(command)
             // Dev commands
             is BridgeMessage.DevCommand -> handleDevCommand(command)
+            // Block 5C: Frontend logging — route React logs to idea.log
+            is BridgeMessage.FrontendLog -> handleFrontendLog(command)
         }
     }
 
@@ -120,7 +122,8 @@ class BridgeDispatcher(
                     userInput = command.text,
                     scope = this,
                     conversationId = command.conversationId,
-                    providerId = command.providerId
+                    providerId = command.providerId,
+                    bypassMode = command.bypassMode
                 )
 
                 if (result.contextSummary != null) {
@@ -635,6 +638,29 @@ class BridgeDispatcher(
         }
 
         devCommandHandler.handleIfDevCommand(command.text)
+    }
+
+    // ── Block 5C: Frontend Logging Handler ─────────────────────────
+
+    /**
+     * Handle FRONTEND_LOG — route React-side logs to idea.log.
+     *
+     * console.log is dead inside JCEF (no DevTools in production). The
+     * frontend's log.ts utility sends FRONTEND_LOG commands instead.
+     * We route them to the standard IDE logging system via [Dev].
+     *
+     * Tagged as "react.{source}" for easy filtering in idea.log:
+     *   react.useBridge — CHAT_RESULT received {exchangeId=abc}
+     *
+     * No event is sent back — this is fire-and-forget.
+     */
+    private fun handleFrontendLog(command: BridgeMessage.FrontendLog) {
+        val tag = "react.${command.source}"
+        when (command.level.uppercase()) {
+            "WARN" -> Dev.warn(log, tag, null, "msg" to command.message)
+            "ERROR" -> Dev.error(log, tag, null, "msg" to command.message)
+            else -> Dev.info(log, tag, "msg" to command.message)
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────

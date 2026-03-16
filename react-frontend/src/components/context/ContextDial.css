@@ -1,0 +1,88 @@
+/**
+ * ContextDial styles — compact rotary toggle for context bypass mode.
+ *
+ * ## Theme
+ *
+ * Follows the Darcula dark theme established in index.css.
+ * All dimensions in px (not rem) for JCEF compatibility.
+ *
+ * ## BEM Naming
+ *
+ * .ymm-context-dial             — button wrapper (24×24)
+ * .ymm-context-dial__svg        — the SVG element
+ * .ymm-context-dial__ring       — outer circle stroke
+ * .ymm-context-dial__notch      — position indicator dot
+ * .ymm-context-dial__center     — center anchor dot
+ * .ymm-context-dial--off        — OFF mode modifier
+ * .ymm-context-dial--full       — FULL mode modifier
+ * .ymm-context-dial--selective  — SELECTIVE mode modifier
+ */
+
+/* ── Button wrapper ──────────────────────────────────────────────── */
+
+.ymm-context-dial {
+    /* Reset button defaults */
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    outline: none;
+
+    /* Fixed 24×24 hit target */
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    /* Smooth rotation transition for the notch */
+    transition: transform 0.15s ease;
+}
+
+.ymm-context-dial:hover {
+    /* Subtle scale-up on hover for interactivity feedback */
+    transform: scale(1.15);
+}
+
+.ymm-context-dial:focus-visible {
+    /* Keyboard focus ring — matches IntelliJ's focus style */
+    outline: 1px solid #569cd6;
+    outline-offset: 2px;
+    border-radius: 50%;
+}
+
+.ymm-context-dial:active {
+    /* Press feedback — slight shrink */
+    transform: scale(0.95);
+}
+
+/* ── SVG internals ───────────────────────────────────────────────── */
+
+.ymm-context-dial__svg {
+    display: block;
+}
+
+/* Smooth color transitions when mode changes */
+.ymm-context-dial__ring,
+.ymm-context-dial__notch,
+.ymm-context-dial__center {
+    transition: fill 0.2s ease, stroke 0.2s ease, cx 0.2s ease, cy 0.2s ease;
+}
+
+/* ── Mode-specific visual tweaks ─────────────────────────────────── */
+
+/* OFF: slightly dimmed to indicate "inactive" */
+.ymm-context-dial--off .ymm-context-dial__ring {
+    opacity: 0.6;
+}
+
+/* FULL: full brightness, active state */
+.ymm-context-dial--full .ymm-context-dial__ring {
+    opacity: 1.0;
+}
+
+/* SELECTIVE: warm glow to indicate "special" mode */
+.ymm-context-dial--selective .ymm-context-dial__ring {
+    opacity: 1.0;
+}

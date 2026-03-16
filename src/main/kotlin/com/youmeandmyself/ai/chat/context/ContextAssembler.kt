@@ -96,6 +96,7 @@ class ContextAssembler(
      * Assemble the complete prompt, optionally enriched with IDE context.
      *
      * This is the main entry point. It:
+     * 0. Checks bypass mode — FULL skips all context gathering immediately
      * 1. Checks if context would be useful for this message
      * 2. If yes, gathers IDE context within a time budget
      * 3. Enriches files with summaries where beneficial
@@ -103,12 +104,42 @@ class ContextAssembler(
      *
      * @param userInput The raw text the user typed
      * @param scope Coroutine scope for context gathering (respects cancellation)
+     * @param bypassMode Context bypass mode from the frontend's ContextDial.
+     *   null / "OFF" = normal flow. "FULL" = skip all context gathering.
+     *   "SELECTIVE" = per-component bypass (STUB — treated as OFF for now).
      * @return The assembled result with the effective prompt and context metadata
      */
     suspend fun assemble(
         userInput: String,
-        scope: CoroutineScope
+        scope: CoroutineScope,
+        bypassMode: String? = null
     ): AssembledPrompt {
+        // ── Step 0: Bypass check ─────────────────────────────────────────
+        // FULL bypass skips all context gathering (steps 1-4). The user's
+        // raw text goes straight to the AI provider. System prompt and
+        // conversation history still flow — they're handled by the
+        // orchestrator, not the assembler.
+        if (bypassMode?.uppercase() == "FULL") {
+            Dev.info(log, "context.bypass.full",
+                "reason" to "user requested full context bypass"
+            )
+            return AssembledPrompt(
+                effectivePrompt = userInput,
+                contextSummary = null,
+                contextTimeMs = null
+            )
+        }
+
+        // SELECTIVE bypass is a STUB — log and fall through to normal flow.
+        // Phase C will wire the ContextLever component and per-component
+        // skip logic. Until then, SELECTIVE behaves identically to OFF.
+        if (bypassMode?.uppercase() == "SELECTIVE") {
+            Dev.info(log, "context.bypass.selective_stub",
+                "reason" to "SELECTIVE bypass not yet implemented, treating as OFF"
+            )
+            // Fall through to normal context gathering
+        }
+
         // Step 1: Determine if IDE context would help answer this question
         val editorFile = currentEditorFile()
         val needContext = shouldGatherContext(userInput, editorFile)

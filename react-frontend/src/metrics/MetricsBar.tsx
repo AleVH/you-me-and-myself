@@ -54,6 +54,7 @@ import {
     fillBarColor,
 } from "./accumulator";
 import "./MetricsBar.css";
+import { log } from "../utils/log";
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CONSTANTS
@@ -321,10 +322,8 @@ export default function MetricsBar({ metricsState }: MetricsBarProps) {
             <button
                 className="ymm-metrics-bar__expand ymm-metrics-bar__expand--placeholder"
                 onClick={() => {
-                    console.warn(
-                        "[YMM] Metrics Tab not implemented yet. " +
-                        "Will show per-model breakdown, historical usage, and cost estimates (Pricing Module)."
-                    );
+                    log.warn("MetricsBar", "Metrics Tab not implemented yet — " +
+                        "will show per-model breakdown, historical usage, and cost estimates (Pricing Module)");
                 }}
                 title="Open metrics panel (not implemented yet)"
                 aria-label="Open metrics panel (not implemented yet)"
