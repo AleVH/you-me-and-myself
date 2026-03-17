@@ -4,10 +4,13 @@
  * ## Layout
  *
  * Compact (default):
- *   [ ContextDial ]  Context: OFF              [ ⤢ ]
+ *   [ ContextDial ]  Summarization: ON          [ ⤢ ]
+ *
+ * Bypass active:
+ *   [ ContextDial ]  Bypass Summarization       [ ⤢ ]
  *
  * Expanded (toggle):
- *   [ ContextDial ]  Context: SELECTIVE         [ ⤢ ]
+ *   [ ContextDial ]  Summarization: Selective   [ ⤢ ]
  *   [ ContextLever ──────────── ] Partial  Coming soon
  *
  * ## Positioning
@@ -59,9 +62,9 @@ export interface ContextDialStripProps {
 // ── Human-readable mode labels ───────────────────────────────────────
 
 const MODE_DISPLAY: Record<BypassMode, string> = {
-    OFF: "Context: OFF",
-    FULL: "Context: ON",
-    SELECTIVE: "Context: Selective",
+    OFF: "Summarization: ON",
+    FULL: "Bypass Summarization",
+    SELECTIVE: "Summarization: Selective",
 };
 
 // ── Component ────────────────────────────────────────────────────────────
