@@ -55,6 +55,10 @@ class BridgeDispatcher(
 ) {
     private val log = Dev.logger(BridgeDispatcher::class.java)
     private val scope = CoroutineScope(Dispatchers.IO)
+
+    init {
+        Dev.info(log, "bridge.version", "block" to "5")
+    }
     private val tabStateService = TabStateService.getInstance(project)
     private val storage = LocalStorageFacade.getInstance(project)
     private val devCommandHandler: DevCommandHandler by lazy {

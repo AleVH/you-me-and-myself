@@ -47,6 +47,9 @@ import ProviderSelector from "./ProviderSelector";
 import MetricsBar from "../metrics/MetricsBar";
 import TabBar from "./TabBar";
 import ContextDialStrip from "./context/ContextDialStrip";
+import { log } from "../utils/log";
+
+log.info("ChatApp", "[VERSION] Block 5 loaded");
 
 function ChatApp() {
     const bridge = useBridge();
