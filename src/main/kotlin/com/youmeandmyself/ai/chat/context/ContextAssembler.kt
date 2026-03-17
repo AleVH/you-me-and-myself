@@ -96,7 +96,7 @@ class ContextAssembler(
      * Assemble the complete prompt, optionally enriched with IDE context.
      *
      * This is the main entry point. It:
-     * 0. Checks bypass mode — FULL skips all context gathering immediately
+     * 0. Checks bypass mode — FULL skips detection/generation, uses existing summary or raw file
      * 1. Checks if context would be useful for this message
      * 2. If yes, gathers IDE context within a time budget
      * 3. Enriches files with summaries where beneficial
@@ -105,8 +105,8 @@ class ContextAssembler(
      * @param userInput The raw text the user typed
      * @param scope Coroutine scope for context gathering (respects cancellation)
      * @param bypassMode Context bypass mode from the frontend's ContextDial.
-     *   null / "OFF" = normal flow. "FULL" = skip all context gathering.
-     *   "SELECTIVE" = per-component bypass (STUB — treated as OFF for now).
+     *   null / "OFF" = normal flow. "FULL" = skip detection/generation, use existing summary or raw file.
+     *   "SELECTIVE" = partial bypass, scope TBD (STUB — treated as OFF for now).
      * @return The assembled result with the effective prompt and context metadata
      */
     suspend fun assemble(
@@ -115,24 +115,111 @@ class ContextAssembler(
         bypassMode: String? = null
     ): AssembledPrompt {
         // ── Step 0: Bypass check ─────────────────────────────────────────
-        // FULL bypass skips all context gathering (steps 1-4). The user's
-        // raw text goes straight to the AI provider. System prompt and
-        // conversation history still flow — they're handled by the
-        // orchestrator, not the assembler.
+        // FULL bypass skips summarization generation and all detection steps
+        // (language, framework, project structure). The open file is still
+        // grabbed. If an existing up-to-date summary is available, it is
+        // used. If not, the raw file content is attached instead.
+        // No new summarization is requested.
         if (bypassMode?.uppercase() == "FULL") {
-            Dev.info(log, "context.bypass.full",
-                "reason" to "user requested full context bypass"
+            Dev.info(log, "context.bypass.full.enter",
+                "reason" to "user requested full summarization bypass"
             )
+
+            val editorFile = currentEditorFile()
+
+            if (editorFile == null) {
+                Dev.info(log, "context.bypass.full.no_editor_file",
+                    "result" to "no file open in editor, sending raw user input only"
+                )
+                return AssembledPrompt(
+                    effectivePrompt = userInput,
+                    contextSummary = "[Context: bypass=FULL, no file open]",
+                    contextTimeMs = null
+                )
+            }
+
+            Dev.info(log, "context.bypass.full.editor_file",
+                "filePath" to editorFile.path,
+                "fileName" to editorFile.name,
+                "fileType" to editorFile.fileType.name
+            )
+
+            // Resolve project ID for summary lookup
+            val projectId = try {
+                LocalStorageFacade.getInstance(project).resolveProjectId()
+            } catch (_: Throwable) {
+                project.basePath ?: project.name
+            }
+
+            // Check for an existing up-to-date summary — no new summarization triggered.
+            val summary = summaryStore.getSummary(editorFile.path, projectId)
+
+            Dev.info(log, "context.bypass.full.summary_lookup",
+                "filePath" to editorFile.path,
+                "summaryFound" to (summary != null),
+                "summaryStale" to (summary?.isStale ?: false),
+                "summaryShared" to (summary?.isShared ?: false)
+            )
+
+            val contentBlock: String
+            val attachmentKind: String
+
+            if (summary != null && !summary.isStale) {
+                // Existing up-to-date summary available — use it (no generation triggered)
+                val fileName = editorFile.name
+                contentBlock = buildString {
+                    appendLine("[File: $fileName] (existing summary)")
+                    if (!summary.headerSample.isNullOrBlank()) {
+                        appendLine(summary.headerSample)
+                        appendLine()
+                    }
+                    append(summary.synopsis)
+                }
+                attachmentKind = "existing summary"
+
+                Dev.info(log, "context.bypass.full.using_existing_summary",
+                    "fileName" to fileName,
+                    "synopsisLength" to summary.synopsis.length,
+                    "hasHeaderSample" to (!summary.headerSample.isNullOrBlank()),
+                    "source" to if (summary.isShared) "shared" else "local"
+                )
+            } else {
+                // No summary or stale — attach raw file content instead
+                contentBlock = formatFileBlock(editorFile)
+                attachmentKind = "raw file"
+
+                Dev.info(log, "context.bypass.full.using_raw_file",
+                    "fileName" to editorFile.name,
+                    "reason" to if (summary == null) "no summary exists" else "summary is stale",
+                    "contentLength" to contentBlock.length
+                )
+            }
+
+            val effectivePrompt = if (contentBlock.isNotBlank()) {
+                "$contentBlock\n\n$userInput"
+            } else {
+                userInput
+            }
+
+            Dev.info(log, "context.bypass.full.assembled",
+                "attachmentKind" to attachmentKind,
+                "effectivePromptLength" to effectivePrompt.length
+            )
+
             return AssembledPrompt(
-                effectivePrompt = userInput,
-                contextSummary = null,
+                effectivePrompt = effectivePrompt,
+                contextSummary = "[Context: bypass=FULL, $attachmentKind attached]",
                 contextTimeMs = null
             )
         }
 
-        // SELECTIVE bypass is a STUB — log and fall through to normal flow.
-        // Phase C will wire the ContextLever component and per-component
-        // skip logic. Until then, SELECTIVE behaves identically to OFF.
+        // SELECTIVE (partial) bypass — NOT IMPLEMENTED YET.
+        // Scope not yet defined. Partial bypass will allow the user to
+        // choose which enrichment steps run (e.g., language detection,
+        // framework detection, project structure, relevant files) while
+        // always attaching the open file. The exact breakdown of toggleable
+        // steps is TBD. For now, falls through to normal flow (OFF). THESE STEPS WILL BE GROUPED IN DIFFERENT LEVELS THAT WE STILL NEED TO DEFINE. THAT IS THE TODO BIT
+        // TODO: Define partial bypass scope and implement per-step toggles.
         if (bypassMode?.uppercase() == "SELECTIVE") {
             Dev.info(log, "context.bypass.selective_stub",
                 "reason" to "SELECTIVE bypass not yet implemented, treating as OFF"
@@ -555,19 +642,15 @@ class ContextAssembler(
     }
 
     /**
-     * Build the full content block for the currently open editor file.
+     * Format a file's content into a fenced prompt block.
      *
-     * Only included when the user explicitly references "this file" (deictic phrasing).
-     * Reads the file content with a safety cap to prevent sending enormous files to the AI.
+     * Shared by both the FULL bypass path and the normal deictic file inclusion.
+     * Reads the file content with a safety cap to prevent sending enormous files.
      *
-     * @param userInput The user's message (checked for deictic references)
-     * @param editorFile The currently open file (null if nothing is open)
-     * @return Formatted file block, or empty string if not applicable
+     * @param editorFile The file to format
+     * @return Formatted file block, or empty string if reading failed
      */
-    private fun buildCurrentFileBlock(userInput: String, editorFile: VirtualFile?): String {
-        // Only include if user explicitly references "this file"
-        if (editorFile == null || !refersToCurrentFile(userInput)) return ""
-
+    private fun formatFileBlock(editorFile: VirtualFile): String {
         val text = readFileTextCapped(editorFile) ?: return ""
         if (text.isBlank()) return ""
 
@@ -580,6 +663,20 @@ class ContextAssembler(
             ${text.trim()}
             ```
         """.trimIndent()
+    }
+
+    /**
+     * Build the full content block for the currently open editor file.
+     *
+     * Only included when the user explicitly references "this file" (deictic phrasing).
+     *
+     * @param userInput The user's message (checked for deictic references)
+     * @param editorFile The currently open file (null if nothing is open)
+     * @return Formatted file block, or empty string if not applicable
+     */
+    private fun buildCurrentFileBlock(userInput: String, editorFile: VirtualFile?): String {
+        if (editorFile == null || !refersToCurrentFile(userInput)) return ""
+        return formatFileBlock(editorFile)
     }
 
     // ── File Reading Helpers ─────────────────────────────────────────────
