@@ -7,6 +7,10 @@ import com.intellij.openapi.ui.TextFieldWithBrowseButton
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextField
 import com.youmeandmyself.dev.Dev
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.progress.ProgressIndicator
+import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.Task
 import java.awt.BorderLayout
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
@@ -31,14 +35,10 @@ import javax.swing.*
  *   network drive or synced folder). Individual tier uses a local path.
  *
  * - Keep tabs on restart — whether open conversation tabs are restored
- *   when the IDE reopens. [PLACEHOLDER — UI shown, not yet wired to backend]
+ *   when the IDE reopens. Persisted to [TabSettingsState] XML.
  *
  * - Maximum open tabs — hard cap on simultaneous open tabs (2–20).
- *   [PLACEHOLDER — UI shown, not yet wired to backend]
- *
- * - Summary prompt template — lets users control what the AI focuses
- *   on when summarizing code. Pre-launch must-ship.
- *   [PLACEHOLDER — UI shown, backend prompt template system not yet built]
+ *   Persisted to [TabSettingsState] XML. Frontend wiring is a separate task.
  *
  * - Scan for new added files — triggers an import flow to index JSONL
  *   files that were added to the storage root manually (e.g. copied from
@@ -77,26 +77,19 @@ class GeneralConfigurable(private val project: Project) : Configurable {
     private val log = Dev.logger(GeneralConfigurable::class.java)
 
     // ── Services ──────────────────────────────────────────────────────
+    //
+    // No monolithic GeneralSettingsState — settings are modularized:
+    //   Tab preferences → TabSettingsState (XML)
+    //   Storage root    → storage_config SQLite table (via LocalStorageFacade)
 
-    /**
-     * General settings state — persisted via IntelliJ PersistentStateComponent.
-     *
-     * PLACEHOLDER: GeneralSettingsState does not yet exist.
-     * Create src/main/kotlin/com/youmeandmyself/ai/settings/GeneralSettingsState.kt
-     * as a @State/@Storage PersistentStateComponent storing:
-     *   - storageRoot: String
-     *   - keepTabs: Boolean (default true)
-     *   - maxTabs: Int (default 5)
-     *   - summaryPromptTemplate: String
-     */
-    // private val settingsState get() = GeneralSettingsState.getInstance(project)
+    private val tabSettingsState get() = TabSettingsState.getInstance(project)
+    private val storageFacade get() = com.youmeandmyself.storage.LocalStorageFacade.getInstance(project)
 
     // ── Working copy ──────────────────────────────────────────────────
 
     private var workingStorageRoot: String = defaultStorageRoot()
     private var workingKeepTabs: Boolean = true
     private var workingMaxTabs: Int = 5
-    private var workingSummaryPromptTemplate: String = DEFAULT_SUMMARY_PROMPT
 
     // ── UI components ─────────────────────────────────────────────────
 
@@ -108,12 +101,6 @@ class GeneralConfigurable(private val project: Project) : Configurable {
     // Chat tabs
     private val keepTabsCheckbox = JCheckBox("Restore open tabs when IDE restarts")
     private val maxTabsSpinner = JSpinner(SpinnerNumberModel(5, 2, 20, 1))
-
-    // Summary prompt template
-    private val summaryPromptArea = JTextArea(6, 40).apply {
-        lineWrap = true
-        wrapStyleWord = true
-    }
 
     // Index management buttons
     private val scanNewFilesButton = JButton("Scan for new added files")
@@ -174,68 +161,16 @@ class GeneralConfigurable(private val project: Project) : Configurable {
             label = "",
             component = keepTabsCheckbox,
             help = "When enabled, your open conversation tabs are saved when you close the IDE " +
-                    "and restored next time you open it. " +
-                    "PLACEHOLDER: this checkbox is visible but not yet wired to the backend. " +
-                    "To implement: add keepTabs field to GeneralSettingsState, read it in " +
-                    "BridgeDispatcher.kt when handling REQUEST_TAB_STATE, and return empty " +
-                    "tabs list when keepTabs=false."
+                    "and restored next time you open it. Disabling starts you fresh on each restart."
         )
-
-        // Keep tabs placeholder notice
-        val keepTabsNotice = placeholderLabel(
-            "Not yet wired — backend always restores tabs regardless of this setting."
-        )
-        row = addFormRow(formPanel, gbc, row, label = "", component = keepTabsNotice, help = "")
 
         // Max tabs
         row = addFormRow(formPanel, gbc, row,
             label = "Maximum open tabs:",
             component = maxTabsSpinner,
             help = "Hard cap on simultaneous open conversation tabs (2–20). Default: 5. " +
-                    "More tabs = more memory used by the embedded browser. " +
-                    "PLACEHOLDER: this spinner is visible but not yet wired to the frontend. " +
-                    "To implement: add maxTabs to GeneralSettingsState, send it in the " +
-                    "TAB_STATE event from BridgeDispatcher.kt so the React TabBar reads " +
-                    "the real limit instead of the hardcoded DEFAULT_MAX_TABS=5."
+                    "More tabs = more memory used by the embedded browser."
         )
-
-        val maxTabsNotice = placeholderLabel(
-            "Not yet wired — frontend uses hardcoded default of 5 tabs."
-        )
-        row = addFormRow(formPanel, gbc, row, label = "", component = maxTabsNotice, help = "")
-
-        // ── Section: Summary Prompt Template ─────────────────────────
-
-        row = addSeparator(formPanel, gbc, row, "Summary Prompt Template")
-
-        val templateNote = JBLabel(
-            "<html>Customize what the AI focuses on when summarizing your code. " +
-                    "Use <b>{code}</b> as the placeholder for the code being summarized.</html>"
-        )
-        row = addFormRow(formPanel, gbc, row, label = "", component = templateNote, help = "")
-
-        summaryPromptArea.text = workingSummaryPromptTemplate
-        val summaryScroll = JScrollPane(summaryPromptArea).apply {
-            preferredSize = java.awt.Dimension(400, 120)
-        }
-        row = addFormRow(formPanel, gbc, row,
-            label = "Prompt template:",
-            component = summaryScroll,
-            help = "The prompt sent to the AI when summarizing code. " +
-                    "{code} is replaced with the actual source code. " +
-                    "You can focus the AI on security, performance, API contracts, " +
-                    "business logic, or anything your team cares about. " +
-                    "PRE-LAUNCH MUST-SHIP: this field is visible but not yet connected " +
-                    "to the summarization pipeline. " +
-                    "To implement: read this value in SummaryConfigService, pass it " +
-                    "to ChatOrchestrator/GenericLlmProvider when building summary requests, " +
-                    "replacing the hardcoded prompt."
-        )
-
-        val templateNotice = placeholderLabel(
-            "Not yet wired — pipeline uses hardcoded summary prompt. Pre-launch must-ship."
-        )
-        row = addFormRow(formPanel, gbc, row, label = "", component = templateNotice, help = "")
 
         // ── Section: Index Management ─────────────────────────────────
 
@@ -297,29 +232,69 @@ class GeneralConfigurable(private val project: Project) : Configurable {
     }
 
     override fun isModified(): Boolean {
-        // PLACEHOLDER: compare against GeneralSettingsState when it exists
-        // For now always return false so Apply button stays greyed out
-        // until storage root wiring is implemented
+        // Storage root — compare against SQLite storage_config
+        val currentRoot = try {
+            storageFacade.getConfigValue("storage_root_path") ?: defaultStorageRoot()
+        } catch (e: Exception) {
+            defaultStorageRoot()
+        }
+        if (storageRootField.text != currentRoot) return true
+
+        // Tab settings — compare against TabSettingsState XML
+        val tabState = tabSettingsState.state
+        if (keepTabsCheckbox.isSelected != tabState.keepTabs) return true
+        if ((maxTabsSpinner.value as Int) != tabState.maxTabs) return true
+
         return false
     }
 
     override fun apply() {
-        // PLACEHOLDER: persist to GeneralSettingsState when it exists
-        // Storage root change → warn user + trigger rebuild
-        Dev.info(log, "general.settings.apply",
-            "storageRoot" to storageRootField.text,
+        // ── Tab settings → TabSettingsState XML ──
+        val newTabState = tabSettingsState.state.copy(
+            keepTabs = keepTabsCheckbox.isSelected,
+            maxTabs = maxTabsSpinner.value as Int
+        )
+        tabSettingsState.loadState(newTabState)
+
+        // ── Storage root → SQLite storage_config ──
+        val newRoot = storageRootField.text
+        val currentRoot = try {
+            storageFacade.getConfigValue("storage_root_path") ?: defaultStorageRoot()
+        } catch (e: Exception) {
+            defaultStorageRoot()
+        }
+        if (newRoot != currentRoot) {
+            storageFacade.setConfigValue("storage_root_path", newRoot)
+            Dev.info(log, "general.settings.storage_root_changed",
+                "from" to currentRoot, "to" to newRoot)
+            // NOTE: Full reinitialization with the new root is a separate task.
+            // The value is persisted; it will take effect on next IDE restart.
+        }
+
+        Dev.info(log, "general.settings.applied",
+            "storageRoot" to newRoot,
             "keepTabs" to keepTabsCheckbox.isSelected,
-            "maxTabs" to maxTabsSpinner.value,
-            "note" to "PLACEHOLDER — GeneralSettingsState not yet created, nothing persisted"
+            "maxTabs" to maxTabsSpinner.value
         )
     }
 
     override fun reset() {
-        // PLACEHOLDER: load from GeneralSettingsState when it exists
+        // Storage root: read from SQLite storage_config
+        workingStorageRoot = try {
+            storageFacade.getConfigValue("storage_root_path") ?: defaultStorageRoot()
+        } catch (e: Exception) {
+            defaultStorageRoot()
+        }
+
+        // Tab settings: read from TabSettingsState XML
+        val tabState = tabSettingsState.state
+        workingKeepTabs = tabState.keepTabs
+        workingMaxTabs = tabState.maxTabs
+
+        // Update UI
         storageRootField.text = workingStorageRoot
         keepTabsCheckbox.isSelected = workingKeepTabs
         maxTabsSpinner.value = workingMaxTabs
-        summaryPromptArea.text = workingSummaryPromptTemplate
     }
 
     override fun disposeUIResources() { /* nothing to dispose */ }
@@ -400,16 +375,37 @@ class GeneralConfigurable(private val project: Project) : Configurable {
         )
 
         if (confirm == JOptionPane.YES_OPTION) {
-            // PLACEHOLDER: trigger JsonlRebuildService.rebuildFromDirectory() here
-            // Needs: background task (ProgressManager), progress indicator,
-            // result dialog showing RebuildStats (files, imported, skipped, errors)
-            JOptionPane.showMessageDialog(
-                root,
-                "PLACEHOLDER — Rebuild trigger not yet wired to JsonlRebuildService.\n\n" +
-                        "To implement: run JsonlRebuildService.rebuildFromDirectory(storageRoot) " +
-                        "in a ProgressManager background task and show RebuildStats on completion.",
-                "Not Yet Implemented",
-                JOptionPane.INFORMATION_MESSAGE
+            ProgressManager.getInstance().run(
+                object : Task.Backgroundable(project, "Rebuilding index from JSONL files", false) {
+                    override fun run(indicator: ProgressIndicator) {
+                        indicator.isIndeterminate = true
+                        indicator.text = "Scanning JSONL files..."
+                        try {
+                            val stats = storageFacade.rebuildIndex()
+                            ApplicationManager.getApplication().invokeLater {
+                                JOptionPane.showMessageDialog(root,
+                                    "Rebuild complete:\n\n" +
+                                        "  Files scanned: ${stats.filesScanned}\n" +
+                                        "  Lines read: ${stats.linesRead}\n" +
+                                        "  Exchanges imported: ${stats.imported}\n" +
+                                        "  Skipped (duplicate): ${stats.skippedDuplicate}\n" +
+                                        "  Skipped (no content): ${stats.skippedNoContent}\n" +
+                                        "  Skipped (not JSON): ${stats.skippedNotJson}\n" +
+                                        "  Enriched: ${stats.enriched}",
+                                    "Rebuild Complete",
+                                    JOptionPane.INFORMATION_MESSAGE)
+                            }
+                        } catch (e: Exception) {
+                            Dev.error(log, "general.settings.rebuild_failed", e)
+                            ApplicationManager.getApplication().invokeLater {
+                                JOptionPane.showMessageDialog(root,
+                                    "Rebuild failed: ${e.message}",
+                                    "Error",
+                                    JOptionPane.ERROR_MESSAGE)
+                            }
+                        }
+                    }
+                }
             )
         }
     }
@@ -495,18 +491,4 @@ class GeneralConfigurable(private val project: Project) : Configurable {
         return System.getProperty("user.home") + "/YouMeAndMyself"
     }
 
-    companion object {
-        /**
-         * Default summary prompt template.
-         *
-         * PLACEHOLDER: this default is shown in the UI but not yet read by the
-         * summarization pipeline. To wire: read from GeneralSettingsState in
-         * SummaryConfigService and pass to GenericLlmProvider.
-         */
-        const val DEFAULT_SUMMARY_PROMPT = """Summarize the following code concisely.
-Focus on: what it does, key responsibilities, important dependencies, and any non-obvious behaviour.
-Be specific — avoid generic phrases like "this class handles X".
-
-{code}"""
-    }
 }

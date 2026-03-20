@@ -17,6 +17,8 @@ import com.youmeandmyself.context.orchestrator.detectors.FrameworkDetector
 import com.youmeandmyself.context.orchestrator.detectors.LanguageDetector
 import com.youmeandmyself.context.orchestrator.detectors.ProjectStructureDetector
 import com.youmeandmyself.context.orchestrator.detectors.RelevantFilesDetector
+import com.youmeandmyself.ai.settings.ContextSettingsState
+import com.youmeandmyself.context.orchestrator.Detector
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.summary.config.SummaryConfigService
@@ -104,16 +106,44 @@ class ContextAssembler(
      *
      * @param userInput The raw text the user typed
      * @param scope Coroutine scope for context gathering (respects cancellation)
-     * @param bypassMode Context bypass mode from the frontend's ContextDial.
-     *   null / "OFF" = normal flow. "FULL" = skip detection/generation, use existing summary or raw file.
-     *   "SELECTIVE" = partial bypass, scope TBD (STUB — treated as OFF for now).
+     * @param bypassMode Context bypass mode from the frontend's ContextDial (backend perspective).
+     *   null / "OFF" = bypass off, normal context gathering runs.
+     *   "FULL" = full bypass, skip detection/generation, use existing summary or raw file.
+     *   "SELECTIVE" = partial bypass — run only the detectors for the given selectiveLevel.
+     * @param selectiveLevel Active lever level when bypassMode is "SELECTIVE".
+     *   0 = Minimal (no detectors, open file only with existing summary if available).
+     *   1 = Partial (Language + Framework + RelevantFiles, skip ProjectStructure).
+     *   2 = Full (all 4 detectors — same as bypassMode null). Default: 2.
      * @return The assembled result with the effective prompt and context metadata
      */
     suspend fun assemble(
         userInput: String,
         scope: CoroutineScope,
-        bypassMode: String? = null
+        bypassMode: String? = null,
+        selectiveLevel: Int? = null
     ): AssembledPrompt {
+        // ── Step -1: Global context kill-switch ──────────────────────────
+        // Settings → Tools → YMM Assistant → Context → "Enable context gathering"
+        //
+        // When false: zero context injected, not even the open file.
+        // Overrides bypassMode entirely — if context is globally off, the
+        // per-tab dial setting is irrelevant for this message.
+        //
+        // Propagation: instant. ContextSettingsState is read at call time,
+        // not cached at startup. Toggling the checkbox and clicking Apply
+        // updates in-memory state immediately via loadState() — no restart needed.
+        val contextSettings = ContextSettingsState.getInstance(project).state
+        if (!contextSettings.contextEnabled) {
+            Dev.info(log, "context.kill_switch.active",
+                "reason" to "contextEnabled=false in ContextSettingsState"
+            )
+            return AssembledPrompt(
+                effectivePrompt = userInput,
+                contextSummary = "[Context: disabled in settings]",
+                contextTimeMs = null
+            )
+        }
+
         // ── Step 0: Bypass check ─────────────────────────────────────────
         // FULL bypass skips summarization generation and all detection steps
         // (language, framework, project structure). The open file is still
@@ -213,18 +243,92 @@ class ContextAssembler(
             )
         }
 
-        // SELECTIVE (partial) bypass — NOT IMPLEMENTED YET.
-        // Scope not yet defined. Partial bypass will allow the user to
-        // choose which enrichment steps run (e.g., language detection,
-        // framework detection, project structure, relevant files) while
-        // always attaching the open file. The exact breakdown of toggleable
-        // steps is TBD. For now, falls through to normal flow (OFF). THESE STEPS WILL BE GROUPED IN DIFFERENT LEVELS THAT WE STILL NEED TO DEFINE. THAT IS THE TODO BIT
-        // TODO: Define partial bypass scope and implement per-step toggles.
+        // ── SELECTIVE bypass ─────────────────────────────────────────────
+        // Partial context gathering: only the detectors defined for the given level run.
+        //
+        // Level 0 (Minimal): no detectors — attach only the open file using the
+        //   same logic as FULL bypass (existing summary or raw). The difference from
+        //   FULL bypass is that the user can still reach SELECTIVE level 0 while
+        //   knowing context *was* considered — just minimised.
+        // Level 1 (Partial): Language + Framework + RelevantFiles. Skips
+        //   ProjectStructureDetector (build system overhead). Good for per-file
+        //   questions where project structure isn't relevant.
+        // Level 2 (Full): all 4 detectors active — identical to bypassMode null.
+        //   The lever at maximum = same as having no bypass at all.
         if (bypassMode?.uppercase() == "SELECTIVE") {
-            Dev.info(log, "context.bypass.selective_stub",
-                "reason" to "SELECTIVE bypass not yet implemented, treating as OFF"
+            val level = selectiveLevel ?: 2  // Default to Full if level missing
+
+            Dev.info(log, "context.bypass.selective.enter",
+                "level" to level,
+                "levelName" to when (level) { 0 -> "Minimal"; 1 -> "Partial"; else -> "Full" }
             )
-            // Fall through to normal context gathering
+
+            if (level == 0) {
+                // Minimal — same open-file attach logic as FULL bypass (no detectors, no generation)
+                val editorFile = currentEditorFile()
+                if (editorFile == null) {
+                    return AssembledPrompt(
+                        effectivePrompt = userInput,
+                        contextSummary = "[Context: selective=Minimal, no file open]",
+                        contextTimeMs = null
+                    )
+                }
+                val projectId = try {
+                    LocalStorageFacade.getInstance(project).resolveProjectId()
+                } catch (_: Throwable) { project.basePath ?: project.name }
+                val summary = summaryStore.getSummary(editorFile.path, projectId)
+                val contentBlock: String
+                val attachmentKind: String
+                if (summary != null && !summary.isStale) {
+                    contentBlock = buildString {
+                        appendLine("[File: ${editorFile.name}] (existing summary)")
+                        if (!summary.headerSample.isNullOrBlank()) { appendLine(summary.headerSample); appendLine() }
+                        append(summary.synopsis)
+                    }
+                    attachmentKind = "existing summary"
+                } else {
+                    contentBlock = formatFileBlock(editorFile)
+                    attachmentKind = "raw file"
+                }
+                val effectivePrompt = if (contentBlock.isNotBlank()) "$contentBlock\n\n$userInput" else userInput
+                return AssembledPrompt(
+                    effectivePrompt = effectivePrompt,
+                    contextSummary = "[Context: selective=Minimal, $attachmentKind attached]",
+                    contextTimeMs = null
+                )
+            }
+
+            // Level 1 or 2: run the detection pipeline with a filtered detector list
+            // Step 1: Check if context is needed (same heuristic as normal flow)
+            val editorFile = currentEditorFile()
+            val needContext = shouldGatherContext(userInput, editorFile)
+            if (!needContext) {
+                Dev.info(log, "context.skipped", "reason" to "not_needed_selective")
+                return AssembledPrompt(effectivePrompt = userInput, contextSummary = null, contextTimeMs = null)
+            }
+            if (DumbService.isDumb(project)) {
+                Dev.info(log, "context.skipped", "reason" to "ide_indexing_selective")
+                return AssembledPrompt.indexingBlocked()
+            }
+            val (bundle, metrics) = gatherIdeContext(scope, buildDetectorsForLevel(level))
+            Dev.info(log, "context.gathered.selective",
+                "level" to level, "files" to bundle.files.size, "timeMs" to metrics.totalMillis
+            )
+            val enrichedBundle = enrichWithSummaries(bundle)
+            val contextNote = formatContextNote(enrichedBundle)
+            val manifest = enrichedBundle.manifestLine()
+            val filesBlock = enrichedBundle.filesSection()
+            val fileBlock = buildCurrentFileBlock(userInput, editorFile)
+            val effectivePrompt = buildString {
+                appendLine(contextNote); appendLine(manifest); appendLine(); appendLine(filesBlock)
+                if (fileBlock.isNotBlank()) { appendLine(); appendLine(fileBlock) }
+                appendLine(); append(userInput)
+            }
+            return AssembledPrompt(
+                effectivePrompt = effectivePrompt,
+                contextSummary = "[Context: selective=level$level, ${enrichedBundle.manifestLine()}]",
+                contextTimeMs = metrics.totalMillis
+            )
         }
 
         // Step 1: Determine if IDE context would help answer this question
@@ -249,7 +353,7 @@ class ContextAssembler(
         }
 
         // Step 3: Gather IDE context (language, frameworks, project structure, relevant files)
-        val (bundle, metrics) = gatherIdeContext(scope)
+        val (bundle, metrics) = gatherIdeContext(scope, buildDetectorsForLevel(2))
 
         Dev.info(log, "context.gathered",
             "files" to bundle.files.size,
@@ -397,26 +501,18 @@ class ContextAssembler(
     /**
      * Gather IDE context using the [ContextOrchestrator] detector pipeline.
      *
-     * The orchestrator runs multiple detectors concurrently within a time budget:
-     * - LanguageDetector: primary language of the project
-     * - FrameworkDetector: frameworks in use (Spring, React, etc.)
-     * - ProjectStructureDetector: build system, modules
-     * - RelevantFilesDetector: files related to the user's question
+     * Accepts an explicit list of detectors so the SELECTIVE bypass path can
+     * pass a filtered set without duplicating orchestration logic.
      *
      * @param scope Coroutine scope (cancellation propagates to detectors)
+     * @param detectors Detectors to run. Defaults to all four for the normal path.
      * @return The context bundle and performance metrics
      */
     private suspend fun gatherIdeContext(
-        scope: CoroutineScope
+        scope: CoroutineScope,
+        detectors: List<Detector> = buildDetectorsForLevel(2)
     ): Pair<ContextBundle, OrchestratorMetrics> {
-        val registry = DetectorRegistry(
-            listOf(
-                LanguageDetector(),
-                FrameworkDetector(),
-                ProjectStructureDetector(),
-                RelevantFilesDetector()
-            )
-        )
+        val registry = DetectorRegistry(detectors)
         val orchestrator = ContextOrchestrator(registry, Logger.getInstance(ContextAssembler::class.java))
 
         // Time budget for context gathering. If detectors take longer than this,
@@ -424,6 +520,20 @@ class ContextAssembler(
         val request = ContextRequest(project = project, maxMillis = MAX_CONTEXT_GATHER_MS)
 
         return orchestrator.gather(request, scope)
+    }
+
+    /**
+     * Build the detector list for a given SELECTIVE bypass level.
+     *
+     * Level 1 excludes [ProjectStructureDetector] (build system / module map)
+     * because most per-file questions don't benefit from it.
+     * Level 2 (and anything else) includes all four detectors — full pipeline.
+     *
+     * @param level 0 is handled by the caller (Minimal path). Only 1 and 2 arrive here.
+     */
+    private fun buildDetectorsForLevel(level: Int): List<Detector> = when (level) {
+        1    -> listOf(LanguageDetector(), FrameworkDetector(), RelevantFilesDetector())
+        else -> listOf(LanguageDetector(), FrameworkDetector(), ProjectStructureDetector(), RelevantFilesDetector())
     }
 
     // ── Summary Enrichment (READ PATH) ──────────────────────────────────

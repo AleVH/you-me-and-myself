@@ -213,8 +213,10 @@ class LibraryPanel(
                 "clearAllBookmarks"   -> handleClearAllBookmarks(payload)
 
                 // Bookmarks (explicit collection management)
-                "addToCollection"     -> handleAddToCollection(payload)
-                "removeFromCollection"-> handleRemoveFromCollection(payload)
+                "addToCollection"          -> handleAddToCollection(payload)
+                "removeFromCollection"     -> handleRemoveFromCollection(payload)
+                // Returns all collections an item currently belongs to (for checkmarks in dropdown)
+                "getBookmarksForItem"      -> handleGetBookmarksForItem(payload)
 
                 // Tags (on bookmarks, not exchanges)
                 "setTag"              -> handleSetTag(payload)
@@ -226,6 +228,29 @@ class LibraryPanel(
                 // Stats & detail
                 "getStats"            -> handleGetStats()
                 "getExchange"         -> handleGetExchange(payload)
+
+                // Code snippet bookmarks — Library "Bookmarks" section
+                // TODO (Phase 4): implement getCodeBookmarks with smart grouping
+                //   - group by conversation → then by day/week (threshold: 15 day-groups → week)
+                //   - within group: >10 items → sub-group by hour/session
+                //   - threshold is Pro-configurable (default: 15) — stub the settings key
+                //   - items show snippet only; "Load full exchange" and "Go to chat" are Pro stubs
+                "getCodeBookmarks"    -> """{"error": "Not yet implemented", "stub": true}"""
+
+                // Cascading filter data for the Bookmarks section filter panel
+                // TODO (Phase 4): implement getBookmarkFilterOptions
+                //   - returns available languages (from code_bookmarks.language)
+                //   - returns tags filtered by currently-selected language (from code_bookmark_tags)
+                //   - cascading: selecting a language narrows tag options to PHP → Symfony/Laravel/etc
+                "getBookmarkFilters"  -> """{"error": "Not yet implemented", "stub": true}"""
+
+                // Soft delete — for Phase 6 deletion flow UI
+                // TODO (Phase 6): implement softDeleteExchange, softDeleteConversation,
+                //   softDeleteCodeBookmark — each must call countExchangeMarks first
+                //   and return the mark count so the JS layer can show the warning dialog
+                "softDeleteExchange"      -> """{"error": "Not yet implemented", "stub": true}"""
+                "softDeleteConversation"  -> """{"error": "Not yet implemented", "stub": true}"""
+                "softDeleteCodeBookmark"  -> """{"error": "Not yet implemented", "stub": true}"""
 
                 // Chat sessions for sidebar
                 "getChatSessions"     -> handleGetChatSessions()
@@ -452,21 +477,35 @@ class LibraryPanel(
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Add an exchange to a specific named collection.
+     * Add any bookmarkable item to a specific named collection.
      *
-     * JS sends { exchangeId, collectionId }.
+     * JS sends { sourceType, sourceId, collectionId }.
+     *
+     * sourceType must be one of: 'CHAT', 'SUMMARY', 'CONVERSATION', 'CODE_SNIPPET'
+     * sourceId is the ID of the item in its respective table.
+     *
+     * This replaces the old { exchangeId, collectionId } shape which was
+     * hardcoded to CHAT exchanges only. All item types now go through
+     * the same polymorphic path.
      */
     private fun handleAddToCollection(payload: String): String {
         val req = gson.fromJson(payload, CollectionItemRequest::class.java)
 
+        // Fetch a content preview for fast display in the collection browser.
+        // Only CHAT/SUMMARY exchanges have a getFullExchange equivalent for now.
+        // CODE_SNIPPET content lives directly in code_bookmarks.content.
+        // CONVERSATION previews are a future enhancement — null is safe here.
         val cachedContent = try {
-            storageFacade.getFullExchange(req.exchangeId)?.assistantText?.take(500)
+            when (req.sourceType) {
+                "CHAT", "SUMMARY" -> storageFacade.getFullExchange(req.sourceId)?.assistantText?.take(500)
+                else -> null  // TODO: add preview fetching for CONVERSATION and CODE_SNIPPET
+            }
         } catch (_: Exception) { null }
 
         val bookmark = bookmarkService.addBookmark(
             collectionId = req.collectionId,
-            sourceType = "CHAT",
-            sourceId = req.exchangeId,
+            sourceType = req.sourceType,
+            sourceId = req.sourceId,
             cachedContent = cachedContent
         ) ?: return """{"error": "Failed to add to collection"}"""
 
@@ -477,21 +516,42 @@ class LibraryPanel(
     }
 
     /**
-     * Remove an exchange from a specific collection.
+     * Remove any bookmarkable item from a specific collection.
      *
-     * JS sends { exchangeId, collectionId }. We find the bookmark linking
-     * them and delete it. The exchange may still be in other collections.
+     * JS sends { sourceType, sourceId, collectionId }.
+     * We find the bookmark linking them and delete it.
+     * The item may still be in other collections — this only removes
+     * the membership reference, not the item itself.
      */
     private fun handleRemoveFromCollection(payload: String): String {
         val req = gson.fromJson(payload, CollectionItemRequest::class.java)
 
-        // Find the bookmark for this exchange in this collection
-        val bookmarks = bookmarkService.getBookmarksForSource("CHAT", req.exchangeId)
+        // Find the bookmark for this item in this collection
+        val bookmarks = bookmarkService.getBookmarksForSource(req.sourceType, req.sourceId)
         val target = bookmarks.find { it.collectionId == req.collectionId }
-            ?: return """{"error": "Exchange not in this collection"}"""
+            ?: return """{"error": "Item not in this collection"}"""
 
         val removed = bookmarkService.removeBookmark(target.id)
         return gson.toJson(mapOf("success" to removed))
+    }
+
+    /**
+     * Return all collection memberships for a given item.
+     *
+     * JS sends { sourceType, sourceId }.
+     * Used by the collection picker dropdown to show checkmarks on collections
+     * the item is already in, before the user opens the dropdown.
+     *
+     * Returns a list of collectionIds the item belongs to — the dropdown
+     * maps these to checkmarks client-side using the full collections list
+     * it already has from getCollections.
+     */
+    private fun handleGetBookmarksForItem(payload: String): String {
+        val req = gson.fromJson(payload, BookmarksForItemRequest::class.java)
+        val bookmarks = bookmarkService.getBookmarksForSource(req.sourceType, req.sourceId)
+        return gson.toJson(mapOf(
+            "collectionIds" to bookmarks.map { it.collectionId }
+        ))
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -557,7 +617,7 @@ class LibraryPanel(
         val starredCount = try {
             storageFacade.withReadableDatabase { db ->
                 db.queryScalar(
-                    "SELECT COUNT(*) FROM chat_exchanges WHERE is_starred = 1 AND project_id = ?",
+                    "SELECT COUNT(*) FROM chat_exchanges WHERE is_starred = 1 AND project_id = ? AND deleted = 0",
                     storageFacade.resolveProjectId()
                 )
             }
@@ -637,7 +697,7 @@ class LibraryPanel(
                 db.query(
                     """SELECT id, title, updated_at, turn_count
                    FROM conversations
-                   WHERE project_id = ? AND is_active = 1
+                   WHERE project_id = ? AND is_active = 1 AND deleted = 0
                    ORDER BY updated_at DESC""",
                     projectId
                 ) { rs ->
@@ -846,8 +906,11 @@ class LibraryPanel(
     )
 
     // Bookmarks — explicit collection management
+    // sourceType: 'CHAT' | 'SUMMARY' | 'CONVERSATION' | 'CODE_SNIPPET'
+    // sourceId: ID of the item in its respective table
     private data class CollectionItemRequest(
-        val exchangeId: String = "",
+        val sourceType: String = "CHAT",
+        val sourceId: String = "",
         val collectionId: String = ""
     )
 
@@ -873,5 +936,11 @@ class LibraryPanel(
     // Cross-panel navigation (TEMPORARY)
     private data class ContinueChatRequest(
         val conversationId: String = ""
+    )
+
+    // Collection picker — fetch memberships for checkmarks
+    private data class BookmarksForItemRequest(
+        val sourceType: String = "CHAT",
+        val sourceId: String = ""
     )
 }

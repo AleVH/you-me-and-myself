@@ -108,6 +108,9 @@ function ChatApp() {
                 mode={bridge.bypassMode}
                 onModeChange={bridge.setBypassMode}
                 canUseSelective={false} /* Basic tier — SELECTIVE gated behind Pro */
+                globalContextEnabled={bridge.globalContextEnabled}
+                selectiveLevel={bridge.selectiveLevel}
+                onLevelChange={bridge.setSelectiveLevel}
             />
 
             <InputBar

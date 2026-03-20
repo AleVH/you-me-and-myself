@@ -127,6 +127,27 @@ class CrossPanelBridge(private val project: Project) {
         return true
     }
 
+    /**
+     * Push a fresh CONTEXT_SETTINGS event to the React frontend.
+     *
+     * Called from ContextConfigurable when the user changes context settings
+     * so the React panel reflects the new state immediately — the dial greys
+     * out or lights up without requiring the user to restart the IDE.
+     *
+     * Dispatches a RequestContextSettings command to the existing handler which
+     * reads the current ContextSettingsState and emits the event.
+     */
+    fun notifyContextSettingsChanged() {
+        val dispatcher = chatDispatcher
+        if (dispatcher == null) {
+            Dev.warn(log, "cross_panel.no_chat_dispatcher", null,
+                "action" to "notifyContextSettings"
+            )
+            return
+        }
+        dispatcher.dispatch(BridgeMessage.RequestContextSettings())
+    }
+
     companion object {
         fun getInstance(project: Project): CrossPanelBridge = project.service()
     }

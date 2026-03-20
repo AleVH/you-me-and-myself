@@ -48,7 +48,7 @@ export type { BypassMode } from "./ContextDial";
 // ── Types ────────────────────────────────────────────────────────────────
 
 export interface ContextDialStripProps {
-    /** Current bypass mode for the active tab. */
+    /** Current bypass mode for the active tab (dial perspective). */
     mode: BypassMode;
     /** Called when the user changes the mode via the dial. */
     onModeChange: (mode: BypassMode) => void;
@@ -57,19 +57,40 @@ export interface ContextDialStripProps {
      * When false, the dial cycles OFF ↔ FULL only.
      */
     canUseSelective: boolean;
+    /**
+     * Whether context gathering is globally enabled.
+     * When false, the dial is greyed out and clicks are rejected.
+     * Driven by ContextSettingsState.contextEnabled from the backend.
+     */
+    globalContextEnabled?: boolean;
+    /**
+     * Called when the user changes the lever position (SELECTIVE mode).
+     * @param level 0 = Minimal, 1 = Partial, 2 = Full
+     */
+    onLevelChange?: (level: number) => void;
+    /** Current selective level for the active tab (0-2). */
+    selectiveLevel?: number;
 }
 
-// ── Human-readable mode labels ───────────────────────────────────────
-
+// ── Human-readable mode labels (dial perspective) ────────────────────
+// FULL = context on = summarization running
+// OFF  = context off = summarization bypassed
 const MODE_DISPLAY: Record<BypassMode, string> = {
-    OFF: "Summarization: ON",
-    FULL: "Bypass Summarization",
+    FULL: "Summarization: ON",
+    OFF: "Bypass Summarization",
     SELECTIVE: "Summarization: Selective",
 };
 
 // ── Component ────────────────────────────────────────────────────────────
 
-function ContextDialStrip({ mode, onModeChange, canUseSelective }: ContextDialStripProps) {
+function ContextDialStrip({
+    mode,
+    onModeChange,
+    canUseSelective,
+    globalContextEnabled = true,
+    onLevelChange,
+    selectiveLevel = 2,
+}: ContextDialStripProps) {
     // Expanded state — controls whether the lever row is visible.
     // Only meaningful when mode is SELECTIVE. Persists while the
     // component is mounted (resets on tab switch / IDE restart).
@@ -82,6 +103,11 @@ function ContextDialStrip({ mode, onModeChange, canUseSelective }: ContextDialSt
     // The lever is only relevant in SELECTIVE mode
     const showLever = mode === "SELECTIVE" && expanded;
 
+    // Effective label: when globally disabled, show that context gathering is off
+    const label = !globalContextEnabled
+        ? "Context gathering disabled"
+        : MODE_DISPLAY[mode];
+
     return (
         <div className={`ymm-context-strip ${expanded ? "ymm-context-strip--expanded" : ""}`}>
             {/* ── Primary row: dial + label + expand toggle ─── */}
@@ -90,15 +116,16 @@ function ContextDialStrip({ mode, onModeChange, canUseSelective }: ContextDialSt
                     mode={mode}
                     onModeChange={onModeChange}
                     canUseSelective={canUseSelective}
+                    disabled={!globalContextEnabled}
                 />
 
-                <span className={`ymm-context-strip__label ymm-context-strip__label--${mode.toLowerCase()}`}>
-                    {MODE_DISPLAY[mode]}
+                <span className={`ymm-context-strip__label ymm-context-strip__label--${mode.toLowerCase()}${!globalContextEnabled ? " ymm-context-strip__label--disabled" : ""}`}>
+                    {label}
                 </span>
 
                 {/* Expand toggle — only shown when SELECTIVE is the active mode,
                     since that's the only mode with additional details to show. */}
-                {mode === "SELECTIVE" && (
+                {mode === "SELECTIVE" && globalContextEnabled && (
                     <button
                         className="ymm-context-strip__expand"
                         onClick={toggleExpand}
@@ -116,11 +143,8 @@ function ContextDialStrip({ mode, onModeChange, canUseSelective }: ContextDialSt
                 <div className="ymm-context-strip__detail">
                     <ContextLever
                         visible={true}
-                        onLevelChange={(level) => {
-                            // STUB: level is captured but has no backend effect.
-                            // Phase D will wire this to per-component bypass config.
-                            void level;
-                        }}
+                        level={selectiveLevel}
+                        onLevelChange={onLevelChange}
                     />
                 </div>
             )}

@@ -1229,20 +1229,23 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             val database = db ?: return LibraryStats(0, 0, 0, 0)
             val projectId = resolveProjectId()
 
+            // All stats exclude soft-deleted exchanges (deleted = 0).
+            // Soft-deleted exchanges are hidden from the user's view but
+            // their records remain for metrics aggregation until Stage 2 consolidation.
             val total = database.queryOne(
-                "SELECT COUNT(*) as cnt FROM chat_exchanges WHERE project_id = ?", projectId
+                "SELECT COUNT(*) as cnt FROM chat_exchanges WHERE project_id = ? AND deleted = 0", projectId
             ) { rs -> rs.getInt("cnt") } ?: 0
 
             val bookmarked = database.queryOne(
-                "SELECT COUNT(*) as cnt FROM chat_exchanges WHERE project_id = ? AND flags LIKE '%BOOKMARKED%'", projectId
+                "SELECT COUNT(*) as cnt FROM chat_exchanges WHERE project_id = ? AND deleted = 0 AND flags LIKE '%BOOKMARKED%'", projectId
             ) { rs -> rs.getInt("cnt") } ?: 0
 
             val withCode = database.queryOne(
-                "SELECT COUNT(*) as cnt FROM chat_exchanges WHERE project_id = ? AND has_code_block = 1", projectId
+                "SELECT COUNT(*) as cnt FROM chat_exchanges WHERE project_id = ? AND deleted = 0 AND has_code_block = 1", projectId
             ) { rs -> rs.getInt("cnt") } ?: 0
 
             val totalTokens = database.queryOne(
-                "SELECT COALESCE(SUM(total_tokens), 0) as total FROM chat_exchanges WHERE project_id = ? AND total_tokens IS NOT NULL", projectId
+                "SELECT COALESCE(SUM(total_tokens), 0) as total FROM chat_exchanges WHERE project_id = ? AND deleted = 0 AND total_tokens IS NOT NULL", projectId
             ) { rs -> rs.getLong("total") } ?: 0L
 
             LibraryStats(total, bookmarked, withCode, totalTokens)
@@ -1281,7 +1284,7 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 SELECT id, model_id, assistant_text, user_prompt, timestamp, total_tokens,
                        has_code_block, code_languages, detected_topics, file_paths,
                        context_file, context_branch, open_files
-                FROM chat_exchanges WHERE id = ?
+                FROM chat_exchanges WHERE id = ? AND deleted = 0
                 """.trimIndent(),
                 exchangeId
             ) { rs ->
@@ -1304,6 +1307,149 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         } catch (e: Exception) {
             Dev.error(log, "full_exchange.failed", e, "exchangeId" to exchangeId)
             null
+        }
+    }
+
+    // ==================== Soft Delete ====================
+    //
+    // Deletion is a two-stage process:
+    //   Stage 1 (here): set deleted = 1 in DB. The item disappears from all views
+    //                   immediately. The DB record and JSONL content are untouched.
+    //   Stage 2 (Settings page): "Consolidate deleted items" physically rewrites
+    //                   JSONL files to strip text content from deleted exchanges.
+    //                   See TODO-LIST_ALONG_THE_WAY.md item 5.
+    //
+    // The caller (UI layer) is responsible for checking marks before calling these
+    // and showing the appropriate warning to the user.
+    // These methods only perform the flag operation — no warning logic here.
+
+    /**
+     * Soft-delete a chat exchange.
+     *
+     * Sets deleted = 1. The exchange is immediately hidden from all views.
+     * The DB record is preserved for metrics. JSONL content is not touched.
+     * If the exchange has a code_bookmark, that bookmark survives (snippets
+     * outlive their parent exchange by design).
+     *
+     * @param exchangeId The exchange to soft-delete
+     * @return True if flagged, false if not found or failed
+     *
+     * TODO: caller should check isExchangeMarked(exchangeId) before calling
+     *       and warn the user if marks exist.
+     */
+    fun softDeleteExchange(exchangeId: String): Boolean {
+        if (mode == StorageMode.OFF) return false
+        return try {
+            withDatabase { db ->
+                val rows = db.execute(
+                    "UPDATE chat_exchanges SET deleted = 1 WHERE id = ? AND deleted = 0",
+                    exchangeId
+                )
+                Dev.info(log, "exchange.soft_deleted", "id" to exchangeId, "affected" to rows)
+                rows > 0
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "exchange.soft_delete_failed", e, "id" to exchangeId)
+            false
+        }
+    }
+
+    /**
+     * Soft-delete a conversation and all its exchanges.
+     *
+     * Sets deleted = 1 on the conversation and all its chat_exchanges.
+     * Code bookmarks on those exchanges survive — they are not deleted.
+     * This runs in a single transaction for atomicity.
+     *
+     * @param conversationId The conversation to soft-delete
+     * @return True if flagged, false if not found or failed
+     *
+     * TODO: caller should check if any exchange in the conversation has marks
+     *       and warn the user before calling this.
+     */
+    fun softDeleteConversation(conversationId: String): Boolean {
+        if (mode == StorageMode.OFF) return false
+        return try {
+            withDatabase { db ->
+                db.inTransaction {
+                    // Flag all exchanges in this conversation
+                    db.execute(
+                        "UPDATE chat_exchanges SET deleted = 1 WHERE conversation_id = ? AND deleted = 0",
+                        conversationId
+                    )
+                    // Flag the conversation itself
+                    val rows = db.execute(
+                        "UPDATE conversations SET deleted = 1 WHERE id = ? AND deleted = 0",
+                        conversationId
+                    )
+                    Dev.info(log, "conversation.soft_deleted", "id" to conversationId, "affected" to rows)
+                    rows > 0
+                }
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "conversation.soft_delete_failed", e, "id" to conversationId)
+            false
+        }
+    }
+
+    /**
+     * Soft-delete a code bookmark (snippet).
+     *
+     * Sets deleted = 1 on the code_bookmark row. The snippet is hidden from
+     * all views except the "Deleted snippets" filter in the Bookmarks section.
+     * The content is NOT removed from JSONL at this stage.
+     *
+     * Snippets are "sacred" — this method should ONLY be called after the user
+     * has explicitly confirmed deletion from the Bookmarks section with the
+     * "are you sure?" dialog. Do not call this from bulk delete flows.
+     *
+     * @param codeBookmarkId The code_bookmark to soft-delete
+     * @return True if flagged, false if not found or failed
+     */
+    fun softDeleteCodeBookmark(codeBookmarkId: String): Boolean {
+        if (mode == StorageMode.OFF) return false
+        return try {
+            withDatabase { db ->
+                val rows = db.execute(
+                    "UPDATE code_bookmarks SET deleted = 1 WHERE id = ? AND deleted = 0",
+                    codeBookmarkId
+                )
+                Dev.info(log, "code_bookmark.soft_deleted", "id" to codeBookmarkId, "affected" to rows)
+                rows > 0
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "code_bookmark.soft_delete_failed", e, "id" to codeBookmarkId)
+            false
+        }
+    }
+
+    /**
+     * Count how many marks (collections, stars, tags) reference a given exchange.
+     *
+     * Used by the UI layer to decide whether to show a deletion warning.
+     * Returns 0 if no marks exist (safe to delete without warning).
+     *
+     * @param exchangeId The exchange to check
+     * @return Number of marks found across all mark types
+     */
+    fun countExchangeMarks(exchangeId: String): Int {
+        return try {
+            withReadableDatabase { db ->
+                // Count collection memberships
+                val collectionCount = db.queryScalar(
+                    "SELECT COUNT(*) FROM bookmarks WHERE source_type = 'CHAT' AND source_id = ?",
+                    exchangeId
+                )
+                // Count stars (is_starred flag)
+                val starCount = db.queryScalar(
+                    "SELECT is_starred FROM chat_exchanges WHERE id = ?",
+                    exchangeId
+                )
+                collectionCount + starCount
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "exchange.count_marks_failed", e, "id" to exchangeId)
+            0
         }
     }
 
@@ -1935,6 +2081,26 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 rawFile
             )
         }
+    }
+
+    // ==================== Index Rebuild =============================
+
+    /**
+     * Rebuild the SQLite index from all JSONL files under the storage root.
+     *
+     * Exposed for the General Settings "Rebuild index" button.
+     * Delegates to [JsonlRebuildService.rebuildFromDirectory].
+     *
+     * **Must be called from a background thread** (e.g., via ProgressManager).
+     *
+     * @return Statistics about the rebuild operation
+     * @throws IllegalStateException if database or storage config is not initialized
+     */
+    fun rebuildIndex(): JsonlRebuildService.RebuildStats {
+        val database = db ?: throw IllegalStateException("Database not initialized")
+        val config = storageConfig ?: throw IllegalStateException("Storage config not initialized")
+        val rebuildService = JsonlRebuildService(database)
+        return rebuildService.rebuildFromDirectory(config.root)
     }
 
     // ==================== Storage Config Access ====================

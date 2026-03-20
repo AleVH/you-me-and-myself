@@ -12,6 +12,7 @@ import com.youmeandmyself.ai.metrics.DefaultContextWindows
 import com.youmeandmyself.ai.metrics.MetricsService
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.storage.TabStateService
+import com.youmeandmyself.ai.settings.ContextSettingsState
 import com.youmeandmyself.ai.settings.MetricsSettingsState
 import com.youmeandmyself.tier.CompositeTierProvider
 import com.youmeandmyself.tier.Feature
@@ -90,6 +91,7 @@ class BridgeDispatcher(
             // R4: Tab management
             is BridgeMessage.SwitchTab -> handleSwitchTab(command)
             is BridgeMessage.CloseTab -> handleCloseTab(command)
+            is BridgeMessage.RenameTab -> handleRenameTab(command)
             is BridgeMessage.SaveTabState -> handleSaveTabState(command)
             is BridgeMessage.RequestTabState -> handleRequestTabState()
             // R4: Conversation history
@@ -104,6 +106,8 @@ class BridgeDispatcher(
             is BridgeMessage.DevCommand -> handleDevCommand(command)
             // Block 5C: Frontend logging — route React logs to idea.log
             is BridgeMessage.FrontendLog -> handleFrontendLog(command)
+            // Block 5: Context settings request
+            is BridgeMessage.RequestContextSettings -> handleRequestContextSettings()
         }
     }
 
@@ -127,7 +131,8 @@ class BridgeDispatcher(
                     scope = this,
                     conversationId = command.conversationId,
                     providerId = command.providerId,
-                    bypassMode = command.bypassMode
+                    bypassMode = command.bypassMode,
+                    selectiveLevel = command.selectiveLevel
                 )
 
                 if (result.contextSummary != null) {
@@ -410,6 +415,50 @@ class BridgeDispatcher(
     }
 
     /**
+     * Handle RENAME_TAB — user committed a tab title edit.
+     *
+     * The frontend already applied the rename optimistically and will persist
+     * it via the next SAVE_TAB_STATE (which carries the updated title in TabStateDto).
+     * This handler additionally writes the new title to conversations.title so the
+     * rename is reflected in the Library and survives future IDE restarts cleanly.
+     *
+     * conversationId is null for fresh tabs that have never sent a message — in that
+     * case the conversation doesn't exist in storage yet and we skip the DB update.
+     *
+     * No event is sent back to the frontend.
+     */
+    private fun handleRenameTab(command: BridgeMessage.RenameTab) {
+        val conversationId = command.conversationId
+        if (conversationId == null) {
+            Dev.info(log, "bridge.rename_tab.no_conversation",
+                "tabId" to command.tabId,
+                "title" to command.title
+            )
+            return
+        }
+
+        scope.launch {
+            try {
+                Dev.info(log, "bridge.rename_tab",
+                    "tabId" to command.tabId,
+                    "conversationId" to conversationId,
+                    "title" to command.title
+                )
+                com.youmeandmyself.ai.chat.conversation.ConversationManager
+                    .getInstance(project)
+                    .updateTitle(conversationId, command.title)
+
+                LibraryPanelHolder.get(project)?.refresh()
+            } catch (t: Throwable) {
+                Dev.error(log, "bridge.rename_tab_failed", t,
+                    "tabId" to command.tabId,
+                    "conversationId" to conversationId
+                )
+            }
+        }
+    }
+
+    /**
      * Handle SAVE_TAB_STATE — frontend persists its current tab layout.
      *
      * Receives the complete tab state and writes it to the open_tabs table.
@@ -642,6 +691,56 @@ class BridgeDispatcher(
         }
 
         devCommandHandler.handleIfDevCommand(command.text)
+    }
+
+    // ── Block 5: Context Settings Handler ────────────────────────────
+
+    /**
+     * Handle REQUEST_CONTEXT_SETTINGS — send project-level context settings to React.
+     *
+     * Called at startup (BRIDGE_READY and non-JCEF dev mode). The React app uses
+     * this to set globalContextEnabled (disables ContextDial when false) and
+     * defaultBypassMode (used as the initial dial position for new tabs).
+     *
+     * Tier-gating: Basic-tier users always receive defaultBypassMode = "FULL"
+     * regardless of the stored value, because they cannot customise this setting.
+     * The SELECTIVE default is gated behind Feature.CONTEXT_SELECTIVE_BYPASS.
+     */
+    private fun handleRequestContextSettings() {
+        try {
+            val contextSettings = ContextSettingsState.getInstance(project).state
+            val canUseSelective = try {
+                CompositeTierProvider.getInstance().canUse(Feature.CONTEXT_SELECTIVE_BYPASS)
+            } catch (e: Exception) {
+                Dev.warn(log, "context_settings.tier_check_failed", e)
+                false
+            }
+
+            // Basic users always get "FULL" — they cannot customise the default
+            val defaultBypassMode = if (canUseSelective) {
+                contextSettings.defaultBypassMode
+            } else {
+                "FULL"
+            }
+
+            Dev.info(log, "bridge.context_settings",
+                "contextEnabled" to contextSettings.contextEnabled,
+                "defaultBypassMode" to defaultBypassMode,
+                "canUseSelective" to canUseSelective
+            )
+
+            emit(BridgeMessage.ContextSettingsEvent(
+                contextEnabled = contextSettings.contextEnabled,
+                defaultBypassMode = defaultBypassMode
+            ))
+        } catch (t: Throwable) {
+            Dev.error(log, "bridge.context_settings_failed", t)
+            // Fallback: send safe defaults so the UI doesn't hang
+            emit(BridgeMessage.ContextSettingsEvent(
+                contextEnabled = true,
+                defaultBypassMode = "FULL"
+            ))
+        }
     }
 
     // ── Block 5C: Frontend Logging Handler ─────────────────────────

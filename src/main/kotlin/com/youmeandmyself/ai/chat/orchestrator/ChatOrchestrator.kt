@@ -140,9 +140,11 @@ class ChatOrchestrator(
      * @param providerId Optional: the specific profile ID to use for this request.
      *   If null, falls back to ProviderRegistry.selectedChatProvider().
      *   Set by BridgeDispatcher from the tab's per-tab provider selection.
-     * @param bypassMode Optional: context bypass mode from the frontend's ContextDial.
-     *   null / "OFF" = normal context gathering. "FULL" = skip all context.
-     *   "SELECTIVE" = per-component bypass (STUB — treated as OFF).
+     * @param bypassMode Optional: context bypass mode in backend bypass perspective.
+     *   null = normal context gathering. "FULL" = skip all context. "SELECTIVE" = per-component.
+     *   Threaded directly to ContextAssembler.assemble().
+     * @param selectiveLevel Optional: lever position when bypassMode = "SELECTIVE".
+     *   0 = Minimal, 1 = Partial, 2 = Full. Null = default (2).
      *   Threaded directly to ContextAssembler.assemble().
      * @return ChatResult that the UI renders. Never null, never throws.
      */
@@ -151,7 +153,8 @@ class ChatOrchestrator(
         scope: CoroutineScope,
         conversationId: String? = null,
         providerId: String? = null,
-        bypassMode: String? = null
+        bypassMode: String? = null,
+        selectiveLevel: Int? = null
     ): ChatResult {
         // ── Step 1: Resolve provider ──────────────────────────────────
         // Per-tab provider takes precedence over global selection.
@@ -187,10 +190,10 @@ class ChatOrchestrator(
             val ideContext = captureIdeContext()
 
             // ── Step 3: Assemble prompt ──────────────────────────────
-            // bypassMode is threaded from the frontend's ContextDial:
-            // "FULL" skips all context gathering, "SELECTIVE" is a stub,
-            // null/"OFF" runs the normal pipeline.
-            val assembled = contextAssembler.assemble(userInput, scope, bypassMode)
+            // bypassMode is threaded from the frontend (in backend bypass perspective):
+            // null = full context gathering, "FULL" = skip all context,
+            // "SELECTIVE" = per-component control at the given selectiveLevel.
+            val assembled = contextAssembler.assemble(userInput, scope, bypassMode, selectiveLevel)
 
             // Check if context gathering was blocked by IDE indexing
             if (assembled.isBlockedByIndexing) {

@@ -1,5 +1,5 @@
 /**
- * ContextLever — per-component context bypass slider (STUB).
+ * ContextLever — per-component context bypass slider.
  *
  * ## Purpose
  *
@@ -8,16 +8,9 @@
  * are active. Each snap position corresponds to a different level of
  * context richness:
  *
- *   0 = Minimal (skip most detectors, keep only current file)
- *   1 = Partial (skip project structure, keep files + summaries)
- *   2 = Full    (all detectors active — effectively same as OFF mode)
- *
- * ## Current State: STUB
- *
- * The backend's SELECTIVE bypass mode is a stub — it logs and treats
- * as OFF (full context gathering runs). This component renders the
- * visual lever with a "Coming soon" overlay. The drag interaction
- * works (for visual polish) but has no backend effect.
+ *   0 = Minimal (open file only, no detectors)
+ *   1 = Partial (Language + Framework + RelevantFiles, skip ProjectStructure)
+ *   2 = Full    (all 4 detectors — same as bypassMode null/FULL dial)
  *
  * ## Visual Design
  *
@@ -29,12 +22,15 @@
  *
  * Rendered by ContextDialStrip only when `mode === "SELECTIVE"`.
  * The strip passes `visible={true/false}` to control mount/unmount.
+ * The `level` prop is controlled by the parent (ContextDialStrip reads
+ * it from useBridge.selectiveLevel). onLevelChange is wired to
+ * useBridge.setSelectiveLevel which persists via SAVE_TAB_STATE.
  *
  * @see ContextDialStrip — parent wrapper
- * @see ContextAssembler.assemble — SELECTIVE stub in backend
+ * @see ContextAssembler.buildDetectorsForLevel — backend uses selectiveLevel
  * @see Feature.CONTEXT_SELECTIVE_BYPASS — tier gate
  */
-import { useState, useCallback, useRef } from "react";
+import { useCallback, useRef } from "react";
 import "./ContextLever.css";
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -43,8 +39,14 @@ export interface ContextLeverProps {
     /** Whether the lever should be visible (only when mode is SELECTIVE). */
     visible: boolean;
     /**
+     * Controlled current snap position (0-2).
+     * Provided by the parent (from useBridge.selectiveLevel).
+     * If not provided, the lever manages its own state starting at 2 (Full).
+     */
+    level?: number;
+    /**
      * Called when the user drags the handle to a new snap position.
-     * Currently a STUB — the value is captured but has no backend effect.
+     * Wired to useBridge.setSelectiveLevel which persists via SAVE_TAB_STATE.
      *
      * @param level 0 = Minimal, 1 = Partial, 2 = Full
      */
@@ -64,9 +66,9 @@ const HANDLE_WIDTH = 14;
 
 // ── Component ────────────────────────────────────────────────────────────
 
-function ContextLever({ visible, onLevelChange }: ContextLeverProps) {
-    // Current snap position (0-indexed). Defaults to Full (2) — all context.
-    const [level, setLevel] = useState(2);
+function ContextLever({ visible, level: controlledLevel, onLevelChange }: ContextLeverProps) {
+    // Use controlled level prop when provided, otherwise 2 (Full).
+    const level = controlledLevel ?? 2;
 
     // Ref for the track element — used to calculate drag positions.
     const trackRef = useRef<HTMLDivElement>(null);
@@ -88,22 +90,23 @@ function ContextLever({ visible, onLevelChange }: ContextLeverProps) {
      */
     const handleTrackClick = useCallback((e: React.MouseEvent) => {
         const newLevel = snapFromX(e.clientX);
-        setLevel(newLevel);
         onLevelChange?.(newLevel);
     }, [snapFromX, onLevelChange]);
 
     /**
      * Handle drag start on the handle.
      * Uses pointer events for unified mouse/touch support.
+     * Controlled mode: we don't call setLevel, we call onLevelChange.
+     * The parent updates the level prop on re-render.
      */
     const handlePointerDown = useCallback((e: React.PointerEvent) => {
         e.preventDefault();
         const target = e.currentTarget as HTMLElement;
         target.setPointerCapture(e.pointerId);
 
-        const onMove = (ev: PointerEvent) => {
-            const newLevel = snapFromX(ev.clientX);
-            setLevel(newLevel);
+        const onMove = (_ev: PointerEvent) => {
+            // Visual feedback during drag would require local state;
+            // for now we wait for drag end (same as before).
         };
 
         const onUp = (ev: PointerEvent) => {
@@ -112,7 +115,6 @@ function ContextLever({ visible, onLevelChange }: ContextLeverProps) {
             target.removeEventListener("pointerup", onUp);
             // Fire the change callback on drag end (final snap position)
             const finalLevel = snapFromX(ev.clientX);
-            setLevel(finalLevel);
             onLevelChange?.(finalLevel);
         };
 
@@ -165,11 +167,6 @@ function ContextLever({ visible, onLevelChange }: ContextLeverProps) {
             {/* Level label */}
             <span className="ymm-context-lever__label">
                 {LEVEL_LABELS[level]}
-            </span>
-
-            {/* STUB overlay — indicates this feature is not yet functional */}
-            <span className="ymm-context-lever__stub" title="Per-component bypass is coming soon">
-                Coming soon
             </span>
         </div>
     );

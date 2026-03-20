@@ -65,11 +65,14 @@ object BridgeMessage {
      *   If null, falls back to the globally selected chat provider.
      *   Set by the frontend from the per-tab provider selection.
      * bypassMode: controls whether ContextAssembler gathers IDE context.
-     *   null / "OFF" = normal flow (full context gathering).
-     *   "FULL" = skip all context gathering (system prompt + history still flow).
-     *   "SELECTIVE" = Pro-tier per-component bypass (STUB — treated as OFF).
+     *   Sent in backend bypass perspective (translated from dial perspective by dialToBackendBypass).
+     *   null = normal flow (full context gathering). "FULL" = skip all context.
+     *   "SELECTIVE" = Pro-tier per-component bypass.
+     * selectiveLevel: only relevant when bypassMode = "SELECTIVE".
+     *   0 = Minimal (open file only), 1 = Partial (no ProjectStructure),
+     *   2 = Full (all 4 detectors). Null = use default (2).
      *
-     * @see ContextAssembler.assemble — checks bypassMode for early return
+     * @see ContextAssembler.assemble — checks bypassMode + selectiveLevel
      * @see Feature.CONTEXT_SELECTIVE_BYPASS — tier gate for SELECTIVE mode
      */
     @Serializable
@@ -79,7 +82,8 @@ object BridgeMessage {
         val text: String,
         val conversationId: String? = null,
         val providerId: String? = null,
-        val bypassMode: String? = null
+        val bypassMode: String? = null,
+        val selectiveLevel: Int? = null
     ) : Command()
 
     @Serializable
@@ -167,6 +171,30 @@ object BridgeMessage {
     ) : Command()
 
     /**
+     * User renamed a tab via double-click inline edit.
+     *
+     * conversationId is nullable — a fresh tab that has never sent a message
+     * has no conversation in storage yet. In that case the backend skips the
+     * DB update; the title lives in local state and persists via SAVE_TAB_STATE.
+     *
+     * When conversationId is present, the backend updates conversations.title
+     * so the rename survives IDE restarts and shows correctly in the Library.
+     *
+     * No event is sent back — the frontend already applied the title optimistically.
+     *
+     * Backend: BridgeDispatcher.handleRenameTab()
+     * → ConversationManager.updateTitle(conversationId, title) when conversationId != null
+     */
+    @Serializable
+    @SerialName("RENAME_TAB")
+    data class RenameTab(
+        override val type: String = "RENAME_TAB",
+        val tabId: String,
+        val conversationId: String? = null,
+        val title: String
+    ) : Command()
+
+    /**
      * Frontend saves the full tab state for persistence.
      * Backend does a full replace in the open_tabs table.
      */
@@ -210,8 +238,19 @@ object BridgeMessage {
 
     /**
      * User clicked the bookmark ribbon on a code block.
-     * Bookmarks the entire exchange (not just the code block).
-     * blockIndex is included for future per-block bookmarking.
+     *
+     * Creates a code_bookmarks row for this specific block (per-block bookmarking).
+     * blockIndex identifies which code block within the exchange (0-based).
+     *
+     * NOTE: The current BridgeDispatcher handler for this command bookmarks the
+     * entire exchange rather than the specific code block. That needs to be updated
+     * to create a code_bookmarks row via LocalStorageFacade. See Item 6 action plan.
+     *
+     * TODO (Phase 5 — Add to Collection UX):
+     *   After bookmarking, the user can also add the snippet to a collection.
+     *   The hover button on code blocks in the chat view will need a new
+     *   ADD_TO_COLLECTION command (separate from this) that opens the collection
+     *   picker dropdown for code snippets.
      */
     @Serializable
     @SerialName("BOOKMARK_CODE_BLOCK")
@@ -220,6 +259,25 @@ object BridgeMessage {
         val exchangeId: String,
         val blockIndex: Int
     ) : Command()
+
+    // ── Phase 5 stub: Add to Collection from chat view ───────────────
+    // TODO (Phase 5 — Add to Collection UX):
+    //   Add an ADD_TO_COLLECTION command here for the React chat view.
+    //   The hover button on exchanges and code blocks will send this command.
+    //   Payload: { sourceType, sourceId, collectionId }
+    //   Mirrors the LibraryPanel "addToCollection" command but routed
+    //   through the chat bridge so it works from within the chat view.
+    //   Also add: GET_COLLECTIONS (for the dropdown) and GET_ITEM_COLLECTIONS
+    //   (for checkmarks). The Library already has these; the chat bridge does not.
+    //
+    // @Serializable
+    // @SerialName("ADD_TO_COLLECTION")
+    // data class AddToCollection(
+    //     override val type: String = "ADD_TO_COLLECTION",
+    //     val sourceType: String,   // 'CHAT' | 'CODE_SNIPPET' | 'CONVERSATION'
+    //     val sourceId: String,
+    //     val collectionId: String
+    // ) : Command()
 
     // ── R5: Open Conversation Command ────────────────────────────────
 
@@ -289,6 +347,23 @@ object BridgeMessage {
         val message: String,
         /** React module or component name (e.g., "useBridge"). */
         val source: String = "unknown"
+    ) : Command()
+
+    // ── Block 5: Context Settings Request ────────────────────────────
+
+    /**
+     * Frontend requests project-level context settings on startup.
+     *
+     * Sent at BRIDGE_READY (and non-JCEF dev startup). Backend reads
+     * ContextSettingsState and emits ContextSettingsEvent back.
+     *
+     * @see BridgeDispatcher.handleRequestContextSettings — handler
+     * @see ContextSettingsEvent — the response
+     */
+    @Serializable
+    @SerialName("REQUEST_CONTEXT_SETTINGS")
+    data class RequestContextSettings(
+        override val type: String = "REQUEST_CONTEXT_SETTINGS"
     ) : Command()
 
     // ═══════════════════════════════════════════════════════════════════
@@ -539,6 +614,34 @@ object BridgeMessage {
         val content: String
     ) : Event()
 
+    // ── Block 5: Context Settings Event ──────────────────────────────
+
+    /**
+     * Project-level context settings sent to the frontend on startup.
+     *
+     * Sent in response to RequestContextSettings. The React app uses
+     * this to:
+     * - Set the global kill-switch state (globalContextEnabled) which
+     *   disables the ContextDial when false.
+     * - Set the default bypassMode for new tabs (defaultBypassMode).
+     *
+     * @param contextEnabled Master kill-switch. When false, all context
+     *   gathering is disabled regardless of per-tab dial position.
+     *   The ContextDial is visually greyed out and clicks are rejected.
+     * @param defaultBypassMode Dial position for new tabs. "FULL" = full
+     *   context on (default), "OFF" = no context, "SELECTIVE" = Pro only.
+     *   Basic-tier users always receive "FULL" regardless of stored value.
+     *
+     * @see ContextSettingsState — stores the values
+     * @see BridgeDispatcher.handleRequestContextSettings — sends this
+     */
+    @Serializable
+    data class ContextSettingsEvent(
+        override val type: String = "CONTEXT_SETTINGS",
+        val contextEnabled: Boolean,
+        val defaultBypassMode: String  // "OFF" | "FULL" (dial perspective)
+    ) : Event()
+
     // ═══════════════════════════════════════════════════════════════════
     //  SHARED DTOs
     // ═══════════════════════════════════════════════════════════════════
@@ -550,6 +653,24 @@ object BridgeMessage {
      *   Null means "use the global chat provider selection".
      *   Persisted in open_tabs.provider_id so per-tab provider
      *   survives IDE restarts.
+     *
+     * bypassMode: dial position stored in dial perspective (not backend bypass perspective).
+     *   "FULL" = full context on (default). "OFF" = no context. "SELECTIVE" = Pro only.
+     *   Persisted in open_tabs.bypass_mode. Default "FULL".
+     *
+     * selectiveLevel: the lever position when bypassMode = "SELECTIVE".
+     *   0 = Minimal, 1 = Partial, 2 = Full. Persisted in open_tabs.selective_level.
+     *   Ignored when bypassMode != "SELECTIVE". Default 2.
+     *
+     * traversalRadius: per-tab override for how far the context assembler
+     *   reaches into the dependency graph from the current focus point.
+     *   Null = use the project-level default from ContextSettingsState.
+     *   STUB: not yet read by ContextAssembler. See ContextSettingsState for full docs.
+     *
+     * infrastructureVisibility: per-tab override for how high-fan-in
+     *   cross-cutting classes (Auth, Logger, DB, DI, etc.) are included in context.
+     *   Values: "OFF" | "BRIEF" | "DETAIL". Null = use project-level default.
+     *   STUB: not yet read by ContextAssembler. See ContextSettingsState for full docs.
      */
     @Serializable
     data class TabStateDto(
@@ -559,7 +680,14 @@ object BridgeMessage {
         val tabOrder: Int,
         val isActive: Boolean,
         val scrollPosition: Int,
-        val providerId: String? = null
+        val providerId: String? = null,
+        /** Dial position: "FULL" = context on (default), "OFF" = no context, "SELECTIVE" = Pro. */
+        val bypassMode: String? = "FULL",
+        /** Lever position when SELECTIVE: 0=Minimal, 1=Partial, 2=Full. Default 2. */
+        val selectiveLevel: Int? = 2,
+        // STUB — per-tab context controls (not yet wired to ContextAssembler)
+        val traversalRadius: Int? = null,
+        val infrastructureVisibility: String? = null
     )
 
     @Serializable
@@ -597,6 +725,7 @@ object BridgeMessage {
                 // R4: Tab management
                 "SWITCH_TAB" -> json.decodeFromString<SwitchTab>(jsonString)
                 "CLOSE_TAB" -> json.decodeFromString<CloseTab>(jsonString)
+                "RENAME_TAB" -> json.decodeFromString<RenameTab>(jsonString)
                 "SAVE_TAB_STATE" -> json.decodeFromString<SaveTabState>(jsonString)
                 "REQUEST_TAB_STATE" -> json.decodeFromString<RequestTabState>(jsonString)
                 // R4: Conversation history
@@ -611,6 +740,8 @@ object BridgeMessage {
                 "DEV_COMMAND" -> json.decodeFromString<DevCommand>(jsonString)
                 // Block 5C: Frontend logging
                 "FRONTEND_LOG" -> json.decodeFromString<FrontendLog>(jsonString)
+                // Block 5: Context settings request
+                "REQUEST_CONTEXT_SETTINGS" -> json.decodeFromString<RequestContextSettings>(jsonString)
                 else -> {
                     Dev.warn(log, "bridge.parse.unknown_command", null,
                         "type" to (typeField ?: "null")
@@ -645,6 +776,8 @@ object BridgeMessage {
             is OpenConversationResultEvent -> json.encodeToString(OpenConversationResultEvent.serializer(), event)
             // Dev
             is DevOutputEvent -> json.encodeToString(DevOutputEvent.serializer(), event)
+            // Block 5: Context settings
+            is ContextSettingsEvent -> json.encodeToString(ContextSettingsEvent.serializer(), event)
         }
     }
 }

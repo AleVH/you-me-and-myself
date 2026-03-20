@@ -713,6 +713,115 @@ class BookmarkService(private val project: Project) {
         }
     }
 
+    // ==================== Code Bookmark Tags ====================
+    //
+    // User-created tags on code snippet bookmarks (code_bookmark_tags table).
+    // Mirrors the bookmark_tags API exactly — same pattern, separate table.
+    //
+    // Why a separate set of methods instead of reusing addTag/removeTag?
+    // Because code bookmarks are a different entity type (code_bookmarks table,
+    // not bookmarks table). The tag table is also different (code_bookmark_tags).
+    // Keeping them separate avoids a polymorphic "tagType" parameter that would
+    // make call sites harder to read and audit.
+
+    /**
+     * Add a user-created tag to a code snippet bookmark.
+     *
+     * Tags are unique per code bookmark — adding the same tag twice is a no-op
+     * (UNIQUE constraint on code_bookmark_id + tag).
+     *
+     * @param codeBookmarkId The code_bookmark to tag
+     * @param tag The tag value (e.g., "utility", "auth", "needs-review")
+     * @return True if added (or already existed), false on failure
+     */
+    fun addTagToCodeBookmark(codeBookmarkId: String, tag: String): Boolean {
+        return try {
+            facade.withDatabase { db ->
+                db.execute(
+                    "INSERT OR IGNORE INTO code_bookmark_tags (code_bookmark_id, tag) VALUES (?, ?)",
+                    codeBookmarkId, tag
+                )
+                Dev.info(log, "code_bookmark_tag.added", "codeBookmarkId" to codeBookmarkId, "tag" to tag)
+                true
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "code_bookmark_tag.add_failed", e, "codeBookmarkId" to codeBookmarkId, "tag" to tag)
+            false
+        }
+    }
+
+    /**
+     * Remove a user-created tag from a code snippet bookmark.
+     *
+     * @param codeBookmarkId The code_bookmark to untag
+     * @param tag The tag to remove
+     * @return True if removed, false if not found or failed
+     */
+    fun removeTagFromCodeBookmark(codeBookmarkId: String, tag: String): Boolean {
+        return try {
+            facade.withDatabase { db ->
+                val rows = db.execute(
+                    "DELETE FROM code_bookmark_tags WHERE code_bookmark_id = ? AND tag = ?",
+                    codeBookmarkId, tag
+                )
+                Dev.info(log, "code_bookmark_tag.removed", "codeBookmarkId" to codeBookmarkId, "tag" to tag)
+                rows > 0
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "code_bookmark_tag.remove_failed", e, "codeBookmarkId" to codeBookmarkId, "tag" to tag)
+            false
+        }
+    }
+
+    /**
+     * Get all user-created tags on a code snippet bookmark.
+     *
+     * @param codeBookmarkId The code_bookmark to query
+     * @return List of tag strings, alphabetically sorted
+     */
+    fun getTagsForCodeBookmark(codeBookmarkId: String): List<String> {
+        return try {
+            facade.withReadableDatabase { db ->
+                db.query(
+                    "SELECT tag FROM code_bookmark_tags WHERE code_bookmark_id = ? ORDER BY tag",
+                    codeBookmarkId
+                ) { rs -> rs.getString("tag") }
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "code_bookmark_tags.get_failed", e, "codeBookmarkId" to codeBookmarkId)
+            emptyList()
+        }
+    }
+
+    /**
+     * Get all unique user-created tags across all code snippet bookmarks for
+     * the current project.
+     *
+     * Used by the Library filter panel for tag autocomplete and the cascading
+     * filter UI (Language → Framework → user tags).
+     *
+     * @return List of unique tag strings, alphabetically sorted
+     */
+    fun getAllCodeBookmarkTags(): List<String> {
+        val projectId = facade.resolveProjectId()
+
+        return try {
+            facade.withReadableDatabase { db ->
+                db.query(
+                    """SELECT DISTINCT cbt.tag
+                       FROM code_bookmark_tags cbt
+                       JOIN code_bookmarks cb ON cb.id = cbt.code_bookmark_id
+                       WHERE cb.project_id = ? AND cb.deleted = 0
+                       ORDER BY cbt.tag""",
+                    projectId
+                ) { rs -> rs.getString("tag") }
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "code_bookmark_tags.get_all_failed", e)
+            emptyList()
+        }
+    }
+
     companion object {
         fun getInstance(project: Project): BookmarkService =
             project.getService(BookmarkService::class.java)

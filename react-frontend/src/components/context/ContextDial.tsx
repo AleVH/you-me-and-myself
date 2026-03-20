@@ -36,7 +36,7 @@ import "./ContextDial.css";
 export type BypassMode = "OFF" | "FULL" | "SELECTIVE";
 
 export interface ContextDialProps {
-    /** Current bypass mode for the active tab. */
+    /** Current bypass mode for the active tab (dial perspective). */
     mode: BypassMode;
     /** Called when the user clicks to cycle to the next mode. */
     onModeChange: (mode: BypassMode) => void;
@@ -45,6 +45,12 @@ export interface ContextDialProps {
      * When false, the cycle is OFF → FULL → OFF (2 positions).
      */
     canUseSelective: boolean;
+    /**
+     * When true, the dial is greyed out and clicks are rejected.
+     * Driven by globalContextEnabled from ContextSettingsState.
+     * The kill-switch in Settings → Tools → YMM Assistant → Context disables this.
+     */
+    disabled?: boolean;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -93,29 +99,36 @@ const MODE_LABELS: Record<BypassMode, string> = {
 
 // ── Component ────────────────────────────────────────────────────────────
 
-function ContextDial({ mode, onModeChange, canUseSelective }: ContextDialProps) {
+function ContextDial({ mode, onModeChange, canUseSelective, disabled = false }: ContextDialProps) {
     /**
      * Determine the next mode in the clockwise cycle.
      *
-     * Basic tier (canUseSelective=false): OFF → FULL → OFF
-     * Pro tier   (canUseSelective=true):  OFF → FULL → SELECTIVE → OFF
+     * Basic tier (canUseSelective=false): FULL → OFF → FULL
+     * Pro tier   (canUseSelective=true):  FULL → OFF → SELECTIVE → FULL
+     *
+     * Clicks are silently rejected when disabled=true (kill-switch active).
      */
     const handleClick = () => {
+        if (disabled) return;
+
         if (canUseSelective) {
-            // Pro: 3-position cycle
-            const cycle: BypassMode[] = ["OFF", "FULL", "SELECTIVE"];
+            // Pro: 3-position cycle (dial perspective)
+            const cycle: BypassMode[] = ["FULL", "OFF", "SELECTIVE"];
             const idx = cycle.indexOf(mode);
             const next = cycle[(idx + 1) % cycle.length];
             onModeChange(next);
         } else {
-            // Basic: 2-position toggle
-            onModeChange(mode === "OFF" ? "FULL" : "OFF");
+            // Basic: 2-position toggle (dial perspective)
+            onModeChange(mode === "FULL" ? "OFF" : "FULL");
         }
     };
 
     const angle = MODE_ANGLES[mode];
-    const color = MODE_COLORS[mode];
-    const label = MODE_LABELS[mode];
+    // When disabled, grey out the dial regardless of mode
+    const color = disabled ? "#4a4a4a" : MODE_COLORS[mode];
+    const label = disabled
+        ? "Context gathering disabled (see Settings → Context)"
+        : MODE_LABELS[mode];
 
     // Calculate notch position from angle.
     // SVG: 0° = 12 o'clock = negative Y direction.
@@ -126,10 +139,11 @@ function ContextDial({ mode, onModeChange, canUseSelective }: ContextDialProps) 
 
     return (
         <button
-            className={`ymm-context-dial ymm-context-dial--${mode.toLowerCase()}`}
+            className={`ymm-context-dial ymm-context-dial--${mode.toLowerCase()}${disabled ? " ymm-context-dial--disabled" : ""}`}
             onClick={handleClick}
             title={label}
             aria-label={label}
+            aria-disabled={disabled}
             type="button"
         >
             <svg

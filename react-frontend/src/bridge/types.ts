@@ -112,6 +112,14 @@ export const CommandType = {
     CLOSE_TAB: "CLOSE_TAB",
 
     /**
+     * User renamed a tab via double-click inline edit.
+     * Backend updates conversations.title when conversationId is present.
+     * No event sent back — frontend already applied the rename optimistically.
+     * @see BridgeMessage.RenameTab
+     */
+    RENAME_TAB: "RENAME_TAB",
+
+    /**
      * Frontend persists current tab state to the backend.
      * Sent on tab switch, new message, or periodic save. Includes tab order,
      * active tab, scroll positions, titles, and per-tab provider IDs.
@@ -168,6 +176,16 @@ export const CommandType = {
      * @see BridgeDispatcher.handleFrontendLog — Kotlin handler
      */
     FRONTEND_LOG: "FRONTEND_LOG",
+
+    // ── Block 5: Context Settings ────────────────────────────────
+    /**
+     * Frontend requests project-level context settings on startup.
+     * Backend reads ContextSettingsState and emits CONTEXT_SETTINGS event.
+     *
+     * @see BridgeMessage.RequestContextSettings — Kotlin command class
+     * @see BridgeDispatcher.handleRequestContextSettings — Kotlin handler
+     */
+    REQUEST_CONTEXT_SETTINGS: "REQUEST_CONTEXT_SETTINGS",
 } as const;
 
 export type CommandType = (typeof CommandType)[keyof typeof CommandType];
@@ -203,6 +221,12 @@ export interface SendMessageCommand {
      * @see Feature.CONTEXT_SELECTIVE_BYPASS — tier gate for SELECTIVE mode
      */
     bypassMode: string | null;
+    /**
+     * Lever position when bypassMode = "SELECTIVE".
+     * 0 = Minimal, 1 = Partial, 2 = Full. Null when not in SELECTIVE mode.
+     * Threaded to ContextAssembler.assemble() via ChatOrchestrator.send().
+     */
+    selectiveLevel: number | null;
 }
 
 /** User confirms heuristic was correct. Mirrors BridgeMessage.ConfirmCorrection. */
@@ -275,6 +299,23 @@ export interface SwitchTabCommand {
 export interface CloseTabCommand {
     type: typeof CommandType.CLOSE_TAB;
     tabId: string;
+}
+
+/**
+ * User renamed a tab via double-click inline edit. Mirrors BridgeMessage.RenameTab.
+ *
+ * conversationId is null for fresh tabs that have never sent a message — the
+ * backend skips the DB update in that case. When present, the backend updates
+ * conversations.title so the rename is durable across IDE restarts.
+ *
+ * No event is sent back — the frontend already applied the rename optimistically
+ * and the new title will persist via the next SAVE_TAB_STATE command.
+ */
+export interface RenameTabCommand {
+    type: typeof CommandType.RENAME_TAB;
+    tabId: string;
+    conversationId: string | null;
+    title: string;
 }
 
 /**
@@ -378,6 +419,16 @@ export interface FrontendLogCommand {
 }
 
 /**
+ * Frontend requests project-level context settings. Mirrors BridgeMessage.RequestContextSettings.
+ *
+ * Sent at BRIDGE_READY (and non-JCEF dev startup). Backend reads ContextSettingsState
+ * and emits CONTEXT_SETTINGS event with contextEnabled + defaultBypassMode.
+ */
+export interface RequestContextSettingsCommand {
+    type: typeof CommandType.REQUEST_CONTEXT_SETTINGS;
+}
+
+/**
  * Union of all command types.
  *
  * The transport layer serializes this to JSON before sending.
@@ -394,6 +445,7 @@ export type BridgeCommand =
     | SwitchTabProviderCommand
     | SwitchTabCommand
     | CloseTabCommand
+    | RenameTabCommand
     | SaveTabStateCommand
     | RequestTabStateCommand
     | LoadConversationCommand
@@ -401,7 +453,8 @@ export type BridgeCommand =
     | BookmarkCodeBlockCommand
     | OpenConversationCommand
     | DevCommandCommand
-    | FrontendLogCommand;
+    | FrontendLogCommand
+    | RequestContextSettingsCommand;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  EVENT TYPES (Backend → Frontend)
@@ -471,6 +524,14 @@ export const EventType = {
     // ── Dev Events ───────────────────────────────────────────────
     /** Dev command output, rendered as system message. */
     DEV_OUTPUT: "DEV_OUTPUT",
+
+    // ── Block 5: Context Settings ────────────────────────────────
+    /**
+     * Project-level context settings from the backend.
+     * Sent in response to REQUEST_CONTEXT_SETTINGS on startup.
+     * @see BridgeMessage.ContextSettingsEvent — Kotlin event class
+     */
+    CONTEXT_SETTINGS: "CONTEXT_SETTINGS",
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
@@ -675,6 +736,15 @@ export interface BridgeReadyEvent {
  * providerId: the AI profile selected for this specific tab.
  * Null means "use the global chat provider selection".
  * Persisted in open_tabs.provider_id so per-tab provider survives IDE restarts.
+ *
+ * traversalRadius: per-tab override for context depth (hops in dependency graph).
+ * Null = use project-level default from ContextSettingsState.
+ * STUB: not yet read by the context system. See ContextSettingsState.kt for full docs.
+ *
+ * infrastructureVisibility: per-tab override for how high-fan-in cross-cutting
+ * classes (Auth, Logger, DB, DI, etc.) are included in context.
+ * Values: "OFF" | "BRIEF" | "DETAIL". Null = use project-level default.
+ * STUB: not yet read by the context system. See ContextSettingsState.kt for full docs.
  */
 export interface TabStateDto {
     /** Unique tab identifier (generated by frontend). */
@@ -691,6 +761,21 @@ export interface TabStateDto {
     scrollPosition: number;
     /** Per-tab AI provider profile ID. Null = use global selection. */
     providerId: string | null;
+    /**
+     * Dial position in dial perspective (not backend bypass perspective).
+     * "FULL" = context on (default), "OFF" = no context, "SELECTIVE" = Pro.
+     * Persisted in open_tabs.bypass_mode. Default "FULL".
+     */
+    bypassMode?: string | null;
+    /**
+     * Lever position when bypassMode = "SELECTIVE".
+     * 0 = Minimal, 1 = Partial, 2 = Full. Default 2.
+     */
+    selectiveLevel?: number | null;
+    /** STUB — per-tab traversal radius override. Null = project default. */
+    traversalRadius?: number | null;
+    /** STUB — per-tab infrastructure visibility override. Null = project default. */
+    infrastructureVisibility?: "OFF" | "BRIEF" | "DETAIL" | null;
 }
 
 /**
@@ -796,6 +881,31 @@ export interface DevOutputEvent {
 }
 
 /**
+ * Project-level context settings event. Mirrors BridgeMessage.ContextSettingsEvent.
+ *
+ * Sent in response to REQUEST_CONTEXT_SETTINGS on startup.
+ * The React app uses this to:
+ * - Set globalContextEnabled: when false, the ContextDial is greyed out.
+ * - Set defaultBypassMode: dial position for new tabs ("FULL" or "OFF").
+ *   Basic-tier users always receive "FULL" regardless of stored value.
+ */
+export interface ContextSettingsEvent {
+    type: typeof EventType.CONTEXT_SETTINGS;
+    /**
+     * Master kill-switch from ContextSettingsState.contextEnabled.
+     * When false, all context gathering is disabled and the ContextDial
+     * is visually disabled (clicks rejected).
+     */
+    contextEnabled: boolean;
+    /**
+     * Default dial position for new tabs (dial perspective).
+     * "FULL" = full context on (default), "OFF" = no context.
+     * "SELECTIVE" only if Pro tier; Basic always receives "FULL".
+     */
+    defaultBypassMode: string;
+}
+
+/**
  * Union of all event types.
  *
  * The transport layer deserializes incoming JSON into one of these.
@@ -816,4 +926,5 @@ export type BridgeEvent =
     | StarUpdatedEvent
     | BookmarkResultEvent
     | OpenConversationResultEvent
-    | DevOutputEvent;
+    | DevOutputEvent
+    | ContextSettingsEvent;

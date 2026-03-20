@@ -75,6 +75,7 @@ import {
     type BookmarkResultEvent,
     type OpenConversationResultEvent,
     type DevOutputEvent,
+    type ContextSettingsEvent,
     type TabStateDto, ProviderInfoDto,
 } from "../bridge/types";
 import { createAccumulator, accumulate, contextFillPercent } from "../metrics";
@@ -155,20 +156,35 @@ export interface TabData {
      */
     collapsedIds: Set<string>;
     /**
-     * Context bypass mode for this tab's next SEND_MESSAGE.
+     * Context bypass mode for this tab — stored in dial perspective.
      *
-     * Controls whether the backend's ContextAssembler gathers IDE context.
-     * - "OFF":       Normal flow — full context gathering runs (default).
-     * - "FULL":      Skip all context gathering. System prompt + history still flow.
-     * - "SELECTIVE": Per-component bypass (Pro tier, STUB — treated as OFF).
+     * Dial semantics (user perspective):
+     * - "FULL":      Full context gathering (context ON). Default.
+     * - "OFF":       No context gathering (context OFF).
+     * - "SELECTIVE": Per-component control (Pro tier).
      *
-     * Ephemeral — not persisted to SQLite or TabStateDto. Resets to "OFF"
-     * on IDE restart. Set by the ContextDial in the ContextDialStrip.
+     * Translated to backend bypass perspective by dialToBackendBypass()
+     * before inclusion in SEND_MESSAGE:
+     *   "FULL" → null (no bypass, context runs)
+     *   "OFF"  → "FULL" (full bypass, no context)
+     *   "SELECTIVE" → "SELECTIVE"
+     *
+     * Persisted in open_tabs.bypass_mode via SAVE_TAB_STATE. Default "FULL".
      *
      * @see ContextDialStrip — React component that reads/writes this
+     * @see dialToBackendBypass — translates for SEND_MESSAGE
      * @see ContextAssembler.assemble — backend checks bypassMode
      */
     bypassMode: "OFF" | "FULL" | "SELECTIVE";
+    /**
+     * Lever position when bypassMode = "SELECTIVE".
+     * 0 = Minimal (open file only), 1 = Partial (no ProjectStructure), 2 = Full.
+     * Persisted in open_tabs.selective_level. Default 2.
+     *
+     * @see ContextLever — React component that reads/writes this
+     * @see ContextAssembler.buildDetectorsForLevel — backend uses this value
+     */
+    selectiveLevel: number;
 }
 
 /** R4: Lightweight tab descriptor for the TabBar component. */
@@ -274,9 +290,9 @@ export interface BridgeState {
     // R5: Bookmark command
     bookmarkCodeBlock: (exchangeId: string, blockIndex: number) => void;
 
-    // Block 5C: Context bypass
+    // Block 5: Context bypass + settings
     /**
-     * Active tab's context bypass mode.
+     * Active tab's context bypass mode (dial perspective).
      * Read by ContextDialStrip to show the current state.
      */
     bypassMode: "OFF" | "FULL" | "SELECTIVE";
@@ -285,6 +301,26 @@ export interface BridgeState {
      * Called by ContextDialStrip when the user clicks the ContextDial.
      */
     setBypassMode: (mode: "OFF" | "FULL" | "SELECTIVE") => void;
+    /**
+     * Active tab's selective level (0-2).
+     * Read by ContextLever to show the current position.
+     */
+    selectiveLevel: number;
+    /**
+     * Update the active tab's selective level.
+     * Called by ContextLever when the user drags the handle.
+     */
+    setSelectiveLevel: (level: number) => void;
+    /**
+     * Whether context gathering is globally enabled (from ContextSettingsState).
+     * When false, the ContextDial is greyed out and clicks are rejected.
+     */
+    globalContextEnabled: boolean;
+    /**
+     * Default dial position for new tabs from the backend settings.
+     * Applied to newly created tabs from defaultBypassMode in ContextSettingsEvent.
+     */
+    defaultBypassMode: "OFF" | "FULL" | "SELECTIVE";
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -327,7 +363,9 @@ function createTab(data?: Partial<TabData>): TabData {
         historyLoaded: data?.historyLoaded ?? true,
         providerId: data?.providerId ?? null,
         collapsedIds: data?.collapsedIds ?? new Set(),
-        bypassMode: "OFF",
+        // Dial perspective: "FULL" = context on (default). Translated to backend by dialToBackendBypass().
+        bypassMode: data?.bypassMode ?? "FULL",
+        selectiveLevel: data?.selectiveLevel ?? 2,
     };
 
     log.info("useBridge", "createTab", {
@@ -345,6 +383,26 @@ function titleFromMessage(text: string): string {
     const trimmed = text.trim().replace(/\n/g, " ");
     if (trimmed.length <= TAB_TITLE_MAX_LENGTH) return trimmed;
     return trimmed.slice(0, TAB_TITLE_MAX_LENGTH - 1) + "…";
+}
+
+/**
+ * Translate a dial-perspective bypass mode to the backend bypass perspective
+ * expected by ContextAssembler.assemble().
+ *
+ * Dial perspective (user):   "FULL" = context on, "OFF" = no context
+ * Backend bypass perspective: null = context runs, "FULL" = full bypass (no context)
+ *
+ * Translation:
+ *   "FULL"      → null       (no bypass = context runs)
+ *   "OFF"       → "FULL"     (full bypass = no context)
+ *   "SELECTIVE" → "SELECTIVE" (per-component)
+ */
+function dialToBackendBypass(mode: "OFF" | "FULL" | "SELECTIVE"): string | null {
+    switch (mode) {
+        case "FULL":      return null;
+        case "OFF":       return "FULL";
+        case "SELECTIVE": return "SELECTIVE";
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -373,6 +431,12 @@ export function useBridge(): BridgeState {
 
     const [providers, setProviders] = useState<ProviderInfoDto[]>([]);
     const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+
+    // Block 5: Context settings — received from backend at startup via CONTEXT_SETTINGS event.
+    // globalContextEnabled: master kill-switch. When false, ContextDial is greyed out.
+    // defaultBypassMode: dial position applied to newly created tabs.
+    const [globalContextEnabled, setGlobalContextEnabled] = useState<boolean>(true);
+    const [defaultBypassMode, setDefaultBypassMode] = useState<"OFF" | "FULL" | "SELECTIVE">("FULL");
 
     const idCounter = useRef(0);
     const tabStateInitialized = useRef(false);
@@ -403,7 +467,8 @@ export function useBridge(): BridgeState {
     };
     const activeScrollPosition = activeTab?.scrollPosition ?? 0;
     const activeCollapsedIds = activeTab?.collapsedIds ?? new Set<string>();
-    const activeBypassMode = activeTab?.bypassMode ?? "OFF";
+    const activeBypassMode = activeTab?.bypassMode ?? "FULL";
+    const activeSelectiveLevel = activeTab?.selectiveLevel ?? 2;
 
     const tabs= tabOrder
         .map((id) => {
@@ -446,6 +511,8 @@ export function useBridge(): BridgeState {
                         isActive: id === activeTabId,
                         scrollPosition: tab?.scrollPosition ?? 0,
                         providerId: tab?.providerId ?? null,
+                        bypassMode: tab?.bypassMode ?? "FULL",
+                        selectiveLevel: tab?.selectiveLevel ?? 2,
                     };
                 });
 
@@ -491,9 +558,14 @@ export function useBridge(): BridgeState {
                     const tab = prev.get(targetId);
                     if (!tab) return prev;
 
+                    // Always trust the backend's conversationId — it is the authoritative
+                    // SQLite record ID. The frontend generates a temporary UUID when the
+                    // tab is first created, but the backend assigns the real ID on the
+                    // first CHAT_RESULT. Syncing here ensures RENAME_TAB and other
+                    // commands target the correct DB record.
                     if (e.conversationId && tab.conversationId && e.conversationId !== tab.conversationId) {
-                        log.warn("useBridge", "conversationId mismatch", {
-                            tab: tab.conversationId,
+                        log.info("useBridge", "syncing conversationId from backend", {
+                            frontend: tab.conversationId,
                             backend: e.conversationId,
                             tabId: targetId,
                         });
@@ -518,7 +590,8 @@ export function useBridge(): BridgeState {
                         ...tab,
                         messages: [...tab.messages, newMsg],
                         isThinking: false,
-                        conversationId: tab.conversationId ?? e.conversationId,
+                        // Backend's conversationId is authoritative — use it when present.
+                        conversationId: e.conversationId ?? tab.conversationId,
                     });
                     return next;
                 });
@@ -629,11 +702,12 @@ export function useBridge(): BridgeState {
             }),
         );
 
-        // BRIDGE_READY — request providers and tab state
+        // BRIDGE_READY — request providers, tab state, and context settings
         unsubscribers.push(
             onEvent(EventType.BRIDGE_READY, () => {
                 sendCommand({ type: CommandType.REQUEST_PROVIDERS });
                 sendCommand({ type: CommandType.REQUEST_TAB_STATE });
+                sendCommand({ type: CommandType.REQUEST_CONTEXT_SETTINGS });
             }),
         );
 
@@ -652,6 +726,13 @@ export function useBridge(): BridgeState {
 
                 const sorted = [...e.tabs].sort((a, b) => a.tabOrder - b.tabOrder);
                 for (const dto of sorted) {
+                    // Validate restored bypassMode (guard against unexpected DB values)
+                    const validModes: Array<"OFF" | "FULL" | "SELECTIVE"> = ["OFF", "FULL", "SELECTIVE"];
+                    const restoredBypassMode: "OFF" | "FULL" | "SELECTIVE" =
+                        validModes.includes(dto.bypassMode as "OFF" | "FULL" | "SELECTIVE")
+                            ? dto.bypassMode as "OFF" | "FULL" | "SELECTIVE"
+                            : "FULL";
+
                     newMap.set(dto.id, {
                         id: dto.id,
                         title: dto.title,
@@ -666,7 +747,8 @@ export function useBridge(): BridgeState {
                         historyLoaded: dto.conversationId === null,
                         providerId: dto.providerId ?? null,
                         collapsedIds: new Set(),
-                        bypassMode: "OFF",
+                        bypassMode: restoredBypassMode,
+                        selectiveLevel: dto.selectiveLevel ?? 2,
                     });
                     newOrder.push(dto.id);
                     if (dto.isActive) newActiveId = dto.id;
@@ -844,6 +926,26 @@ export function useBridge(): BridgeState {
             }),
         );
 
+        // Block 5: CONTEXT_SETTINGS — apply project-level context settings
+        unsubscribers.push(
+            onEvent(EventType.CONTEXT_SETTINGS, (event: BridgeEvent) => {
+                const e = event as ContextSettingsEvent;
+                log.info("useBridge", "CONTEXT_SETTINGS received", {
+                    contextEnabled: e.contextEnabled,
+                    defaultBypassMode: e.defaultBypassMode,
+                });
+
+                setGlobalContextEnabled(e.contextEnabled);
+
+                // Validate and apply defaultBypassMode (guard against unexpected values)
+                const validModes: Array<"OFF" | "FULL" | "SELECTIVE"> = ["OFF", "FULL", "SELECTIVE"];
+                const mode = validModes.includes(e.defaultBypassMode as "OFF" | "FULL" | "SELECTIVE")
+                    ? e.defaultBypassMode as "OFF" | "FULL" | "SELECTIVE"
+                    : "FULL";
+                setDefaultBypassMode(mode);
+            }),
+        );
+
         // DEV_OUTPUT → active tab (same as SYSTEM_MESSAGE)
         unsubscribers.push(
             onEvent(EventType.DEV_OUTPUT, (event: BridgeEvent) => {
@@ -880,6 +982,7 @@ export function useBridge(): BridgeState {
         if (!isJcefMode()) {
             sendCommand({ type: CommandType.REQUEST_PROVIDERS });
             sendCommand({ type: CommandType.REQUEST_TAB_STATE });
+            sendCommand({ type: CommandType.REQUEST_CONTEXT_SETTINGS });
         }
 
         return () => {
@@ -913,16 +1016,18 @@ export function useBridge(): BridgeState {
             let convId: string | null = null;
             let tabProviderId: string | null = null;
             let tabBypassMode: string | null = null;
+            let tabSelectiveLevel: number | null = null;
 
             setTabMap((prev) => {
                 const tab = prev.get(targetId);
                 if (!tab) return prev;
                 convId = tab.conversationId;
                 tabProviderId = tab.providerId;
-                // Capture the tab's bypass mode for the SendMessageCommand.
-                // "OFF" is sent as null (backend default) to avoid noise on
-                // every message when bypass is not active.
-                tabBypassMode = tab.bypassMode === "OFF" ? null : tab.bypassMode;
+                // Translate dial-perspective bypassMode to backend bypass perspective.
+                // "FULL" (context on) → null (no bypass), "OFF" → "FULL" (full bypass).
+                tabBypassMode = dialToBackendBypass(tab.bypassMode);
+                // Only include selectiveLevel when SELECTIVE mode is active
+                tabSelectiveLevel = tab.bypassMode === "SELECTIVE" ? tab.selectiveLevel : null;
 
                 const newMsg: ChatMessage = {
                     id: `msg-${Date.now()}-${++idCounter.current}`,
@@ -948,7 +1053,8 @@ export function useBridge(): BridgeState {
                 conversationId: convId,
                 tabId: targetId,
                 providerId: tabProviderId ?? "global",
-                bypassMode: tabBypassMode ?? "OFF",
+                bypassMode: tabBypassMode ?? "null (full context)",
+                selectiveLevel: tabSelectiveLevel,
             });
 
             sendCommand({
@@ -957,6 +1063,7 @@ export function useBridge(): BridgeState {
                 conversationId: convId,
                 providerId: tabProviderId,
                 bypassMode: tabBypassMode,
+                selectiveLevel: tabSelectiveLevel,
             });
             persistTabState();
         },
@@ -1084,35 +1191,32 @@ export function useBridge(): BridgeState {
     );
 
     /**
-     * Rename a tab title (updates both local state and persists).
+     * Rename a tab title.
      *
-     * PLACEHOLDER: RENAME_TAB backend command not yet implemented.
-     * Currently updates local state only — title survives tab switches
-     * and IDE restarts (included in TabStateDto via SAVE_TAB_STATE).
+     * Sends RENAME_TAB to the backend so the title is written to
+     * conversations.title in SQLite (making the rename durable in the Library).
+     * Also updates local state immediately and persists via SAVE_TAB_STATE.
      *
-     * Full backend wiring needed:
-     * 1. Add RENAME_TAB to CommandType in types.ts
-     * 2. Handle in BridgeDispatcher.kt → UPDATE conversations SET title = ?
-     * 3. Uncomment sendCommand(RENAME_TAB) below
+     * conversationId may be null for fresh tabs that have never sent a message;
+     * the backend skips the DB update in that case.
      */
     const renameTab = useCallback(
         (tabId: string, newTitle: string) => {
             const trimmed = newTitle.trim();
             if (!trimmed) return;
 
-            updateTab(tabId, (tab) => ({ ...tab, title: trimmed }));
-
-            // PLACEHOLDER: sendCommand({ type: CommandType.RENAME_TAB, tabId, title: trimmed });
-            // PLACEHOLDER: RENAME_TAB backend command not yet implemented.
-            // Add to CommandType and handle in BridgeDispatcher.kt.
-            log.warn("useBridge", "renameTab: local only (RENAME_TAB not implemented)", {
+            const conversationId = tabMap.get(tabId)?.conversationId ?? null;
+            sendCommand({
+                type: CommandType.RENAME_TAB,
                 tabId,
+                conversationId,
                 title: trimmed,
             });
 
+            updateTab(tabId, (tab) => ({ ...tab, title: trimmed }));
             persistTabState();
         },
-        [updateTab, persistTabState],
+        [tabMap, updateTab, persistTabState, sendCommand],
     );
 
     /**
@@ -1215,21 +1319,40 @@ export function useBridge(): BridgeState {
     }, [updateTab]);
 
     /**
-     * Update the active tab's context bypass mode.
+     * Update the active tab's context bypass mode (dial perspective).
      *
      * Called by ContextDialStrip when the user clicks the ContextDial.
-     * The new mode is stored in TabData.bypassMode (ephemeral) and
-     * included in the next SEND_MESSAGE command.
+     * The new mode is stored in TabData.bypassMode (persisted via SAVE_TAB_STATE)
+     * and included in the next SEND_MESSAGE command via dialToBackendBypass().
      *
      * @see ContextDialStrip — calls this on dial click
-     * @see sendMessage — reads bypassMode from TabData
+     * @see dialToBackendBypass — translates to backend perspective in sendMessage
      */
     const setBypassMode = useCallback((mode: "OFF" | "FULL" | "SELECTIVE") => {
         updateTab(activeTabIdRef.current, (tab) => ({
             ...tab,
             bypassMode: mode,
         }));
-    }, [updateTab]);
+        persistTabState();
+    }, [updateTab, persistTabState]);
+
+    /**
+     * Update the active tab's selective level.
+     *
+     * Called by ContextLever when the user drags the handle to a new snap position.
+     * The level is stored in TabData.selectiveLevel (persisted via SAVE_TAB_STATE)
+     * and included in the next SEND_MESSAGE when bypassMode = "SELECTIVE".
+     *
+     * @see ContextLever — calls this on handle drag end
+     * @see sendMessage — reads selectiveLevel from TabData
+     */
+    const setSelectiveLevel = useCallback((level: number) => {
+        updateTab(activeTabIdRef.current, (tab) => ({
+            ...tab,
+            selectiveLevel: level,
+        }));
+        persistTabState();
+    }, [updateTab, persistTabState]);
 
     return {
         messages: activeMessages,
@@ -1263,5 +1386,9 @@ export function useBridge(): BridgeState {
         bookmarkCodeBlock,
         bypassMode: activeBypassMode,
         setBypassMode,
+        selectiveLevel: activeSelectiveLevel,
+        setSelectiveLevel,
+        globalContextEnabled,
+        defaultBypassMode,
     };
 }

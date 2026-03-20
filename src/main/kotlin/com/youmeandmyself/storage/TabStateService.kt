@@ -3,6 +3,7 @@ package com.youmeandmyself.storage
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.project.Project
 import com.youmeandmyself.ai.chat.bridge.BridgeMessage
+import com.youmeandmyself.ai.settings.TabSettingsState
 import com.youmeandmyself.dev.Dev
 import java.time.Instant
 
@@ -13,7 +14,7 @@ import java.time.Instant
  *
  * Persists the frontend's open tab state (which tabs are open, their order,
  * which is active, scroll positions, per-tab provider) so that tabs survive
- * IDE restarts. Controlled by the `keep_tabs` setting in storage_config.
+ * IDE restarts. Controlled by the `keepTabs` preference in [TabSettingsState] (XML).
  *
  * ## Storage Strategy
  *
@@ -53,22 +54,14 @@ class TabStateService(private val project: Project) {
     /**
      * Check whether tab persistence is enabled.
      *
-     * Reads the `keep_tabs` key from storage_config. Defaults to true
-     * if the key doesn't exist (opt-out rather than opt-in).
+     * Reads from [TabSettingsState] XML preferences. Defaults to true
+     * if the state hasn't been configured (opt-out rather than opt-in).
      *
      * @return True if tabs should be saved/restored across restarts
      */
     fun isKeepTabsEnabled(): Boolean {
         return try {
-            facade.withReadableDatabase { db ->
-                val value = db.queryOne(
-                    "SELECT config_value FROM storage_config WHERE config_key = ?",
-                    "keep_tabs"
-                ) { rs -> rs.getString("config_value") }
-
-                // Default to true if not set
-                value?.lowercase() != "false"
-            }
+            TabSettingsState.getInstance(project).state.keepTabs
         } catch (e: Exception) {
             Dev.warn(log, "tab_state.keep_tabs_read_failed", e)
             true // Default to keeping tabs on error
@@ -76,23 +69,36 @@ class TabStateService(private val project: Project) {
     }
 
     /**
-     * Set the keep_tabs preference.
+     * Set the keepTabs preference.
+     *
+     * Writes to [TabSettingsState] XML. If disabled, tab state will not
+     * be saved/restored across IDE restarts.
      *
      * @param enabled True to persist tabs, false to start fresh on restart
      */
     fun setKeepTabs(enabled: Boolean) {
         try {
-            facade.withDatabase { db ->
-                db.execute(
-                    """INSERT INTO storage_config (config_key, config_value)
-                       VALUES ('keep_tabs', ?)
-                       ON CONFLICT(config_key) DO UPDATE SET config_value = ?""",
-                    enabled.toString(), enabled.toString()
-                )
-            }
+            val settings = TabSettingsState.getInstance(project)
+            settings.loadState(settings.state.copy(keepTabs = enabled))
             Dev.info(log, "tab_state.keep_tabs_set", "enabled" to enabled)
         } catch (e: Exception) {
             Dev.warn(log, "tab_state.keep_tabs_set_failed", e)
+        }
+    }
+
+    /**
+     * Get the maximum number of open tabs allowed.
+     *
+     * Reads from [TabSettingsState] XML preferences. Defaults to 5.
+     *
+     * @return Maximum simultaneous open tabs (2–20)
+     */
+    fun getMaxTabs(): Int {
+        return try {
+            TabSettingsState.getInstance(project).state.maxTabs
+        } catch (e: Exception) {
+            Dev.warn(log, "tab_state.max_tabs_read_failed", e)
+            5
         }
     }
 
@@ -128,8 +134,8 @@ class TabStateService(private val project: Project) {
                     for (tab in tabs) {
                         db.execute(
                             """INSERT INTO open_tabs
-                               (id, project_id, conversation_id, title, tab_order, is_active, scroll_position, provider_id, created_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               (id, project_id, conversation_id, title, tab_order, is_active, scroll_position, provider_id, bypass_mode, selective_level, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             tab.id,
                             projectId,
                             tab.conversationId,
@@ -138,6 +144,8 @@ class TabStateService(private val project: Project) {
                             tab.isActive,
                             tab.scrollPosition,
                             tab.providerId,
+                            tab.bypassMode ?: "FULL",
+                            tab.selectiveLevel ?: 2,
                             Instant.now().toString()
                         )
                     }
@@ -173,7 +181,7 @@ class TabStateService(private val project: Project) {
         return try {
             facade.withReadableDatabase { db ->
                 db.query(
-                    """SELECT id, conversation_id, title, tab_order, is_active, scroll_position, provider_id
+                    """SELECT id, conversation_id, title, tab_order, is_active, scroll_position, provider_id, bypass_mode, selective_level
                        FROM open_tabs
                        WHERE project_id = ?
                        ORDER BY tab_order""",
@@ -186,7 +194,9 @@ class TabStateService(private val project: Project) {
                         tabOrder = rs.getInt("tab_order"),
                         isActive = rs.getInt("is_active") == 1,
                         scrollPosition = rs.getInt("scroll_position"),
-                        providerId = rs.getString("provider_id")
+                        providerId = rs.getString("provider_id"),
+                        bypassMode = rs.getString("bypass_mode") ?: "FULL",
+                        selectiveLevel = rs.getInt("selective_level").takeUnless { rs.wasNull() } ?: 2
                     )
                 }
             }

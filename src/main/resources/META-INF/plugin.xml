@@ -119,6 +119,12 @@
              Persisted to ymmMetricsSettings.xml in the project config dir. -->
         <projectService serviceImplementation="com.youmeandmyself.ai.settings.MetricsSettingsState"/>
 
+        <!-- ── TabSettingsState — project-level persistent state ────────── -->
+        <!-- Stores tab preferences (keepTabs, maxTabs).
+             Persisted to ymmTabSettings.xml in the project config dir.
+             Read by TabStateService and GeneralConfigurable. -->
+        <projectService serviceImplementation="com.youmeandmyself.ai.settings.TabSettingsState"/>
+
         <!-- ── MetricsConfigurable — settings UI page ─────────────────────── -->
         <!-- Settings → Tools → YMM Assistant → Metrics
              Nested under the YMM root node (parentId matches the root configurable). -->
@@ -188,35 +194,12 @@
                popup="true"
                description="AI tools">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
-
-            <!-- Ping all configured AI providers and report status -->
-            <action id="com.youmeandmyself.ai.actions.TestAiProvidersAction"
-                    class="com.youmeandmyself.ai.actions.TestAiProvidersAction"
-                    text="Test AI Providers"
-                    description="Ping all configured AI providers"/>
         </group>
-
-        <!-- Test actions: send a prompt to a specific provider -->
-        <action id="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"
-                class="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"
-                text="Send Test Prompt to OpenAI"
-                description="Sends a simple prompt to OpenAI and shows the reply">
-            <add-to-group group-id="com.youmeandmyself.ai.toolsGroup"
-                          anchor="last"
-                          action-id="com.youmeandmyself.ai.actions.SendTestPromptToOpenAIAction"/>
-        </action>
-
-        <action id="com.youmeandmyself.ai.actions.SendTestPromptToGeminiAction"
-                class="com.youmeandmyself.ai.actions.SendTestPromptToGeminiAction"
-                text="Send Test Prompt to Gemini"
-                description="Sends a simple prompt to Gemini and shows the reply">
-            <add-to-group group-id="com.youmeandmyself.ai.toolsGroup" anchor="last"/>
-        </action>
 
         <!-- Keyboard shortcut to open the chat panel -->
         <action id="com.youmeandmyself.ai.actions.OpenChatToolWindow"
                 class="com.youmeandmyself.ai.actions.OpenChatToolWindowAction"
-                text="Open YMM Chat">
+                text="Open YMM Assistant">
             <add-to-group group-id="com.youmeandmyself.ai.toolsGroup" anchor="last"/>
             <keyboard-shortcut first-keystroke="ctrl alt Y" keymap="$default"/>
             <keyboard-shortcut first-keystroke="meta alt Y" keymap="Mac OS X"/>

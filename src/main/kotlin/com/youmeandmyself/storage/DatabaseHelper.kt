@@ -20,7 +20,7 @@ import java.sql.ResultSet
  *
  * If the database is ever lost or corrupted, it can be fully rebuilt from JSONL.
  *
- * ## Schema: 14 Tables
+ * ## Schema: 15 Tables
  *
  * Created on first run, all tables exist from day one even if some features
  * (summaries, bookmarks) haven't been built yet. This avoids future migrations.
@@ -32,13 +32,14 @@ import java.sql.ResultSet
  * 5.  summary_hierarchy            — parent/child relationships between summaries
  * 6.  summary_config               — per-project summarization settings
  * 7.  collections                  — user-created groups for bookmarks
- * 8.  bookmarks                    — saved items (chat or summary) with cached content
- * 9.  bookmark_tags                — tags on bookmarks for filtering
- * 10. storage_config               — global plugin settings (retention, cleanup thresholds)
- * 11. open_tabs                    — persisted chat tab state for restore on IDE restart
- * 12. code_bookmarks               — saved code blocks from chat responses
- * 13. metrics                      — per-exchange token usage metrics for the Metrics Module
- * 14. assistant_profile_summary    — stores the summarized version of the user's assistant profile
+ * 8.  bookmarks                    — saved items (chat, summary, conversation, or snippet) with cached content
+ * 9.  bookmark_tags                — user-created tags on exchange/summary bookmarks
+ * 10. code_bookmark_tags           — user-created tags on code snippet bookmarks (same pattern as bookmark_tags)
+ * 11. storage_config               — global plugin settings (retention, cleanup thresholds)
+ * 12. open_tabs                    — persisted chat tab state for restore on IDE restart
+ * 13. code_bookmarks               — saved code blocks from chat responses
+ * 14. metrics                      — per-exchange token usage metrics for the Metrics Module
+ * 15. assistant_profile_summary    — stores the summarized version of the user's assistant profile
  *
  * ## Thread Safety
  *
@@ -253,7 +254,7 @@ class DatabaseHelper(private val dbFile: File) {
     // ==================== Schema Creation ====================
 
     /**
-     * Create all 10 tables and their indexes.
+     * Create all 15 tables and their indexes.
      *
      * Uses CREATE TABLE IF NOT EXISTS so this is safe to call on every startup.
      * All tables are created upfront — even those for features not yet built
@@ -272,6 +273,7 @@ class DatabaseHelper(private val dbFile: File) {
                 if (DevMode.isEnabled()) {
                     Dev.info(log, "db.schema.dev_wipe", "reason" to "dev mode active, ensuring clean schema")
                     stmt.execute("PRAGMA foreign_keys = OFF")
+                    stmt.execute("DROP TABLE IF EXISTS code_bookmark_tags")  // must drop before code_bookmarks
                     stmt.execute("DROP TABLE IF EXISTS bookmark_tags")
                     stmt.execute("DROP TABLE IF EXISTS bookmarks")
                     stmt.execute("DROP TABLE IF EXISTS collections")
@@ -315,12 +317,16 @@ class DatabaseHelper(private val dbFile: File) {
                     model_id                    TEXT,
                     turn_count                  INTEGER NOT NULL DEFAULT 0,
                     is_active                   INTEGER NOT NULL DEFAULT 1,
-                    max_history_tokens_override INTEGER
+                    max_history_tokens_override INTEGER,
+                    -- Soft delete: 0 = visible, 1 = hidden from all views.
+                    -- Stage 2 (JSONL purge) is a separate Settings page action.
+                    deleted                     INTEGER NOT NULL DEFAULT 0
                 )
             """.trimIndent())
-                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_id)")
-                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at)")
-                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_active ON conversations(is_active)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_project  ON conversations(project_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_updated  ON conversations(updated_at)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_active   ON conversations(is_active)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_conv_deleted  ON conversations(deleted)")
 
                 // ── Table 2: chat_exchanges ──
                 // Phase 4: Replaced single `tokens_used INTEGER` with three columns
@@ -372,7 +378,13 @@ class DatabaseHelper(private val dbFile: File) {
                     context_branch    TEXT,
                     open_files        TEXT,
                     -- Exchange-level starring (favourites)
-                    is_starred        INTEGER NOT NULL DEFAULT 0
+                    is_starred        INTEGER NOT NULL DEFAULT 0,
+                    -- Soft delete: 0 = visible, 1 = hidden from all views.
+                    -- The exchange record itself is never fully removed — metrics,
+                    -- token counts, and timestamps are preserved. Only the text
+                    -- content (user_prompt, assistant_text) can be purged later
+                    -- via the Settings page "Consolidate deleted items" action.
+                    deleted           INTEGER NOT NULL DEFAULT 0
                 )
             """.trimIndent())
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_project ON chat_exchanges(project_id)")
@@ -381,7 +393,8 @@ class DatabaseHelper(private val dbFile: File) {
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_purpose ON chat_exchanges(purpose)")
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_duplicate ON chat_exchanges(duplicate_hash)")
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_has_code ON chat_exchanges(has_code_block)")
-                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_starred ON chat_exchanges(is_starred)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_starred  ON chat_exchanges(is_starred)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_chat_deleted  ON chat_exchanges(deleted)")
 
                 // ── Table 3: code_elements ──
                 stmt.execute("""
@@ -465,11 +478,24 @@ class DatabaseHelper(private val dbFile: File) {
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_coll_project ON collections(project_id)")
 
                 // ── Table 8: bookmarks ──
+                // Polymorphic link between any bookmarkable item and a collection.
+                // source_type discriminates between item kinds — no separate join
+                // tables needed. Adding new source types is additive (no migration).
+                //
+                // source_type values:
+                //   'CHAT'         — a single chat exchange (assistant response)
+                //   'SUMMARY'      — a generated code summary
+                //   'CONVERSATION' — an entire conversation (all its exchanges)
+                //   'CODE_SNIPPET' — a saved code block (references code_bookmarks.id)
+                //
+                // Note: no FK on source_id by design. Items of different source_types
+                // live in different tables, so a single FK column can't enforce all of
+                // them. Referential integrity is maintained at the application layer.
                 stmt.execute("""
                 CREATE TABLE IF NOT EXISTS bookmarks (
                     id             TEXT PRIMARY KEY,
                     collection_id  TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
-                    source_type    TEXT NOT NULL CHECK(source_type IN ('CHAT', 'SUMMARY')),
+                    source_type    TEXT NOT NULL CHECK(source_type IN ('CHAT', 'SUMMARY', 'CONVERSATION', 'CODE_SNIPPET')),
                     source_id      TEXT NOT NULL,
                     cached_content TEXT,
                     note           TEXT,
@@ -478,7 +504,10 @@ class DatabaseHelper(private val dbFile: File) {
                 )
             """.trimIndent())
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_bm_collection ON bookmarks(collection_id)")
-                stmt.execute("CREATE INDEX IF NOT EXISTS idx_bm_source ON bookmarks(source_type, source_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_bm_source     ON bookmarks(source_type, source_id)")
+                // Prevents the same item appearing twice in the same collection.
+                // Allows the same item to be in multiple collections (different rows).
+                stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bm_unique_membership ON bookmarks(collection_id, source_type, source_id)")
 
                 // ── Table 9: bookmark_tags ──
                 stmt.execute("""
@@ -490,9 +519,30 @@ class DatabaseHelper(private val dbFile: File) {
                 )
             """.trimIndent())
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_bt_bookmark ON bookmark_tags(bookmark_id)")
-                stmt.execute("CREATE INDEX IF NOT EXISTS idx_bt_tag ON bookmark_tags(tag)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_bt_tag      ON bookmark_tags(tag)")
 
-                // ── Table 10: storage_config ──
+                // ── Table 10: code_bookmark_tags ──
+                // User-created tags on code snippet bookmarks (code_bookmarks rows).
+                //
+                // Mirrors bookmark_tags exactly — same join-table pattern, same reasons:
+                // indexed tag queries, no false-match LIKE scans, consistent filtering
+                // across both bookmark types in the Library filter panel.
+                //
+                // These are user-created marks — NOT plugin-derived metadata.
+                // Plugin-detected language lives in code_bookmarks.language (rebuildable).
+                // These tags are NOT rebuildable: if the DB is lost, they are lost.
+                // That is intentional — they represent user intent, not derived content.
+                stmt.execute("""
+                CREATE TABLE IF NOT EXISTS code_bookmark_tags (
+                    code_bookmark_id TEXT NOT NULL REFERENCES code_bookmarks(id) ON DELETE CASCADE,
+                    tag              TEXT NOT NULL,
+                    UNIQUE(code_bookmark_id, tag)
+                )
+            """.trimIndent())
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cbt_bookmark ON code_bookmark_tags(code_bookmark_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cbt_tag      ON code_bookmark_tags(tag)")
+
+                // ── Table 12: storage_config ──
                 stmt.execute("""
                 CREATE TABLE IF NOT EXISTS storage_config (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -501,7 +551,7 @@ class DatabaseHelper(private val dbFile: File) {
                 )
             """.trimIndent())
 
-                // ── Table 11: open_tabs (R4) ──
+                // ── Table 13: open_tabs (R4) ──
                 // Persists the frontend's open tab state for restore on IDE restart.
                 // Controlled by the `keep_tabs` setting in storage_config.
                 // Uses full-replace strategy: TabStateService deletes all rows for
@@ -516,31 +566,65 @@ class DatabaseHelper(private val dbFile: File) {
                     is_active       INTEGER NOT NULL DEFAULT 0,
                     scroll_position INTEGER NOT NULL DEFAULT 0,
                     provider_id     TEXT,
+                    bypass_mode     TEXT NOT NULL DEFAULT 'FULL',
+                    -- Dial position: 'OFF' | 'FULL' | 'SELECTIVE' (dial perspective,
+                    -- not backend bypass perspective). Default 'FULL' = context ON.
+                    -- See Item 7 action plan §Phase 1 for naming semantics.
+                    selective_level INTEGER NOT NULL DEFAULT 2,
+                    -- Active lever position when bypass_mode = 'SELECTIVE'.
+                    -- 0=Minimal, 1=Partial, 2=Full (all detectors). Default 2 = safest.
+                    -- Ignored when bypass_mode != 'SELECTIVE'.
                     created_at      TEXT NOT NULL
                 )
             """.trimIndent())
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_ot_project ON open_tabs(project_id)")
 
-                // ── Table 12: code_bookmarks ──
+                // ── Table 13: code_bookmarks ──
+                // Saved code blocks from chat responses. Each row represents one
+                // code block the user explicitly bookmarked (the "ribbon" action).
+                //
+                // block_index identifies which code block within the exchange (0-based).
+                // The actual content is cached here for fast display without JSONL reads.
+                // The exchange record is never fully deleted, so block_index is always
+                // rebuildable from the exchange's raw JSONL if needed.
+                //
+                // User-created tags live in code_bookmark_tags (join table) — NOT here.
+                // Plugin-detected language lives in the `language` column (rebuildable).
+                //
+                // conversation_id: denormalized, no FK by design.
+                // Reason: code_bookmarks are sacred — they survive exchange soft-deletes.
+                // A hard FK would either cascade-delete the snippet (unacceptable) or
+                // block conversation deletion (also unacceptable). Same pattern as
+                // metrics.conversation_id — a label, not a referential constraint.
+                // If the conversation is gone, the snippet still shows with a
+                // "conversation no longer available" note in the UI.
                 stmt.execute("""
                 CREATE TABLE IF NOT EXISTS code_bookmarks (
                     id              TEXT PRIMARY KEY,
                     project_id      TEXT NOT NULL REFERENCES projects(id),
                     exchange_id     TEXT NOT NULL REFERENCES chat_exchanges(id),
+                    conversation_id TEXT,
                     block_index     INTEGER NOT NULL,
                     language        TEXT,
                     content         TEXT NOT NULL,
                     title           TEXT,
-                    tags            TEXT,
                     created_at      TEXT NOT NULL,
+                    -- Soft delete: 0 = visible, 1 = hidden.
+                    -- Snippets are "sacred" — only deletable from the Bookmarks
+                    -- section with explicit confirmation. Soft-deleted snippets
+                    -- still appear in the Bookmarks section (marked) until the
+                    -- user explicitly purges them via Settings > Consolidate.
+                    deleted         INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(exchange_id, block_index)
                 )
             """.trimIndent())
-                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_project ON code_bookmarks(project_id)")
-                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_exchange ON code_bookmarks(exchange_id)")
-                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_language ON code_bookmarks(language)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_project      ON code_bookmarks(project_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_exchange     ON code_bookmarks(exchange_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_conversation ON code_bookmarks(conversation_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_language     ON code_bookmarks(language)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_cb_deleted      ON code_bookmarks(deleted)")
 
-                // ── Table 13: metrics ──
+                // ── Table 14: metrics ──
                 // Per-exchange token usage metrics for the Metrics Module.
                 // Separate from chat_exchanges because:
                 // - Metrics have their own lifecycle (aggregation queries, cleanup policies)
@@ -587,7 +671,7 @@ class DatabaseHelper(private val dbFile: File) {
                 // we never need to add it later (adding indexes to large tables is slow).
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_metrics_user         ON metrics(user_id)")
 
-                // ── Table 14: assistant_profile_summary ──
+                // ── Table 15: assistant_profile_summary ──
                 // Stores the summarized version of the user's assistant profile.
                 //
                 // The assistant profile is GLOBAL (not per-project) — this is a user-level
@@ -624,7 +708,7 @@ class DatabaseHelper(private val dbFile: File) {
                     "cleanup_suggestion_threshold_mb" to "2048",
                     "last_cleanup_suggestion" to null,
                     "storage_root_path" to StorageConfig.DEFAULT_ROOT.absolutePath,
-                    "keep_tabs" to "true",
+                    // keep_tabs moved to TabSettingsState XML (PersistentStateComponent)
                     // ── Assistant Profile (Block 4) ──────────────────────────
                     "assistant_profile_enabled" to "true",
                     "assistant_profile_fallback_full" to "false",
@@ -641,7 +725,7 @@ class DatabaseHelper(private val dbFile: File) {
                 insertConfig.close()
             }
 
-            Dev.info(log, "db.schema.created", "tables" to 14)
+            Dev.info(log, "db.schema.created", "tables" to 15)
         } catch (e: org.sqlite.SQLiteException) {
             if (e.message?.contains("FOREIGN KEY") == true) {
                 Dev.error(log, "db.schema.fk_error", e, "line" to "createSchema")

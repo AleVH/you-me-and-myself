@@ -393,11 +393,15 @@ class SummaryConfigurable(private val project: Project) : Configurable {
     /**
      * Handle the kill switch toggle.
      *
-     * When the kill switch changes, we update the enabled/disabled
-     * state of all other controls. Disabled controls are greyed out,
-     * making it visually clear that summarization is off.
+     * Two effects:
+     * 1. Update the in-memory SummaryConfigService immediately (instant kill-switch).
+     *    SummaryConfigService.setEnabled() persists to SQLite AND updates the
+     *    AtomicReference — the next summarization request sees the new value at call time,
+     *    without waiting for Apply to be clicked.
+     * 2. Grey out / un-grey all dependent controls for clear visual feedback.
      */
     private fun onEnabledChanged() {
+        configService.setEnabled(enabledCheckbox.isSelected)
         updateEnabledState()
     }
 

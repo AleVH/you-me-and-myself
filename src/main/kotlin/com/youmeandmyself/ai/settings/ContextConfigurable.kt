@@ -3,6 +3,7 @@ package com.youmeandmyself.ai.settings
 import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.project.Project
 import com.intellij.ui.components.JBLabel
+import com.youmeandmyself.ai.bridge.CrossPanelBridge
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.tier.CompositeTierProvider
 import com.youmeandmyself.tier.Feature
@@ -55,7 +56,7 @@ class ContextConfigurable(private val project: Project) : Configurable {
 
     // ── Working copy ──────────────────────────────────────────────────
     private var workingContextEnabled: Boolean = true
-    private var workingDefaultBypassMode: String = "OFF"
+    private var workingDefaultBypassMode: String = "FULL"
 
     // ── UI components ─────────────────────────────────────────────────
     private val root = JPanel(BorderLayout(0, 12))
@@ -63,8 +64,8 @@ class ContextConfigurable(private val project: Project) : Configurable {
     /** Master toggle: enable/disable context gathering globally. */
     private val contextEnabledCheckbox = JCheckBox("Enable context gathering")
 
-    /** Default bypass mode combo: OFF (full context) or FULL (no context). */
-    private val defaultBypassModeCombo = JComboBox(arrayOf("OFF", "FULL"))
+    /** Default bypass mode combo: FULL (full context) or OFF (no context). */
+    private val defaultBypassModeCombo = JComboBox(arrayOf("FULL", "OFF"))
 
     // ── Configurable interface ────────────────────────────────────────
 
@@ -83,28 +84,20 @@ class ContextConfigurable(private val project: Project) : Configurable {
         // ── Section: General ──────────────────────────────────────────
         row = addSeparator(formPanel, gbc, row, "Context Gathering")
 
-        // Enable context gathering toggle
+        // Enable context gathering toggle.
+        // No ActionListener — changes only take effect when the user clicks Apply.
+        // apply() persists the state and notifies the React panel immediately.
         row = addFormRow(formPanel, gbc, row,
             label = "",
             component = contextEnabledCheckbox,
             help = "When enabled, YMM gathers IDE context (open files, project " +
                     "structure, summaries) and includes it in the prompt sent to " +
                     "the AI provider. When disabled, context gathering is skipped " +
-                    "globally. STUB: this setting is not yet read by the backend."
-        )
-
-        // Default bypass mode combo
-        row = addFormRow(formPanel, gbc, row,
-            label = "Default mode for new tabs:",
-            component = defaultBypassModeCombo,
-            help = "The bypass mode applied when a new tab is created. " +
-                    "OFF = full context gathering (recommended). " +
-                    "FULL = skip all context (faster, no IDE context sent). " +
-                    "STUB: this setting is not yet read by the frontend."
+                    "globally — applies to all tabs immediately."
         )
 
         // ── Section: Selective Bypass (Pro) ───────────────────────────
-        // Show the Pro feature section, greyed out for Basic tier users.
+        // Tier check governs: defaultBypassMode combo + SELECTIVE content below.
         val tierProvider = try {
             CompositeTierProvider.getInstance()
         } catch (e: Exception) {
@@ -114,6 +107,23 @@ class ContextConfigurable(private val project: Project) : Configurable {
 
         val canUseSelective = tierProvider != null &&
                 tierProvider.canUse(Feature.CONTEXT_SELECTIVE_BYPASS)
+
+        // Default bypass mode combo — Pro tier only.
+        // Basic users always get "FULL" (context ON) from the bridge; the stored value
+        // is ignored for Basic. Grey out the combo with a note so they see it exists.
+        defaultBypassModeCombo.isEnabled = canUseSelective
+        row = addFormRow(formPanel, gbc, row,
+            label = "Default mode for new tabs:",
+            component = defaultBypassModeCombo,
+            help = if (canUseSelective) {
+                "The dial position applied when a new tab is created. " +
+                        "FULL = full context gathering (recommended). " +
+                        "OFF = no context sent by default. Pro tier."
+            } else {
+                "Pro tier: set the dial's starting position for new tabs. " +
+                        "Basic tier: new tabs always start with full context gathering."
+            }
+        )
 
         row = addSeparator(formPanel, gbc, row, "Selective Bypass")
 
@@ -163,12 +173,12 @@ class ContextConfigurable(private val project: Project) : Configurable {
 
     override fun isModified(): Boolean {
         return workingContextEnabled != contextEnabledCheckbox.isSelected ||
-                workingDefaultBypassMode != (defaultBypassModeCombo.selectedItem as? String ?: "OFF")
+                workingDefaultBypassMode != (defaultBypassModeCombo.selectedItem as? String ?: "FULL")
     }
 
     override fun apply() {
         workingContextEnabled = contextEnabledCheckbox.isSelected
-        workingDefaultBypassMode = defaultBypassModeCombo.selectedItem as? String ?: "OFF"
+        workingDefaultBypassMode = defaultBypassModeCombo.selectedItem as? String ?: "FULL"
 
         // Persist to state
         val state = settingsState.state
@@ -180,6 +190,13 @@ class ContextConfigurable(private val project: Project) : Configurable {
             "contextEnabled" to workingContextEnabled,
             "defaultBypassMode" to workingDefaultBypassMode
         )
+
+        // Push updated settings to the React panel
+        try {
+            CrossPanelBridge.getInstance(project).notifyContextSettingsChanged()
+        } catch (e: Exception) {
+            Dev.warn(log, "context.settings.apply_notify_failed", e)
+        }
     }
 
     override fun reset() {

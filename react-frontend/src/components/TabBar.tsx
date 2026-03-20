@@ -17,7 +17,7 @@
  * ## Interactions
  *
  * - Click tab                → onSwitchTab(tabId)
- * - Double-click tab title   → rename inline [PLACEHOLDER — not yet wired]
+ * - Double-click tab title   → rename inline → RENAME_TAB → conversations.title
  * - Click ×                  → onCloseTab(tabId)
  * - Middle-click tab         → onCloseTab(tabId)
  * - Click +                  → onNewConversation() — disabled at maxTabs
@@ -28,19 +28,13 @@
  * component below the input bar (see ChatApp.tsx), NOT inside the
  * tab bar. Tabs do not display provider information.
  *
- * ## PLACEHOLDER: Tab Rename
+ * ## Tab Rename
  *
- * Double-clicking a tab title should trigger inline rename editing.
- * When the user commits (Enter / blur), onRenameTab(tabId, newTitle)
- * is called. This is wired to a visible interaction below but the
- * backend command (RENAME_TAB → BridgeDispatcher.kt → UPDATE
- * conversations SET title = ? WHERE id = ?) is NOT YET IMPLEMENTED.
- *
- * To implement:
- * 1. Add RENAME_TAB command to CommandType in types.ts
- * 2. Handle in BridgeDispatcher.kt → update conversations table title
- * 3. Wire onRenameTab prop here to sendCommand(RENAME_TAB)
- * 4. Remove [PLACEHOLDER] markers below
+ * Double-clicking a tab title opens an inline text input.
+ * Committing (Enter / blur) calls onRenameTab(tabId, newTitle), which:
+ * 1. Sends RENAME_TAB to the backend → BridgeDispatcher → ConversationManager.updateTitle()
+ * 2. Updates local tab state immediately (optimistic)
+ * 3. Persists via SAVE_TAB_STATE on the next periodic save
  *
  * ## PLACEHOLDER: Context Usage Indicator
  *
@@ -62,7 +56,8 @@
  * Config page NOT YET IMPLEMENTED — hardcoded default used for now.
  *
  * @see useBridge.ts — Tab state management
- * @see types.ts — RENAME_TAB command (to be added)
+ * @see types.ts — RENAME_TAB command
+ * @see useBridge.ts — renameTab() handler
  */
 
 import { useState, useCallback, useRef } from "react";
@@ -157,27 +152,11 @@ function TabBar({
         [onCloseTab],
     );
 
-    /**
-     * PLACEHOLDER: Double-click starts inline rename.
-     * Shows an input field in place of the tab title.
-     * Committing calls onRenameTab (not yet wired to backend).
-     */
+    /** Double-click starts inline rename. Shows an input in place of the tab title. */
     const handleTitleDoubleClick = useCallback(
         (e: React.MouseEvent, tabId: string, currentTitle: string) => {
             e.stopPropagation();
-
-            if (!onRenameTab) {
-                alert(
-                    "[PLACEHOLDER] Tab rename:\n\n" +
-                    "Double-clicking a tab title will allow inline renaming.\n" +
-                    "This will trigger a RENAME_TAB command → BridgeDispatcher.kt → " +
-                    "UPDATE conversations SET title = ? WHERE id = ?\n\n" +
-                    "Not yet implemented — add RENAME_TAB to CommandType in types.ts " +
-                    "and handle in BridgeDispatcher.kt."
-                );
-                return;
-            }
-
+            if (!onRenameTab) return;
             setRenamingTabId(tabId);
             setRenameValue(currentTitle);
             setTimeout(() => renameInputRef.current?.select(), 0);

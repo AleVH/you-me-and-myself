@@ -23,7 +23,9 @@ class SearchService(private val project: Project) {
 
         return try {
             facade.withReadableDatabase { db ->
-                val conditions = mutableListOf("ce.project_id = ?")
+                // deleted = 0 is always required — soft-deleted exchanges are never
+                // shown in search results, regardless of other filter criteria.
+                val conditions = mutableListOf("ce.project_id = ?", "ce.deleted = 0")
                 val params = mutableListOf<Any?>(projectId)
                 val appliedFilters = mutableListOf<String>()
 
