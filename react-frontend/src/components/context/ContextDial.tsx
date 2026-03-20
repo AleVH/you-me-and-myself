@@ -1,48 +1,78 @@
 /**
- * ContextDial — compact rotary-style toggle for context bypass mode.
+ * ContextDial — compact rotary-style toggle for per-tab context mode.
  *
  * ## Visual Design
  *
  * A 24px SVG circle with a notch indicator that rotates to one of 3
  * positions (clock analogy):
  *
- *   12 o'clock  = OFF        (grey #808080)   — no context sent
- *    4 o'clock  = FULL       (blue #569cd6)   — full context gathering
- *    8 o'clock  = SELECTIVE  (amber #dcdcaa)  — per-component, Pro only
+ *   12 o'clock  = OFF     (grey #808080)   — no context for this tab
+ *    4 o'clock  = ON      (blue #569cd6)   — context with default reach
+ *    8 o'clock  = CUSTOM  (amber #dcdcaa)  — context with lever (Pro only)
  *
- * Click cycles clockwise: OFF → FULL → (SELECTIVE if Pro) → OFF.
+ * ## Two Levels of Control
+ *
+ * GLOBAL (Settings page):
+ *   - Master kill-switch: contextEnabled in ContextSettingsState.
+ *   - When OFF globally, the dial is greyed out and non-interactive.
+ *   - Global overrules local — always.
+ *
+ * LOCAL (per-tab, this dial):
+ *   - The user can choose OFF / ON / CUSTOM for each individual tab.
+ *   - OFF = no context for this specific tab (valid even when global is ON).
+ *   - ON  = context gathering with default settings (radius, scope from global).
+ *   - CUSTOM = context ON + lever appears to control reach (Pro tier).
+ *
+ * Having OFF on the per-tab dial is NOT contradictory: the user wants
+ * context enabled globally but may disable it for a specific conversation
+ * (e.g. a casual chat that doesn't need IDE context).
+ *
+ * ## Cycle
+ *
+ *   Basic:  OFF → ON → OFF  (2 positions)
+ *   Pro:    OFF → ON → CUSTOM → OFF  (3 positions)
  *
  * ## Tier Gating
  *
- * Basic-tier users only see OFF ↔ FULL (2-position toggle). The
- * SELECTIVE position is skipped when `canUseSelective` is false.
- * This is enforced purely in the click handler — no visual "locked"
- * state is shown (the position simply doesn't exist in the cycle).
+ * Basic-tier users see OFF and ON. The CUSTOM position is added when
+ * `canUseSelective` is true. This is enforced in the click handler.
  *
  * ## Integration
  *
  * Used inside ContextDialStrip. The strip reads the active tab's
- * bypassMode from TabData and passes it as the `mode` prop.
+ * contextMode from TabData and passes it as the `mode` prop.
  *
  * @see ContextDialStrip — parent wrapper
  * @see ContextAssembler.assemble — backend checks bypassMode
- * @see Feature.CONTEXT_SELECTIVE_BYPASS — tier gate for SELECTIVE
+ * @see Feature.CONTEXT_SELECTIVE_BYPASS — tier gate for CUSTOM
  */
 import "./ContextDial.css";
 
 // ── Types ────────────────────────────────────────────────────────────────
 
-/** The three bypass modes, matching the backend's string values. */
-export type BypassMode = "OFF" | "FULL" | "SELECTIVE";
+/**
+ * Per-tab context mode (user perspective, NOT backend bypass perspective).
+ *
+ * - "OFF":    No context for this tab.
+ * - "ON":     Context gathering with default reach.
+ * - "CUSTOM": Context gathering + lever for reach control (Pro tier).
+ *
+ * Translated to backend bypassMode by dialToBackendBypass() in useBridge.ts:
+ *   OFF    → "FULL" (full bypass — no context)
+ *   ON     → null   (no bypass — context runs with defaults)
+ *   CUSTOM → "SELECTIVE" (per-component bypass)
+ */
+export type BypassMode = "OFF" | "ON" | "CUSTOM";
 
 export interface ContextDialProps {
-    /** Current bypass mode for the active tab (dial perspective). */
+    /** Current context mode for the active tab (user perspective). */
     mode: BypassMode;
     /** Called when the user clicks to cycle to the next mode. */
     onModeChange: (mode: BypassMode) => void;
     /**
-     * Whether the SELECTIVE position is available (Pro tier).
-     * When false, the cycle is OFF → FULL → OFF (2 positions).
+     * Whether the CUSTOM position is available (Pro tier).
+     * When false, the cycle is OFF → ON → OFF (2 positions).
+     * When true, the cycle is OFF → ON → CUSTOM → OFF (3 positions).
      */
     canUseSelective: boolean;
     /**
@@ -66,35 +96,35 @@ const NOTCH_DIST = 7;
 
 /**
  * Rotation angles for each mode position (degrees, clockwise from 12 o'clock).
- * - OFF:       0° (12 o'clock — straight up)
- * - FULL:    120° (4 o'clock)
- * - SELECTIVE: 240° (8 o'clock)
+ * - OFF:     0° (12 o'clock — straight up)
+ * - ON:    120° (4 o'clock)
+ * - CUSTOM: 240° (8 o'clock)
  */
 const MODE_ANGLES: Record<BypassMode, number> = {
     OFF: 0,
-    FULL: 120,
-    SELECTIVE: 240,
+    ON: 120,
+    CUSTOM: 240,
 };
 
 /**
  * Ring stroke colors per mode — matches the Darcula theme palette.
- * - OFF:       muted grey (context disabled)
- * - FULL:      accent blue (full context active)
- * - SELECTIVE: warm amber (per-component, Pro)
+ * - OFF:    muted grey (no context for this tab)
+ * - ON:     accent blue (context on with default reach)
+ * - CUSTOM: warm amber (context on with lever control, Pro)
  */
 const MODE_COLORS: Record<BypassMode, string> = {
     OFF: "#808080",
-    FULL: "#569cd6",
-    SELECTIVE: "#dcdcaa",
+    ON: "#569cd6",
+    CUSTOM: "#dcdcaa",
 };
 
 /**
  * Human-readable labels shown in the tooltip on hover.
  */
 const MODE_LABELS: Record<BypassMode, string> = {
-    OFF: "Context: OFF — no IDE context sent",
-    FULL: "Context: ON — full context gathering",
-    SELECTIVE: "Context: Selective — per-component (Pro)",
+    OFF: "Context: OFF — no IDE context for this tab",
+    ON: "Context: ON — full context gathering",
+    CUSTOM: "Context: Custom — control context reach (Pro)",
 };
 
 // ── Component ────────────────────────────────────────────────────────────
@@ -103,23 +133,29 @@ function ContextDial({ mode, onModeChange, canUseSelective, disabled = false }: 
     /**
      * Determine the next mode in the clockwise cycle.
      *
-     * Basic tier (canUseSelective=false): FULL → OFF → FULL
-     * Pro tier   (canUseSelective=true):  FULL → OFF → SELECTIVE → FULL
+     * The per-tab dial allows the user to disable context for a specific
+     * tab even when context is globally enabled. This is a valid use case:
+     * e.g. a casual chat that doesn't need IDE context.
      *
-     * Clicks are silently rejected when disabled=true (kill-switch active).
+     * Basic tier (canUseSelective=false): OFF → ON → OFF (2 positions)
+     * Pro tier   (canUseSelective=true):  OFF → ON → CUSTOM → OFF (3 positions)
+     *
+     * Clicks are silently rejected when disabled=true (context globally off).
      */
     const handleClick = () => {
         if (disabled) return;
 
         if (canUseSelective) {
-            // Pro: 3-position cycle (dial perspective)
-            const cycle: BypassMode[] = ["FULL", "OFF", "SELECTIVE"];
-            const idx = cycle.indexOf(mode);
-            const next = cycle[(idx + 1) % cycle.length];
-            onModeChange(next);
+            // Pro: 3-position cycle — OFF → ON → CUSTOM → OFF
+            const next: Record<BypassMode, BypassMode> = {
+                OFF: "ON",
+                ON: "CUSTOM",
+                CUSTOM: "OFF",
+            };
+            onModeChange(next[mode]);
         } else {
-            // Basic: 2-position toggle (dial perspective)
-            onModeChange(mode === "FULL" ? "OFF" : "FULL");
+            // Basic: 2-position cycle — OFF → ON → OFF
+            onModeChange(mode === "OFF" ? "ON" : "OFF");
         }
     };
 

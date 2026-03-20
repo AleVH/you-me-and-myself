@@ -728,6 +728,22 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+   BUILD STAMP — always-visible fingerprint to verify latest React build
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.ymm-build-stamp {
+    position: fixed;
+    bottom: 2px;
+    right: 6px;
+    font-size: 9px;
+    color: rgba(150, 150, 150, 0.5);
+    pointer-events: none;
+    z-index: 999;
+    font-family: monospace;
+    user-select: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
    MARKDOWN PROSE (R2)
    ═══════════════════════════════════════════════════════════════════════ */
 

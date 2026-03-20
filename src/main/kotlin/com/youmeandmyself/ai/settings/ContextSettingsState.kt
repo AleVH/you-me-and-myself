@@ -86,6 +86,38 @@ class ContextSettingsState(
          */
         var defaultBypassMode: String = "FULL",
 
+        // ── Heuristic Filter Toggle ───────────────────────────────────
+
+        /**
+         * Whether the heuristic pre-filter is active.
+         *
+         * ## What This Controls
+         *
+         * When true, [ContextHeuristicFilter.shouldSkipContext] is called BEFORE
+         * context gathering starts. If the filter decides the user's message is not
+         * code-related (e.g. "hello", "tell me a joke"), context gathering is skipped
+         * entirely — saving tokens and API cost.
+         *
+         * When false (DEFAULT), the filter is bypassed. Context ALWAYS flows through
+         * when context gathering is enabled. This is the safe launch default.
+         *
+         * ## Why Default = false
+         *
+         * The heuristic has known false negatives: messages like "could you explain
+         * how this class relates to the backend?" don't match any keyword pattern
+         * and would be incorrectly classified as "not code-related". With the filter
+         * OFF, these messages still get full context.
+         *
+         * ## UI Location
+         *
+         * Settings → Tools → YMM Assistant → Context → "Smart context filter"
+         * Checkbox is disabled/greyed out when contextEnabled is false.
+         *
+         * @see ContextHeuristicFilter — the standalone filter class
+         * @see ContextAssembler.assemble — reads this field to decide whether to call the filter
+         */
+        var heuristicFilterEnabled: Boolean = false,
+
         // ── Future: Traversal Radius ──────────────────────────────────
 
         /**

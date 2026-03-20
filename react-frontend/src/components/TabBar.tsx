@@ -36,24 +36,20 @@
  * 2. Updates local tab state immediately (optimistic)
  * 3. Persists via SAVE_TAB_STATE on the next periodic save
  *
- * ## PLACEHOLDER: Context Usage Indicator
+ * ## Context Usage Indicator
  *
- * Each tab should show a small coloured chip indicating context window
- * usage for the active conversation:
+ * Each tab shows a small coloured chip indicating context window usage:
  * - No chip    → usage unknown or < 75%
  * - Amber chip → usage >= 75%
  * - Red chip   → usage >= 90%
  *
- * To implement:
- * 1. Populate contextUsagePct from metrics (totalTokens / modelContextLimit * 100)
- * 2. modelContextLimit needs to come from provider config
- * 3. Remove [PLACEHOLDER] markers below
+ * Computed per-tab in useBridge via contextFillPercent() from the last
+ * exchange's totalTokens / contextWindowSize. Null until first exchange.
  *
  * ## Max Tabs
  *
  * maxTabs prop controls when "+" is disabled. Default 5, range 2–20.
- * Value comes from user settings (General config page).
- * Config page NOT YET IMPLEMENTED — hardcoded default used for now.
+ * Synced from General settings via TAB_STATE → useBridge → ChatApp.
  *
  * @see useBridge.ts — Tab state management
  * @see types.ts — RENAME_TAB command
@@ -66,9 +62,9 @@ import type { TabInfo } from "../hooks/useBridge";
 // ── Constants ────────────────────────────────────────────────────────
 
 /**
- * Default max open tabs.
- * TODO: Replace with value from General settings config when implemented.
- * Config page: Tools → YMM Assistant → General → "Maximum open tabs"
+ * Fallback max open tabs (used only when maxTabs prop is not provided).
+ * In production, maxTabs is sent from the backend via TAB_STATE event
+ * and passed through useBridge → ChatApp → TabBar.
  */
 const DEFAULT_MAX_TABS = 5;
 
@@ -103,7 +99,7 @@ interface TabBarProps {
 
     /**
      * Maximum simultaneous open tabs. Default: 5.
-     * TODO: Read from General settings config when page is implemented.
+     * Synced from General settings via TAB_STATE → useBridge → ChatApp.
      */
     maxTabs?: number;
 }
@@ -233,14 +229,10 @@ function TabBar({
                                 </span>
                             )}
 
-                            {/*
-                             * PLACEHOLDER: Context usage indicator chip.
-                             * Currently always invisible — contextUsagePct not yet populated.
-                             * To implement: populate from metrics.totalTokens / modelContextLimit * 100
-                             */}
-                            <ContextChip
-                                usagePct={null /* PLACEHOLDER: tab.contextUsagePct */}
-                            />
+                            {/* Context usage chip — amber ≥75%, red ≥90%.
+                             * Computed in useBridge from lastExchange metrics via contextFillPercent().
+                             * Null (hidden) until first exchange provides token data. */}
+                            <ContextChip usagePct={tab.contextUsagePct} />
 
                             {/* Close button */}
                             <button
@@ -283,13 +275,15 @@ function TabBar({
 // ── Context Chip ─────────────────────────────────────────────────────
 
 /**
- * PLACEHOLDER: Small coloured dot showing context window usage.
+ * Small coloured dot showing context window usage per tab.
  *
- * When usagePct is null (not yet implemented), renders nothing visible.
- * When implemented:
- * - null / < 75% → no chip
- * - >= 75%       → amber dot with tooltip
- * - >= 90%       → red dot with tooltip
+ * Thresholds:
+ * - null / < 75% → no visible chip (placeholder span for layout stability)
+ * - >= 75%       → amber dot with tooltip ("getting full")
+ * - >= 90%       → red dot with tooltip ("approaching limit")
+ *
+ * @see contextFillPercent — computes the percentage from token counts
+ * @see useBridge.ts — populates contextUsagePct in TabInfo
  */
 function ContextChip({ usagePct }: { usagePct: number | null }) {
     if (usagePct === null) {

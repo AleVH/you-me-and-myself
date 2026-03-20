@@ -146,6 +146,8 @@ class ChatOrchestrator(
      * @param selectiveLevel Optional: lever position when bypassMode = "SELECTIVE".
      *   0 = Minimal, 1 = Partial, 2 = Full. Null = default (2).
      *   Threaded directly to ContextAssembler.assemble().
+     * @param summaryEnabled Per-tab summary toggle. When false, skip summary enrichment.
+     *   Null = use global setting. Independent from bypassMode.
      * @return ChatResult that the UI renders. Never null, never throws.
      */
     suspend fun send(
@@ -154,7 +156,8 @@ class ChatOrchestrator(
         conversationId: String? = null,
         providerId: String? = null,
         bypassMode: String? = null,
-        selectiveLevel: Int? = null
+        selectiveLevel: Int? = null,
+        summaryEnabled: Boolean? = null
     ): ChatResult {
         // ── Step 1: Resolve provider ──────────────────────────────────
         // Per-tab provider takes precedence over global selection.
@@ -193,7 +196,9 @@ class ChatOrchestrator(
             // bypassMode is threaded from the frontend (in backend bypass perspective):
             // null = full context gathering, "FULL" = skip all context,
             // "SELECTIVE" = per-component control at the given selectiveLevel.
-            val assembled = contextAssembler.assemble(userInput, scope, bypassMode, selectiveLevel)
+            val assembled = contextAssembler.assemble(
+                userInput, scope, bypassMode, selectiveLevel, summaryEnabled
+            )
 
             // Check if context gathering was blocked by IDE indexing
             if (assembled.isBlockedByIndexing) {

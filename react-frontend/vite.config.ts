@@ -32,6 +32,24 @@ import path from "node:path";
 
 export default defineConfig({
     plugins: [react(), viteSingleFile()],
+
+    /**
+     * Build fingerprint — injected as a global constant at compile time.
+     * Format: "HH:MM:SS" (local time of the build).
+     *
+     * Displayed in the UI (ChatApp bottom-right) so you can always verify
+     * that the plugin is running the latest build, not a cached version.
+     * If the timestamp is stale, you know JCEF is serving a cached bundle.
+     */
+    define: {
+        __BUILD_TIMESTAMP__: JSON.stringify(
+            new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+        ),
+        __BUILD_DATE__: JSON.stringify(
+            new Date().toISOString().slice(0, 10)
+        ),
+    },
+
     build: {
         /**
          * Purpose: output the single-file build directly to the plugin resources folder

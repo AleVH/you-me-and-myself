@@ -47,13 +47,11 @@
  * General settings config page (Tools → YMM Assistant → General).
  * Backend default: keep_tabs = true.
  *
- * ## PLACEHOLDER: Max Tabs Config
+ * ## Max Tabs Config
  *
- * DEFAULT_MAX_TABS is hardcoded to 5 here and in TabBar.tsx.
- * The configurable range (2–20) is NOT YET IMPLEMENTED — it lives in
- * the General settings config page (Tools → YMM Assistant → General).
- * When implemented, the backend should send maxTabs in the TAB_STATE
- * event so the frontend cap stays in sync with the setting.
+ * The backend sends maxTabs in the TAB_STATE event (read from General
+ * settings → "Maximum open tabs", range 2–20). DEFAULT_MAX_TABS = 5
+ * is kept as a fallback for defensive parsing.
  *
  * @see transport.ts — Wire layer that this hook wraps
  * @see types.ts — Event and command type definitions
@@ -89,9 +87,8 @@ import { log } from "../utils/log";
 /**
  * Default maximum simultaneous open tabs.
  *
- * PLACEHOLDER: This will come from the General settings config page
- * (Tools → YMM Assistant → General → "Maximum open tabs", range 2–20)
- * once that page is implemented. For now hardcoded here and in TabBar.tsx.
+ * Fallback used until the backend sends the configured value via
+ * TAB_STATE event (General settings → "Maximum open tabs", range 2–20).
  */
 const DEFAULT_MAX_TABS = 5;
 
@@ -156,28 +153,38 @@ export interface TabData {
      */
     collapsedIds: Set<string>;
     /**
-     * Context bypass mode for this tab — stored in dial perspective.
+     * Per-tab summary toggle. Simple ON/OFF, no middle ground.
      *
-     * Dial semantics (user perspective):
-     * - "FULL":      Full context gathering (context ON). Default.
-     * - "OFF":       No context gathering (context OFF).
-     * - "SELECTIVE": Per-component control (Pro tier).
+     * - true:  Messages in this tab get summarisation (if global summary is ON).
+     * - false: No summarisation for this tab.
+     *
+     * Gated by globalSummaryEnabled: if global is OFF, this is irrelevant.
+     * Sent with SEND_MESSAGE so the backend can skip summary enrichment.
+     * Default: true (summaries enabled when globally allowed).
+     */
+    summaryEnabled: boolean;
+    /**
+     * Per-tab context mode (user perspective, NOT backend bypass perspective).
+     *
+     * - "OFF":    No context for this tab (per-tab override).
+     * - "ON":     Context gathering with default reach.
+     * - "CUSTOM": Context on + lever controls reach (Pro tier).
      *
      * Translated to backend bypass perspective by dialToBackendBypass()
      * before inclusion in SEND_MESSAGE:
-     *   "FULL" → null (no bypass, context runs)
-     *   "OFF"  → "FULL" (full bypass, no context)
-     *   "SELECTIVE" → "SELECTIVE"
+     *   "OFF"    → "FULL"      (full bypass — no context)
+     *   "ON"     → null        (no bypass — context runs with defaults)
+     *   "CUSTOM" → "SELECTIVE" (per-component bypass)
      *
-     * Persisted in open_tabs.bypass_mode via SAVE_TAB_STATE. Default "FULL".
+     * Persisted in open_tabs.bypass_mode via SAVE_TAB_STATE. Default "ON".
      *
      * @see ContextDialStrip — React component that reads/writes this
      * @see dialToBackendBypass — translates for SEND_MESSAGE
      * @see ContextAssembler.assemble — backend checks bypassMode
      */
-    bypassMode: "OFF" | "FULL" | "SELECTIVE";
+    bypassMode: "OFF" | "ON" | "CUSTOM";
     /**
-     * Lever position when bypassMode = "SELECTIVE".
+     * Lever position when bypassMode = "CUSTOM".
      * 0 = Minimal (open file only), 1 = Partial (no ProjectStructure), 2 = Full.
      * Persisted in open_tabs.selective_level. Default 2.
      *
@@ -195,20 +202,17 @@ export interface TabInfo {
     hasMessages: boolean;
     isThinking: boolean;
     /**
-     * PLACEHOLDER: Context window usage percentage (0–100).
+     * Context window usage percentage (0–100+).
      *
+     * Computed from lastExchange metrics via contextFillPercent().
      * Used by TabBar to render the context indicator chip:
-     * - null / < 75% → no chip
-     * - >= 75%       → amber chip
-     * - >= 90%       → red chip
+     * - null / < 75% → no chip (hidden)
+     * - >= 75%       → amber chip ("getting full")
+     * - >= 90%       → red chip ("approaching limit")
      *
-     * To implement:
-     * 1. Add modelContextLimit to MetricsData (from provider config)
-     * 2. Compute: (metrics.totalTokens / modelContextLimit) * 100
-     * 3. Populate contextUsagePct below in the tabs derived state
-     * 4. Remove this PLACEHOLDER comment
+     * Null until the tab's first exchange provides token data.
      */
-    contextUsagePct: number | null; // PLACEHOLDER: always null until implemented
+    contextUsagePct: number | null;
     /** Per-tab AI provider. Null = using global selection. Shown in TabBar dropdown. */
     providerId: string | null;
 }
@@ -290,17 +294,28 @@ export interface BridgeState {
     // R5: Bookmark command
     bookmarkCodeBlock: (exchangeId: string, blockIndex: number) => void;
 
-    // Block 5: Context bypass + settings
+    // Block 5: Per-tab summary toggle
     /**
-     * Active tab's context bypass mode (dial perspective).
+     * Active tab's summary toggle. Simple ON/OFF per tab.
+     * Gated by globalSummaryEnabled — if global is OFF, this is irrelevant.
+     */
+    summaryEnabled: boolean;
+    /**
+     * Toggle summaries for the active tab.
+     */
+    setSummaryEnabled: (enabled: boolean) => void;
+
+    // Block 5: Context mode + settings
+    /**
+     * Active tab's context mode (user perspective: OFF/ON/CUSTOM).
      * Read by ContextDialStrip to show the current state.
      */
-    bypassMode: "OFF" | "FULL" | "SELECTIVE";
+    bypassMode: "OFF" | "ON" | "CUSTOM";
     /**
-     * Update the active tab's bypass mode.
+     * Update the active tab's context mode.
      * Called by ContextDialStrip when the user clicks the ContextDial.
      */
-    setBypassMode: (mode: "OFF" | "FULL" | "SELECTIVE") => void;
+    setBypassMode: (mode: "OFF" | "ON" | "CUSTOM") => void;
     /**
      * Active tab's selective level (0-2).
      * Read by ContextLever to show the current position.
@@ -315,12 +330,20 @@ export interface BridgeState {
      * Whether context gathering is globally enabled (from ContextSettingsState).
      * When false, the ContextDial is greyed out and clicks are rejected.
      */
+    /** Maximum simultaneous tabs (from General settings, range 2–20). */
+    maxTabs: number;
     globalContextEnabled: boolean;
+    /**
+     * Whether summarisation is globally enabled (from SummaryConfigService).
+     * When false, per-tab summary toggles are hidden/disabled.
+     * Summary is independent from context gathering.
+     */
+    globalSummaryEnabled: boolean;
     /**
      * Default dial position for new tabs from the backend settings.
      * Applied to newly created tabs from defaultBypassMode in ContextSettingsEvent.
      */
-    defaultBypassMode: "OFF" | "FULL" | "SELECTIVE";
+    defaultBypassMode: "OFF" | "ON" | "CUSTOM";
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -363,8 +386,10 @@ function createTab(data?: Partial<TabData>): TabData {
         historyLoaded: data?.historyLoaded ?? true,
         providerId: data?.providerId ?? null,
         collapsedIds: data?.collapsedIds ?? new Set(),
-        // Dial perspective: "FULL" = context on (default). Translated to backend by dialToBackendBypass().
-        bypassMode: data?.bypassMode ?? "FULL",
+        // Per-tab summary toggle: true = summaries enabled (when global allows). Simple ON/OFF.
+        summaryEnabled: data?.summaryEnabled ?? true,
+        // User perspective: "ON" = context on (default). Translated to backend by dialToBackendBypass().
+        bypassMode: data?.bypassMode ?? "ON",
         selectiveLevel: data?.selectiveLevel ?? 2,
     };
 
@@ -386,22 +411,22 @@ function titleFromMessage(text: string): string {
 }
 
 /**
- * Translate a dial-perspective bypass mode to the backend bypass perspective
- * expected by ContextAssembler.assemble().
+ * Translate per-tab context mode (user perspective) to the backend bypass
+ * perspective expected by ContextAssembler.assemble().
  *
- * Dial perspective (user):   "FULL" = context on, "OFF" = no context
+ * User perspective:          "ON" = context on, "OFF" = no context, "CUSTOM" = lever
  * Backend bypass perspective: null = context runs, "FULL" = full bypass (no context)
  *
  * Translation:
- *   "FULL"      → null       (no bypass = context runs)
- *   "OFF"       → "FULL"     (full bypass = no context)
- *   "SELECTIVE" → "SELECTIVE" (per-component)
+ *   "ON"     → null        (no bypass — context runs with defaults)
+ *   "OFF"    → "FULL"      (full bypass — no context)
+ *   "CUSTOM" → "SELECTIVE" (per-component bypass — lever controls reach)
  */
-function dialToBackendBypass(mode: "OFF" | "FULL" | "SELECTIVE"): string | null {
+function dialToBackendBypass(mode: "OFF" | "ON" | "CUSTOM"): string | null {
     switch (mode) {
-        case "FULL":      return null;
-        case "OFF":       return "FULL";
-        case "SELECTIVE": return "SELECTIVE";
+        case "ON":     return null;
+        case "OFF":    return "FULL";
+        case "CUSTOM": return "SELECTIVE";
     }
 }
 
@@ -432,11 +457,16 @@ export function useBridge(): BridgeState {
     const [providers, setProviders] = useState<ProviderInfoDto[]>([]);
     const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
 
-    // Block 5: Context settings — received from backend at startup via CONTEXT_SETTINGS event.
-    // globalContextEnabled: master kill-switch. When false, ContextDial is greyed out.
+    // Block 5: Context & summary settings — received from backend via CONTEXT_SETTINGS event.
+    // globalContextEnabled: context kill-switch. When false, ContextDial is greyed out.
+    // globalSummaryEnabled: summary kill-switch. When false, per-tab summary toggle is hidden.
     // defaultBypassMode: dial position applied to newly created tabs.
+    // Context and summary are INDEPENDENT features with INDEPENDENT toggles.
     const [globalContextEnabled, setGlobalContextEnabled] = useState<boolean>(true);
-    const [defaultBypassMode, setDefaultBypassMode] = useState<"OFF" | "FULL" | "SELECTIVE">("FULL");
+    const [globalSummaryEnabled, setGlobalSummaryEnabled] = useState<boolean>(true);
+    const [defaultBypassMode, setDefaultBypassMode] = useState<"OFF" | "ON" | "CUSTOM">("ON");
+    // Max tabs — synced from backend via TAB_STATE event; fallback to DEFAULT_MAX_TABS.
+    const [maxTabs, setMaxTabs] = useState<number>(DEFAULT_MAX_TABS);
 
     const idCounter = useRef(0);
     const tabStateInitialized = useRef(false);
@@ -450,6 +480,11 @@ export function useBridge(): BridgeState {
      */
     const activeTabIdRef = useRef(activeTabId);
     activeTabIdRef.current = activeTabId;
+
+    // Ref for maxTabs — event handlers inside useEffect close over this
+    // so they always see the latest value from TAB_STATE.
+    const maxTabsRef = useRef(maxTabs);
+    maxTabsRef.current = maxTabs;
 
     const nextId = useCallback(() => {
         idCounter.current += 1;
@@ -467,7 +502,8 @@ export function useBridge(): BridgeState {
     };
     const activeScrollPosition = activeTab?.scrollPosition ?? 0;
     const activeCollapsedIds = activeTab?.collapsedIds ?? new Set<string>();
-    const activeBypassMode = activeTab?.bypassMode ?? "FULL";
+    const activeSummaryEnabled = activeTab?.summaryEnabled ?? true;
+    const activeBypassMode = activeTab?.bypassMode ?? "ON";
     const activeSelectiveLevel = activeTab?.selectiveLevel ?? 2;
 
     const tabs= tabOrder
@@ -480,7 +516,7 @@ export function useBridge(): BridgeState {
                 isActive: tab.id === activeTabId,
                 hasMessages: tab.messages.length > 0,
                 isThinking: tab.isThinking,
-                // PLACEHOLDER: contextUsagePct not yet computed// Context fill percentage for TabBar indicator chip.
+                // Context fill percentage for TabBar indicator chip.
                 // Uses the last exchange's token count and context window.
                 // Null if no data → chip is hidden.
                 contextUsagePct: contextFillPercent(
@@ -715,6 +751,13 @@ export function useBridge(): BridgeState {
         unsubscribers.push(
             onEvent(EventType.TAB_STATE, (event: BridgeEvent) => {
                 const e = event as TabStateEvent;
+
+                // Always sync max tabs — settings can change at any time via
+                // General Settings → Apply, which re-emits TAB_STATE.
+                setMaxTabs(e.maxTabs ?? DEFAULT_MAX_TABS);
+
+                // Tab restoration only runs once on startup — subsequent
+                // TAB_STATE events are settings-only refreshes.
                 if (tabStateInitialized.current) return;
                 tabStateInitialized.current = true;
 
@@ -726,12 +769,14 @@ export function useBridge(): BridgeState {
 
                 const sorted = [...e.tabs].sort((a, b) => a.tabOrder - b.tabOrder);
                 for (const dto of sorted) {
-                    // Validate restored bypassMode (guard against unexpected DB values)
-                    const validModes: Array<"OFF" | "FULL" | "SELECTIVE"> = ["OFF", "FULL", "SELECTIVE"];
-                    const restoredBypassMode: "OFF" | "FULL" | "SELECTIVE" =
-                        validModes.includes(dto.bypassMode as "OFF" | "FULL" | "SELECTIVE")
-                            ? dto.bypassMode as "OFF" | "FULL" | "SELECTIVE"
-                            : "FULL";
+                    // Validate restored bypassMode (guard against unexpected DB values).
+                    // Backend stores the old "FULL"/"OFF"/"SELECTIVE" values — translate to new names.
+                    const backendToFrontend: Record<string, "OFF" | "ON" | "CUSTOM"> = {
+                        "FULL": "ON", "OFF": "OFF", "SELECTIVE": "CUSTOM",
+                        "ON": "ON", "CUSTOM": "CUSTOM",  // also accept new names
+                    };
+                    const restoredBypassMode: "OFF" | "ON" | "CUSTOM" =
+                        backendToFrontend[dto.bypassMode ?? "ON"] ?? "ON";
 
                     newMap.set(dto.id, {
                         id: dto.id,
@@ -749,6 +794,7 @@ export function useBridge(): BridgeState {
                         collapsedIds: new Set(),
                         bypassMode: restoredBypassMode,
                         selectiveLevel: dto.selectiveLevel ?? 2,
+                        summaryEnabled: dto.summaryEnabled ?? true, // default ON for restored tabs
                     });
                     newOrder.push(dto.id);
                     if (dto.isActive) newActiveId = dto.id;
@@ -807,7 +853,42 @@ export function useBridge(): BridgeState {
                         }
                     }
 
-                    // No existing tab — create one
+                    // No existing tab — check max tabs cap before creating
+                    if (prev.size >= maxTabsRef.current) {
+                        log.warn("useBridge", "OPEN_CONVERSATION_RESULT blocked: tab limit reached", {
+                            maxTabs: maxTabsRef.current,
+                            currentTabs: prev.size,
+                            conversationId: e.conversationId,
+                        });
+                        // Inject a system-level message into the active tab to notify the user
+                        const activeId = activeTabIdRef.current;
+                        const activeTab = prev.get(activeId);
+                        if (activeTab) {
+                            const next = new Map(prev);
+                            next.set(activeId, {
+                                ...activeTab,
+                                messages: [
+                                    ...activeTab.messages,
+                                    {
+                                        id: `msg-${Date.now()}-${++idCounter.current}`,
+                                        role: "system" as const,
+                                        content: `Tab limit reached (${prev.size}/${maxTabsRef.current}). Close a tab to open this conversation.`,
+                                        timestamp: new Date().toISOString(),
+                                        isError: true,
+                                        exchangeId: null,
+                                        correctionAvailable: false,
+                                        isStarred: false,
+                                        contextSummary: null,
+                                        contextTimeMs: null,
+                                    },
+                                ],
+                            });
+                            return next;
+                        }
+                        return prev; // Fallback — no active tab to show message in
+                    }
+
+                    // Tab cap OK — create the new tab
                     log.info("useBridge", "OPEN_CONVERSATION_RESULT: creating new tab", { tabId: e.tabId });
                     const newTab = createTab({
                         id: e.tabId,
@@ -926,22 +1007,30 @@ export function useBridge(): BridgeState {
             }),
         );
 
-        // Block 5: CONTEXT_SETTINGS — apply project-level context settings
+        // Block 5: CONTEXT_SETTINGS — apply project-level context AND summary settings.
+        // Context and summary are INDEPENDENT features. This event carries both.
         unsubscribers.push(
             onEvent(EventType.CONTEXT_SETTINGS, (event: BridgeEvent) => {
                 const e = event as ContextSettingsEvent;
                 log.info("useBridge", "CONTEXT_SETTINGS received", {
                     contextEnabled: e.contextEnabled,
+                    summaryEnabled: e.summaryEnabled,
                     defaultBypassMode: e.defaultBypassMode,
                 });
 
+                // Apply global context kill-switch
                 setGlobalContextEnabled(e.contextEnabled);
 
-                // Validate and apply defaultBypassMode (guard against unexpected values)
-                const validModes: Array<"OFF" | "FULL" | "SELECTIVE"> = ["OFF", "FULL", "SELECTIVE"];
-                const mode = validModes.includes(e.defaultBypassMode as "OFF" | "FULL" | "SELECTIVE")
-                    ? e.defaultBypassMode as "OFF" | "FULL" | "SELECTIVE"
-                    : "FULL";
+                // Apply global summary kill-switch (independent from context)
+                setGlobalSummaryEnabled(e.summaryEnabled ?? true);
+
+                // Translate backend bypass mode to user-facing mode name.
+                // Backend sends "FULL" (context on) or "OFF" or "SELECTIVE" — translate to ON/OFF/CUSTOM.
+                const backendToFrontend: Record<string, "OFF" | "ON" | "CUSTOM"> = {
+                    "FULL": "ON", "OFF": "OFF", "SELECTIVE": "CUSTOM",
+                    "ON": "ON", "CUSTOM": "CUSTOM",  // also accept new names
+                };
+                const mode = backendToFrontend[e.defaultBypassMode] ?? "ON";
                 setDefaultBypassMode(mode);
             }),
         );
@@ -1017,6 +1106,7 @@ export function useBridge(): BridgeState {
             let tabProviderId: string | null = null;
             let tabBypassMode: string | null = null;
             let tabSelectiveLevel: number | null = null;
+            let tabSummaryEnabled: boolean = true;
 
             setTabMap((prev) => {
                 const tab = prev.get(targetId);
@@ -1024,10 +1114,13 @@ export function useBridge(): BridgeState {
                 convId = tab.conversationId;
                 tabProviderId = tab.providerId;
                 // Translate dial-perspective bypassMode to backend bypass perspective.
-                // "FULL" (context on) → null (no bypass), "OFF" → "FULL" (full bypass).
+                // Translate user-facing mode to backend bypass perspective:
+                // "ON" → null (no bypass), "OFF" → "FULL" (full bypass), "CUSTOM" → "SELECTIVE".
                 tabBypassMode = dialToBackendBypass(tab.bypassMode);
-                // Only include selectiveLevel when SELECTIVE mode is active
-                tabSelectiveLevel = tab.bypassMode === "SELECTIVE" ? tab.selectiveLevel : null;
+                // Only include selectiveLevel when CUSTOM mode is active (lever controls reach)
+                tabSelectiveLevel = tab.bypassMode === "CUSTOM" ? tab.selectiveLevel : null;
+                // Per-tab summary toggle (independent from context mode)
+                tabSummaryEnabled = tab.summaryEnabled;
 
                 const newMsg: ChatMessage = {
                     id: `msg-${Date.now()}-${++idCounter.current}`,
@@ -1064,6 +1157,7 @@ export function useBridge(): BridgeState {
                 providerId: tabProviderId,
                 bypassMode: tabBypassMode,
                 selectiveLevel: tabSelectiveLevel,
+                summaryEnabled: tabSummaryEnabled,
             });
             persistTabState();
         },
@@ -1089,17 +1183,15 @@ export function useBridge(): BridgeState {
     /**
      * Create a new conversation tab.
      *
-     * Enforces DEFAULT_MAX_TABS cap — logs a warning and returns early
-     * if the limit is reached. The TabBar "+" button is disabled at the
-     * same threshold, so this is a safety net for programmatic calls.
-     *
-     * PLACEHOLDER: maxTabs will come from General settings config when
-     * that page is implemented. For now DEFAULT_MAX_TABS = 5.
+     * Enforces the maxTabs cap (synced from General settings via TAB_STATE).
+     * Logs a warning and returns early if the limit is reached. The TabBar
+     * "+" button is disabled at the same threshold, so this is a safety net
+     * for programmatic calls.
      */
     const newConversation = useCallback(() => {
-        if (tabOrder.length >= DEFAULT_MAX_TABS) {
+        if (tabOrder.length >= maxTabs) {
             log.warn("useBridge", "newConversation blocked: max tabs reached", {
-                maxTabs: DEFAULT_MAX_TABS,
+                maxTabs,
                 currentTabs: tabOrder.length,
             });
             return;
@@ -1118,7 +1210,7 @@ export function useBridge(): BridgeState {
 
         sendCommand({ type: CommandType.NEW_CONVERSATION });
         persistTabState();
-    }, [tabOrder.length, persistTabState]);
+    }, [tabOrder.length, maxTabs, persistTabState]);
 
     const switchTab = useCallback(
         (tabId: string) => {
@@ -1319,7 +1411,7 @@ export function useBridge(): BridgeState {
     }, [updateTab]);
 
     /**
-     * Update the active tab's context bypass mode (dial perspective).
+     * Update the active tab's context mode (user perspective: OFF/ON/CUSTOM).
      *
      * Called by ContextDialStrip when the user clicks the ContextDial.
      * The new mode is stored in TabData.bypassMode (persisted via SAVE_TAB_STATE)
@@ -1328,7 +1420,19 @@ export function useBridge(): BridgeState {
      * @see ContextDialStrip — calls this on dial click
      * @see dialToBackendBypass — translates to backend perspective in sendMessage
      */
-    const setBypassMode = useCallback((mode: "OFF" | "FULL" | "SELECTIVE") => {
+    /**
+     * Toggle per-tab summary ON/OFF.
+     * Gated by globalSummaryEnabled — if global is OFF, this has no effect.
+     */
+    const setSummaryEnabled = useCallback((enabled: boolean) => {
+        updateTab(activeTabIdRef.current, (tab) => ({
+            ...tab,
+            summaryEnabled: enabled,
+        }));
+        persistTabState();
+    }, [updateTab, persistTabState]);
+
+    const setBypassMode = useCallback((mode: "OFF" | "ON" | "CUSTOM") => {
         updateTab(activeTabIdRef.current, (tab) => ({
             ...tab,
             bypassMode: mode,
@@ -1341,7 +1445,7 @@ export function useBridge(): BridgeState {
      *
      * Called by ContextLever when the user drags the handle to a new snap position.
      * The level is stored in TabData.selectiveLevel (persisted via SAVE_TAB_STATE)
-     * and included in the next SEND_MESSAGE when bypassMode = "SELECTIVE".
+     * and included in the next SEND_MESSAGE when bypassMode = "CUSTOM".
      *
      * @see ContextLever — calls this on handle drag end
      * @see sendMessage — reads selectiveLevel from TabData
@@ -1384,11 +1488,15 @@ export function useBridge(): BridgeState {
         collapseAll,
         expandAll,
         bookmarkCodeBlock,
+        summaryEnabled: activeSummaryEnabled,
+        setSummaryEnabled,
         bypassMode: activeBypassMode,
         setBypassMode,
         selectiveLevel: activeSelectiveLevel,
         setSelectiveLevel,
+        maxTabs,
         globalContextEnabled,
+        globalSummaryEnabled,
         defaultBypassMode,
     };
 }

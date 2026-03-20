@@ -22,30 +22,39 @@ import javax.swing.*
  *
  * ## What Lives Here
  *
- * User-configurable context gathering preferences. STUB at launch —
- * settings are present and persisted but not yet read by the backend.
- * The per-message bypassMode from SendMessage is the only active
- * context control during launch.
+ * User-configurable context gathering preferences:
  *
  * ### Launch (Individual Basic)
- * - Enable context gathering [on/off toggle]
- * - Default bypass mode [OFF / FULL combo]
+ * - **Enable context gathering** [on/off toggle] — master kill-switch
+ * - **Smart context filter** [on/off toggle] — heuristic pre-filter (default: off)
+ * - Default bypass mode combo (FULL only for Basic; SELECTIVE added for Pro)
  *
  * ### Post-Launch (Pro Tier)
- * - Selective bypass mode (greyed out with "Pro" label)
+ * - Selective bypass mode options (greyed out with "Pro" label for Basic)
+ *
+ * ## Smart Context Filter
+ *
+ * When enabled, the [ContextHeuristicFilter] scans the user's message for
+ * code-related markers BEFORE context gathering starts. If no markers are
+ * found (e.g. "hello", "tell me a joke"), context gathering is skipped
+ * to save tokens.
+ *
+ * Default: OFF — context always flows through. This is the safe launch
+ * default because the heuristic has known false negatives (e.g. "how does
+ * this class relate to the backend?" doesn't match any keyword pattern).
+ *
+ * The checkbox is disabled when "Enable context gathering" is unchecked,
+ * because there's nothing to filter if context gathering is off entirely.
  *
  * ## Working Copy Pattern
  *
  * Same as MetricsConfigurable: load on reset(), persist on apply().
  * Users can change fields and cancel without saving.
  *
- * ## Tier-Aware Display
- *
- * The SELECTIVE bypass mode option is shown greyed out for Basic-tier
- * users with a "(Pro)" label. Pro-tier users see it as a selectable
- * option in the combo box.
- *
  * @param project The IntelliJ project these settings belong to
+ * @see ContextSettingsState — persistence layer
+ * @see ContextHeuristicFilter — the filter controlled by the checkbox
+ * @see ContextAssembler — reads heuristicFilterEnabled at call time
  */
 class ContextConfigurable(private val project: Project) : Configurable {
 
@@ -55,8 +64,11 @@ class ContextConfigurable(private val project: Project) : Configurable {
     private val settingsState get() = ContextSettingsState.getInstance(project)
 
     // ── Working copy ──────────────────────────────────────────────────
+    // These hold the UI values between reset() and apply().
+    // They allow the user to change things and cancel without persisting.
     private var workingContextEnabled: Boolean = true
     private var workingDefaultBypassMode: String = "FULL"
+    private var workingHeuristicFilterEnabled: Boolean = false
 
     // ── UI components ─────────────────────────────────────────────────
     private val root = JPanel(BorderLayout(0, 12))
@@ -64,8 +76,29 @@ class ContextConfigurable(private val project: Project) : Configurable {
     /** Master toggle: enable/disable context gathering globally. */
     private val contextEnabledCheckbox = JCheckBox("Enable context gathering")
 
-    /** Default bypass mode combo: FULL (full context) or OFF (no context). */
-    private val defaultBypassModeCombo = JComboBox(arrayOf("FULL", "OFF"))
+    /**
+     * Default bypass mode combo for new tabs.
+     *
+     * When context is enabled (master toggle on), the only sensible default
+     * is "FULL" (full context gathering). "OFF" is NOT offered here because
+     * the master toggle is the kill-switch for context — having a per-tab
+     * "OFF" default when context is enabled contradicts the global setting.
+     *
+     * Pro tier adds "SELECTIVE" as an option (per-component context).
+     */
+    private val defaultBypassModeCombo = JComboBox(arrayOf("FULL"))
+
+    /**
+     * Smart context filter toggle.
+     *
+     * When checked, [ContextHeuristicFilter] is active: messages that don't
+     * contain code-related markers skip context gathering to save tokens.
+     * Default: unchecked (context always flows through).
+     *
+     * Disabled/greyed out when "Enable context gathering" is unchecked,
+     * because there's nothing to filter if context gathering is off entirely.
+     */
+    private val heuristicFilterCheckbox = JCheckBox("Smart context filter (skip context for non-code messages)")
 
     // ── Configurable interface ────────────────────────────────────────
 
@@ -85,8 +118,13 @@ class ContextConfigurable(private val project: Project) : Configurable {
         row = addSeparator(formPanel, gbc, row, "Context Gathering")
 
         // Enable context gathering toggle.
-        // No ActionListener — changes only take effect when the user clicks Apply.
-        // apply() persists the state and notifies the React panel immediately.
+        // ActionListener updates the heuristic filter checkbox enabled state
+        // immediately so the user sees the dependency visually.
+        contextEnabledCheckbox.addActionListener {
+            // The heuristic filter checkbox only makes sense when context is enabled.
+            // If context is off, there's nothing to filter — grey it out.
+            heuristicFilterCheckbox.isEnabled = contextEnabledCheckbox.isSelected
+        }
         row = addFormRow(formPanel, gbc, row,
             label = "",
             component = contextEnabledCheckbox,
@@ -94,6 +132,18 @@ class ContextConfigurable(private val project: Project) : Configurable {
                     "structure, summaries) and includes it in the prompt sent to " +
                     "the AI provider. When disabled, context gathering is skipped " +
                     "globally — applies to all tabs immediately."
+        )
+
+        // Smart context filter — heuristic pre-filter toggle.
+        // Disabled when "Enable context gathering" is unchecked.
+        row = addFormRow(formPanel, gbc, row,
+            label = "",
+            component = heuristicFilterCheckbox,
+            help = "When enabled, the plugin uses keyword detection to skip context " +
+                    "gathering for messages that don't appear code-related (e.g. " +
+                    "'hello', 'tell me a joke'). This saves tokens but may occasionally " +
+                    "skip context for ambiguous messages like 'explain how this relates " +
+                    "to the backend'. Default: off (context always flows through)."
         )
 
         // ── Section: Selective Bypass (Pro) ───────────────────────────
@@ -118,7 +168,7 @@ class ContextConfigurable(private val project: Project) : Configurable {
             help = if (canUseSelective) {
                 "The dial position applied when a new tab is created. " +
                         "FULL = full context gathering (recommended). " +
-                        "OFF = no context sent by default. Pro tier."
+                        "SELECTIVE = per-component context (Pro tier)."
             } else {
                 "Pro tier: set the dial's starting position for new tabs. " +
                         "Basic tier: new tabs always start with full context gathering."
@@ -173,25 +223,32 @@ class ContextConfigurable(private val project: Project) : Configurable {
 
     override fun isModified(): Boolean {
         return workingContextEnabled != contextEnabledCheckbox.isSelected ||
-                workingDefaultBypassMode != (defaultBypassModeCombo.selectedItem as? String ?: "FULL")
+                workingDefaultBypassMode != (defaultBypassModeCombo.selectedItem as? String ?: "FULL") ||
+                workingHeuristicFilterEnabled != heuristicFilterCheckbox.isSelected
     }
 
     override fun apply() {
         workingContextEnabled = contextEnabledCheckbox.isSelected
         workingDefaultBypassMode = defaultBypassModeCombo.selectedItem as? String ?: "FULL"
+        workingHeuristicFilterEnabled = heuristicFilterCheckbox.isSelected
 
-        // Persist to state
+        // Persist to state — this writes to IntelliJ's project-level XML.
+        // ContextAssembler reads heuristicFilterEnabled at call time (no caching),
+        // so the change takes effect on the next message sent.
         val state = settingsState.state
         state.contextEnabled = workingContextEnabled
         state.defaultBypassMode = workingDefaultBypassMode
+        state.heuristicFilterEnabled = workingHeuristicFilterEnabled
         settingsState.loadState(state)
 
         Dev.info(log, "context.settings.applied",
             "contextEnabled" to workingContextEnabled,
-            "defaultBypassMode" to workingDefaultBypassMode
+            "defaultBypassMode" to workingDefaultBypassMode,
+            "heuristicFilterEnabled" to workingHeuristicFilterEnabled
         )
 
-        // Push updated settings to the React panel
+        // Push updated context settings to the React panel immediately.
+        // This re-emits CONTEXT_SETTINGS so the dial/strip reflect the new state.
         try {
             CrossPanelBridge.getInstance(project).notifyContextSettingsChanged()
         } catch (e: Exception) {
@@ -200,13 +257,19 @@ class ContextConfigurable(private val project: Project) : Configurable {
     }
 
     override fun reset() {
-        // Load from persisted state
+        // Load from persisted state — populates the UI with saved values.
         val state = settingsState.state
         workingContextEnabled = state.contextEnabled
         workingDefaultBypassMode = state.defaultBypassMode
+        workingHeuristicFilterEnabled = state.heuristicFilterEnabled
 
         contextEnabledCheckbox.isSelected = workingContextEnabled
         defaultBypassModeCombo.selectedItem = workingDefaultBypassMode
+        heuristicFilterCheckbox.isSelected = workingHeuristicFilterEnabled
+
+        // Sync the heuristic filter checkbox enabled state with the context toggle.
+        // If context is off, the filter checkbox should be greyed out.
+        heuristicFilterCheckbox.isEnabled = workingContextEnabled
     }
 
     override fun disposeUIResources() { /* nothing to dispose */ }

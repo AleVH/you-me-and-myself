@@ -393,6 +393,7 @@ function handleMockCommand(command: BridgeCommand): void {
                     type: "TAB_STATE",
                     tabs: mockTabStore.tabs,
                     keepTabs: mockTabStore.keepTabs,
+                    maxTabs: 5,
                 },
                 100,
             );
@@ -439,6 +440,20 @@ function handleMockCommand(command: BridgeCommand): void {
             break;
 
         // ── R4: Exchange Starring Mock Handler ───────────────────────
+
+        // ── Block 5: Context Settings Mock Handler ──────────────────
+        case "REQUEST_CONTEXT_SETTINGS":
+            // Mock: both context and summary enabled globally, default mode = ON
+            simulateEvent(
+                {
+                    type: "CONTEXT_SETTINGS",
+                    contextEnabled: true,
+                    defaultBypassMode: "FULL",  // Backend sends "FULL" = context on
+                    summaryEnabled: true,        // Summary enabled globally
+                },
+                100,
+            );
+            break;
 
         case "TOGGLE_STAR": {
             // In production, backend toggles star in storage.

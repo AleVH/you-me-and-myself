@@ -227,6 +227,13 @@ export interface SendMessageCommand {
      * Threaded to ContextAssembler.assemble() via ChatOrchestrator.send().
      */
     selectiveLevel: number | null;
+    /**
+     * Per-tab summary toggle. When false, the backend skips summary
+     * enrichment for this message (no summaries used or generated).
+     * Independent from bypassMode — summary and context are separate features.
+     * Null = default to global setting (backward compatibility).
+     */
+    summaryEnabled: boolean | null;
 }
 
 /** User confirms heuristic was correct. Mirrors BridgeMessage.ConfirmCorrection. */
@@ -762,16 +769,23 @@ export interface TabStateDto {
     /** Per-tab AI provider profile ID. Null = use global selection. */
     providerId: string | null;
     /**
-     * Dial position in dial perspective (not backend bypass perspective).
-     * "FULL" = context on (default), "OFF" = no context, "SELECTIVE" = Pro.
-     * Persisted in open_tabs.bypass_mode. Default "FULL".
+     * Per-tab context mode (user perspective).
+     * Backend stores: "FULL" = context on, "OFF" = no context, "SELECTIVE" = Pro.
+     * Frontend translates: "FULL"→"ON", "OFF"→"OFF", "SELECTIVE"→"CUSTOM".
+     * Default "FULL" (= ON).
      */
     bypassMode?: string | null;
     /**
-     * Lever position when bypassMode = "SELECTIVE".
+     * Lever position when contextMode = "CUSTOM" (= backend "SELECTIVE").
      * 0 = Minimal, 1 = Partial, 2 = Full. Default 2.
      */
     selectiveLevel?: number | null;
+    /**
+     * Per-tab summary toggle. True = summaries enabled, false = raw files only.
+     * Independent of context mode — summary can be off even when context is on.
+     * Default true (summaries enabled).
+     */
+    summaryEnabled?: boolean | null;
     /** STUB — per-tab traversal radius override. Null = project default. */
     traversalRadius?: number | null;
     /** STUB — per-tab infrastructure visibility override. Null = project default. */
@@ -791,6 +805,8 @@ export interface TabStateEvent {
     tabs: TabStateDto[];
     /** Whether the keep_tabs setting is enabled. Drives the UI toggle. */
     keepTabs: boolean;
+    /** Maximum number of simultaneous tabs allowed (from General settings, range 2–20). */
+    maxTabs: number;
 }
 
 /**
@@ -881,28 +897,38 @@ export interface DevOutputEvent {
 }
 
 /**
- * Project-level context settings event. Mirrors BridgeMessage.ContextSettingsEvent.
+ * Project-level context AND summary settings event. Mirrors BridgeMessage.ContextSettingsEvent.
  *
- * Sent in response to REQUEST_CONTEXT_SETTINGS on startup.
+ * Sent in response to REQUEST_CONTEXT_SETTINGS on startup, and whenever
+ * settings change (via CrossPanelBridge.notifyContextSettingsChanged).
+ *
  * The React app uses this to:
  * - Set globalContextEnabled: when false, the ContextDial is greyed out.
- * - Set defaultBypassMode: dial position for new tabs ("FULL" or "OFF").
- *   Basic-tier users always receive "FULL" regardless of stored value.
+ * - Set defaultBypassMode: mode for new tabs (backend sends "FULL"/"OFF"/"SELECTIVE").
+ * - Set globalSummaryEnabled: when false, per-tab summary toggles are hidden.
+ *
+ * Context and summary are INDEPENDENT features with INDEPENDENT toggles.
  */
 export interface ContextSettingsEvent {
     type: typeof EventType.CONTEXT_SETTINGS;
     /**
-     * Master kill-switch from ContextSettingsState.contextEnabled.
+     * Global context kill-switch from ContextSettingsState.contextEnabled.
      * When false, all context gathering is disabled and the ContextDial
-     * is visually disabled (clicks rejected).
+     * is visually disabled (clicks rejected). Global overrules local.
      */
     contextEnabled: boolean;
     /**
-     * Default dial position for new tabs (dial perspective).
-     * "FULL" = full context on (default), "OFF" = no context.
-     * "SELECTIVE" only if Pro tier; Basic always receives "FULL".
+     * Default mode for new tabs (backend perspective: "FULL"/"OFF"/"SELECTIVE").
+     * Frontend translates: "FULL"→"ON", "OFF"→"OFF", "SELECTIVE"→"CUSTOM".
+     * Basic-tier users always receive "FULL" regardless of stored value.
      */
     defaultBypassMode: string;
+    /**
+     * Global summary kill-switch from SummaryConfigService.enabled.
+     * When false, per-tab summary toggles are hidden/disabled.
+     * Summarisation is an independent feature from context gathering.
+     */
+    summaryEnabled: boolean;
 }
 
 /**

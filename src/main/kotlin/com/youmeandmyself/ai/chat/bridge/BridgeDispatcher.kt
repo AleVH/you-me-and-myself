@@ -14,6 +14,8 @@ import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.storage.TabStateService
 import com.youmeandmyself.ai.settings.ContextSettingsState
 import com.youmeandmyself.ai.settings.MetricsSettingsState
+import com.youmeandmyself.ai.settings.TabSettingsListener
+import com.youmeandmyself.summary.config.SummaryConfigService
 import com.youmeandmyself.tier.CompositeTierProvider
 import com.youmeandmyself.tier.Feature
 import kotlinx.coroutines.CoroutineScope
@@ -59,6 +61,13 @@ class BridgeDispatcher(
 
     init {
         Dev.info(log, "bridge.version", "block" to "5")
+
+        // Subscribe to tab settings changes so we can re-emit TAB_STATE
+        // when the user changes maxTabs/keepTabs in General Settings.
+        project.messageBus.connect(project).subscribe(TabSettingsListener.TOPIC, TabSettingsListener {
+            Dev.info(log, "bridge.tab_settings_changed", "action" to "re-emit TAB_STATE")
+            handleRequestTabState()
+        })
     }
     private val tabStateService = TabStateService.getInstance(project)
     private val storage = LocalStorageFacade.getInstance(project)
@@ -132,7 +141,8 @@ class BridgeDispatcher(
                     conversationId = command.conversationId,
                     providerId = command.providerId,
                     bypassMode = command.bypassMode,
-                    selectiveLevel = command.selectiveLevel
+                    selectiveLevel = command.selectiveLevel,
+                    summaryEnabled = command.summaryEnabled
                 )
 
                 if (result.contextSummary != null) {
@@ -493,18 +503,21 @@ class BridgeDispatcher(
         scope.launch {
             try {
                 val keepTabs = tabStateService.isKeepTabsEnabled()
+                val maxTabs = tabStateService.getMaxTabs()
                 val tabs = if (keepTabs) tabStateService.loadAll() else emptyList()
 
                 emit(BridgeMessage.TabStateEvent(
                     tabs = tabs,
-                    keepTabs = keepTabs
+                    keepTabs = keepTabs,
+                    maxTabs = maxTabs
                 ))
             } catch (t: Throwable) {
                 Dev.error(log, "bridge.request_tab_state_failed", t)
                 // Fallback: send empty state so the UI doesn't hang
                 emit(BridgeMessage.TabStateEvent(
                     tabs = emptyList(),
-                    keepTabs = true
+                    keepTabs = true,
+                    maxTabs = 5
                 ))
             }
         }
@@ -706,6 +719,23 @@ class BridgeDispatcher(
      * regardless of the stored value, because they cannot customise this setting.
      * The SELECTIVE default is gated behind Feature.CONTEXT_SELECTIVE_BYPASS.
      */
+    /**
+     * Handle REQUEST_CONTEXT_SETTINGS — send project-level context AND summary
+     * settings to the React frontend.
+     *
+     * Called at startup (BRIDGE_READY) and whenever settings change
+     * (via CrossPanelBridge.notifyContextSettingsChanged).
+     *
+     * Sends three things:
+     * 1. contextEnabled — global context kill-switch
+     * 2. defaultBypassMode — dial position for new tabs
+     * 3. summaryEnabled — global summary kill-switch
+     *
+     * The frontend uses these to:
+     * - Grey out the ContextDial when context is globally disabled
+     * - Hide/disable per-tab summary toggles when summary is globally off
+     * - Set the default mode for newly created tabs
+     */
     private fun handleRequestContextSettings() {
         try {
             val contextSettings = ContextSettingsState.getInstance(project).state
@@ -723,22 +753,34 @@ class BridgeDispatcher(
                 "FULL"
             }
 
+            // Read global summary enabled state from SummaryConfigService.
+            // This is independent from context — two separate features.
+            val summaryEnabled = try {
+                SummaryConfigService.getInstance(project).getConfig().enabled
+            } catch (e: Exception) {
+                Dev.warn(log, "context_settings.summary_check_failed", e)
+                true // Safe fallback: assume summary is enabled
+            }
+
             Dev.info(log, "bridge.context_settings",
                 "contextEnabled" to contextSettings.contextEnabled,
                 "defaultBypassMode" to defaultBypassMode,
+                "summaryEnabled" to summaryEnabled,
                 "canUseSelective" to canUseSelective
             )
 
             emit(BridgeMessage.ContextSettingsEvent(
                 contextEnabled = contextSettings.contextEnabled,
-                defaultBypassMode = defaultBypassMode
+                defaultBypassMode = defaultBypassMode,
+                summaryEnabled = summaryEnabled
             ))
         } catch (t: Throwable) {
             Dev.error(log, "bridge.context_settings_failed", t)
             // Fallback: send safe defaults so the UI doesn't hang
             emit(BridgeMessage.ContextSettingsEvent(
                 contextEnabled = true,
-                defaultBypassMode = "FULL"
+                defaultBypassMode = "FULL",
+                summaryEnabled = true
             ))
         }
     }

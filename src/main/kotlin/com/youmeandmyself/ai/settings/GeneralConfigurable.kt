@@ -101,6 +101,12 @@ class GeneralConfigurable(private val project: Project) : Configurable {
     // Chat tabs
     private val keepTabsCheckbox = JCheckBox("Restore open tabs when IDE restarts")
     private val maxTabsSpinner = JSpinner(SpinnerNumberModel(5, 2, 20, 1))
+    private val maxTabsWarning = JBLabel(
+        "<html><i>⚠ More than 5 tabs increases memory and CPU usage, which may affect IDE performance.</i></html>"
+    ).apply {
+        foreground = java.awt.Color(180, 130, 0)
+        isVisible = false  // hidden by default, shown when spinner > 5
+    }
 
     // Index management buttons
     private val scanNewFilesButton = JButton("Scan for new added files")
@@ -171,6 +177,18 @@ class GeneralConfigurable(private val project: Project) : Configurable {
             help = "Hard cap on simultaneous open conversation tabs (2–20). Default: 5. " +
                     "More tabs = more memory used by the embedded browser."
         )
+
+        // Max tabs warning — shown dynamically when value > 5
+        row = addFormRow(formPanel, gbc, row,
+            label = "",
+            component = maxTabsWarning,
+            help = ""
+        )
+        maxTabsSpinner.addChangeListener {
+            maxTabsWarning.isVisible = (maxTabsSpinner.value as Int) > 5
+        }
+        // Initialise visibility based on current value
+        maxTabsWarning.isVisible = (maxTabsSpinner.value as Int) > 5
 
         // ── Section: Index Management ─────────────────────────────────
 
@@ -276,6 +294,10 @@ class GeneralConfigurable(private val project: Project) : Configurable {
             "keepTabs" to keepTabsCheckbox.isSelected,
             "maxTabs" to maxTabsSpinner.value
         )
+
+        // Notify subscribers (BridgeDispatcher) so the frontend picks up
+        // the new maxTabs/keepTabs immediately without IDE restart.
+        project.messageBus.syncPublisher(TabSettingsListener.TOPIC).onTabSettingsChanged()
     }
 
     override fun reset() {

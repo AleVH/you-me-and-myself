@@ -8,6 +8,7 @@ import com.intellij.ui.components.JBTextField
 import com.youmeandmyself.summary.config.SummaryConfig
 import com.youmeandmyself.summary.config.SummaryConfigService
 import com.youmeandmyself.summary.config.SummaryMode
+import com.youmeandmyself.ai.bridge.CrossPanelBridge
 import com.youmeandmyself.dev.Dev
 import java.awt.BorderLayout
 import java.awt.Component
@@ -315,6 +316,19 @@ class SummaryConfigurable(private val project: Project) : Configurable {
             "mode" to workingConfig.mode.name,
             "enabled" to workingConfig.enabled
         )
+
+        // Push updated summary state to the React panel immediately.
+        // CONTEXT_SETTINGS carries BOTH context AND summary global state.
+        // Without this call, the Summary Dial stays stale until IDE restart.
+        // Same pattern as ContextConfigurable.apply().
+        try {
+            CrossPanelBridge.getInstance(project).notifyContextSettingsChanged()
+        } catch (e: Exception) {
+            Dev.warn(
+                com.intellij.openapi.diagnostic.Logger.getInstance(SummaryConfigurable::class.java),
+                "summary.settings.apply_notify_failed", e
+            )
+        }
     }
 
     /**
@@ -391,17 +405,13 @@ class SummaryConfigurable(private val project: Project) : Configurable {
     // ==================== UI Helpers ====================
 
     /**
-     * Handle the kill switch toggle.
+     * Handle the enabled checkbox toggle.
      *
-     * Two effects:
-     * 1. Update the in-memory SummaryConfigService immediately (instant kill-switch).
-     *    SummaryConfigService.setEnabled() persists to SQLite AND updates the
-     *    AtomicReference — the next summarization request sees the new value at call time,
-     *    without waiting for Apply to be clicked.
-     * 2. Grey out / un-grey all dependent controls for clear visual feedback.
+     * Only updates the local UI (grey out / un-grey dependent controls).
+     * Does NOT persist — that happens in apply(), same as ContextConfigurable.
+     * The React panel is also notified in apply(), not here.
      */
     private fun onEnabledChanged() {
-        configService.setEnabled(enabledCheckbox.isSelected)
         updateEnabledState()
     }
 

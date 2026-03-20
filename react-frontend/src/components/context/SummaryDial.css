@@ -1,0 +1,98 @@
+/**
+ * SummaryDial styles — compact rotary toggle for per-tab summary mode.
+ *
+ * This is the SUMMARY dial (compression control), NOT the context dial
+ * (scope control). They are independent features — see SummaryDial.tsx
+ * for the full explanation of context vs summary.
+ *
+ * ## Theme
+ *
+ * Follows the Darcula dark theme established in index.css.
+ * All dimensions in px (not rem) for JCEF compatibility.
+ *
+ * ## BEM Naming
+ *
+ * .ymm-summary-dial             — button wrapper (24×24)
+ * .ymm-summary-dial__svg        — the SVG element
+ * .ymm-summary-dial__ring       — outer circle stroke
+ * .ymm-summary-dial__notch      — position indicator dot
+ * .ymm-summary-dial__center     — center anchor dot
+ * .ymm-summary-dial--off        — OFF mode modifier (raw files, no compression)
+ * .ymm-summary-dial--on         — ON mode modifier (files compressed)
+ * .ymm-summary-dial--disabled   — globally disabled modifier
+ */
+
+/* ── Button wrapper ──────────────────────────────────────────────── */
+
+.ymm-summary-dial {
+    /* Reset button defaults */
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    outline: none;
+
+    /* Fixed 24×24 hit target */
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    /* Smooth rotation transition for the notch */
+    transition: transform 0.15s ease;
+}
+
+.ymm-summary-dial:hover {
+    /* Subtle scale-up on hover for interactivity feedback */
+    transform: scale(1.15);
+}
+
+.ymm-summary-dial:focus-visible {
+    /* Keyboard focus ring — green to match summary's ON color */
+    outline: 1px solid #6a9955;
+    outline-offset: 2px;
+    border-radius: 50%;
+}
+
+.ymm-summary-dial:active {
+    /* Press feedback — slight shrink */
+    transform: scale(0.95);
+}
+
+/* ── Disabled state ─────────────────────────────────────────────── */
+
+.ymm-summary-dial--disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.ymm-summary-dial--disabled:hover {
+    transform: none;
+}
+
+/* ── SVG internals ───────────────────────────────────────────────── */
+
+.ymm-summary-dial__svg {
+    display: block;
+}
+
+/* Smooth color transitions when mode changes */
+.ymm-summary-dial__ring,
+.ymm-summary-dial__notch,
+.ymm-summary-dial__center {
+    transition: fill 0.2s ease, stroke 0.2s ease, cx 0.2s ease, cy 0.2s ease;
+}
+
+/* ── Mode-specific visual tweaks ─────────────────────────────────── */
+
+/* OFF: slightly dimmed to indicate "inactive" (no compression) */
+.ymm-summary-dial--off .ymm-summary-dial__ring {
+    opacity: 0.6;
+}
+
+/* ON: full brightness, compression active */
+.ymm-summary-dial--on .ymm-summary-dial__ring {
+    opacity: 1.0;
+}

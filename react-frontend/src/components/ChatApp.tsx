@@ -49,7 +49,7 @@ import TabBar from "./TabBar";
 import ContextDialStrip from "./context/ContextDialStrip";
 import { log } from "../utils/log";
 
-log.info("ChatApp", "[VERSION] Block 5 loaded");
+log.info("ChatApp", `[BUILD] ${__BUILD_DATE__} ${__BUILD_TIMESTAMP__}`);
 
 function ChatApp() {
     const bridge = useBridge();
@@ -71,6 +71,7 @@ function ChatApp() {
                 onCloseTab={bridge.closeTab}
                 onNewConversation={bridge.newConversation}
                 onRenameTab={bridge.renameTab}
+                maxTabs={bridge.maxTabs}
             />
 
             {/* Collapse/Expand All — between tab bar and message list.
@@ -102,15 +103,26 @@ function ChatApp() {
                 onToggleCollapse={bridge.toggleCollapse}
             />
 
-            {/* Block 5: Context bypass mode toggle — sits above the input
-                bar so the user sees the current mode before sending. */}
+            {/* ═══════════════════════════════════════════════════════════
+                CONTEXT vs SUMMARY — TWO INDEPENDENT features on the same strip.
+                Context (left dial)  = WHAT gets gathered from the IDE (scope).
+                Summary (right dial) = HOW COMPACT the files are (compression).
+                They are sequential: context decides what is included, summary
+                decides how compact it is. Each has its own global kill-switch
+                and per-tab dial. They must NEVER be conflated.
+                ═══════════════════════════════════════════════════════════ */}
             <ContextDialStrip
+                /* ── Context dial props (scope control) ── */
                 mode={bridge.bypassMode}
                 onModeChange={bridge.setBypassMode}
                 canUseSelective={false} /* Basic tier — SELECTIVE gated behind Pro */
                 globalContextEnabled={bridge.globalContextEnabled}
                 selectiveLevel={bridge.selectiveLevel}
                 onLevelChange={bridge.setSelectiveLevel}
+                /* ── Summary dial props (compression control) ── */
+                summaryMode={bridge.summaryEnabled ? "ON" : "OFF"}
+                onSummaryModeChange={(mode) => bridge.setSummaryEnabled(mode === "ON")}
+                globalSummaryEnabled={bridge.globalSummaryEnabled}
             />
 
             <InputBar
@@ -123,6 +135,17 @@ function ChatApp() {
                     DEV MODE — Mock transport active
                 </div>
             )}
+
+            {/* Build fingerprint — always visible so you can verify
+             * the plugin is running the latest React build, not a cached one.
+             * If the time shown here doesn't match your last `npm run build`,
+             * JCEF is serving a stale bundle. */}
+            <div
+                className="ymm-build-stamp"
+                title={`React build: ${__BUILD_DATE__} ${__BUILD_TIMESTAMP__}`}
+            >
+                build {__BUILD_TIMESTAMP__}
+            </div>
         </div>
     );
 }

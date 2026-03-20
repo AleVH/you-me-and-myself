@@ -83,7 +83,20 @@ object BridgeMessage {
         val conversationId: String? = null,
         val providerId: String? = null,
         val bypassMode: String? = null,
-        val selectiveLevel: Int? = null
+        val selectiveLevel: Int? = null,
+        /**
+         * Per-tab summary toggle. When false, context files go to the AI
+         * as full raw text (no compression). When true, the summary pipeline
+         * compresses the context files into shorter representations.
+         *
+         * IMPORTANT: This controls SUMMARY (compression), NOT context (scope).
+         * Context (bypassMode) = WHAT gets gathered from the IDE.
+         * Summary (this field) = HOW COMPACT those gathered files are.
+         * These are independent features — never conflate them.
+         *
+         * Null = use global setting (backward compat with old frontends).
+         */
+        val summaryEnabled: Boolean? = null
     ) : Command()
 
     @Serializable
@@ -551,7 +564,8 @@ object BridgeMessage {
     data class TabStateEvent(
         override val type: String = "TAB_STATE",
         val tabs: List<TabStateDto>,
-        val keepTabs: Boolean
+        val keepTabs: Boolean,
+        val maxTabs: Int = 5
     ) : Event()
 
     /**
@@ -624,22 +638,36 @@ object BridgeMessage {
      * - Set the global kill-switch state (globalContextEnabled) which
      *   disables the ContextDial when false.
      * - Set the default bypassMode for new tabs (defaultBypassMode).
+     * - Know if summary is globally enabled (summaryEnabled).
      *
-     * @param contextEnabled Master kill-switch. When false, all context
-     *   gathering is disabled regardless of per-tab dial position.
-     *   The ContextDial is visually greyed out and clicks are rejected.
+     * @param contextEnabled Master kill-switch for context gathering.
+     *   When false, all context gathering is disabled regardless of per-tab
+     *   dial position. The ContextDial is visually greyed out.
      * @param defaultBypassMode Dial position for new tabs. "FULL" = full
      *   context on (default), "OFF" = no context, "SELECTIVE" = Pro only.
      *   Basic-tier users always receive "FULL" regardless of stored value.
+     * @param summaryEnabled Global summary kill-switch from SummaryConfigService.
+     *   When false, per-tab summary toggles are hidden/disabled in the UI.
      *
-     * @see ContextSettingsState — stores the values
+     * @see ContextSettingsState — stores context values
+     * @see SummaryConfigService — stores summary enabled state
      * @see BridgeDispatcher.handleRequestContextSettings — sends this
      */
     @Serializable
     data class ContextSettingsEvent(
         override val type: String = "CONTEXT_SETTINGS",
+        /** Global context kill-switch from ContextSettingsState.contextEnabled. */
         val contextEnabled: Boolean,
-        val defaultBypassMode: String  // "OFF" | "FULL" (dial perspective)
+        /** Default mode for new tabs: "FULL" (context on) or "OFF". */
+        val defaultBypassMode: String,
+        /**
+         * Global summary kill-switch from SummaryConfigService.enabled.
+         * When false, per-tab summary dials are greyed out and non-interactive.
+         *
+         * Summary = HOW COMPACT the context files are (compression).
+         * This is independent from contextEnabled (which controls WHAT is gathered).
+         */
+        val summaryEnabled: Boolean = true
     ) : Event()
 
     // ═══════════════════════════════════════════════════════════════════
@@ -685,6 +713,15 @@ object BridgeMessage {
         val bypassMode: String? = "FULL",
         /** Lever position when SELECTIVE: 0=Minimal, 1=Partial, 2=Full. Default 2. */
         val selectiveLevel: Int? = 2,
+        /**
+         * Per-tab summary toggle. True = files compressed before sending,
+         * false = raw files sent as-is. Null = default (true).
+         *
+         * IMPORTANT: This controls SUMMARY (compression), NOT context (scope).
+         * Context = WHAT gets gathered. Summary = HOW COMPACT those files are.
+         * These are independent features — see ContextDialStrip.tsx for details.
+         */
+        val summaryEnabled: Boolean? = null,
         // STUB — per-tab context controls (not yet wired to ContextAssembler)
         val traversalRadius: Int? = null,
         val infrastructureVisibility: String? = null

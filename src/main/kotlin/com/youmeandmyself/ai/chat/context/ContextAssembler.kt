@@ -114,13 +114,17 @@ class ContextAssembler(
      *   0 = Minimal (no detectors, open file only with existing summary if available).
      *   1 = Partial (Language + Framework + RelevantFiles, skip ProjectStructure).
      *   2 = Full (all 4 detectors — same as bypassMode null). Default: 2.
+     * @param summaryEnabled Per-tab summary toggle. When false, skip summary enrichment
+     *   entirely (no summaries used or generated). Null = use global setting.
+     *   Independent from bypassMode — summary and context are separate features.
      * @return The assembled result with the effective prompt and context metadata
      */
     suspend fun assemble(
         userInput: String,
         scope: CoroutineScope,
         bypassMode: String? = null,
-        selectiveLevel: Int? = null
+        selectiveLevel: Int? = null,
+        summaryEnabled: Boolean? = null
     ): AssembledPrompt {
         // ── Step -1: Global context kill-switch ──────────────────────────
         // Settings → Tools → YMM Assistant → Context → "Enable context gathering"
@@ -299,12 +303,20 @@ class ContextAssembler(
             }
 
             // Level 1 or 2: run the detection pipeline with a filtered detector list
-            // Step 1: Check if context is needed (same heuristic as normal flow)
+            // Optional heuristic pre-filter (same logic as normal path — see Step 1 comments above)
             val editorFile = currentEditorFile()
-            val needContext = shouldGatherContext(userInput, editorFile)
-            if (!needContext) {
-                Dev.info(log, "context.skipped", "reason" to "not_needed_selective")
-                return AssembledPrompt(effectivePrompt = userInput, contextSummary = null, contextTimeMs = null)
+            val selectiveFilter = ContextHeuristicFilter()
+            val selectiveHeuristicEnabled = ContextSettingsState.getInstance(project).state.heuristicFilterEnabled
+            if (selectiveHeuristicEnabled && selectiveFilter.shouldSkipContext(userInput, editorFile)) {
+                Dev.info(log, "context.skipped_by_heuristic",
+                    "reason" to "heuristic_filter_active_selective",
+                    "input_preview" to userInput.take(50)
+                )
+                return AssembledPrompt(
+                    effectivePrompt = userInput,
+                    contextSummary = "[Context: skipped by heuristic filter (selective)]",
+                    contextTimeMs = null
+                )
             }
             if (DumbService.isDumb(project)) {
                 Dev.info(log, "context.skipped", "reason" to "ide_indexing_selective")
@@ -331,16 +343,29 @@ class ContextAssembler(
             )
         }
 
-        // Step 1: Determine if IDE context would help answer this question
+        // Step 1: Optional heuristic pre-filter
+        //
+        // When the heuristic filter is ENABLED in settings, this is the first gate.
+        // It checks the user's message for code-related markers. If none are found,
+        // context gathering is skipped entirely (token saving optimisation).
+        //
+        // When the heuristic filter is DISABLED (default for launch), this block
+        // is skipped entirely — context ALWAYS flows through. This eliminates the
+        // false negatives that caused the launch blocker (user asks about code in
+        // natural language → heuristic doesn't recognise it → context is dropped).
+        //
+        // To remove the heuristic entirely: delete this `if` block. Nothing else depends on it.
         val editorFile = currentEditorFile()
-        val needContext = shouldGatherContext(userInput, editorFile)
-
-        if (!needContext) {
-            // No context needed — just send the user's message as-is
-            Dev.info(log, "context.skipped", "reason" to "not_needed")
+        val heuristicFilter = ContextHeuristicFilter()
+        val heuristicEnabled = ContextSettingsState.getInstance(project).state.heuristicFilterEnabled
+        if (heuristicEnabled && heuristicFilter.shouldSkipContext(userInput, editorFile)) {
+            Dev.info(log, "context.skipped_by_heuristic",
+                "reason" to "heuristic_filter_active",
+                "input_preview" to userInput.take(50)
+            )
             return AssembledPrompt(
                 effectivePrompt = userInput,
-                contextSummary = null,
+                contextSummary = "[Context: skipped by heuristic filter]",
                 contextTimeMs = null
             )
         }
@@ -361,11 +386,40 @@ class ContextAssembler(
             "timeMs" to metrics.totalMillis
         )
 
-        // Step 4: Enrich files with summaries where beneficial
+        // Step 4: Enrich files with summaries where beneficial.
+        //
+        // ═══════════════════════════════════════════════════════════════
+        // CONTEXT vs SUMMARY — TWO INDEPENDENT features. Never conflate.
+        //
+        // CONTEXT (controlled by bypassMode) = WHAT gets gathered.
+        //   Steps 1-3 above handled this. If bypassMode was FULL (= context
+        //   OFF), we already returned early. If we're here, context is ON.
+        //
+        // SUMMARY (controlled by summaryEnabled) = HOW COMPACT the files are.
+        //   This step COMPRESSES the gathered files into shorter representations.
+        //   It does NOT add anything — it just SHRINKS what's already there.
+        //   Without summary, the raw files go to the AI as full text.
+        //
+        // They are SEQUENTIAL: context decided WHAT is included (above),
+        // now summary decides HOW COMPACT it is (this step).
+        // ═══════════════════════════════════════════════════════════════
+        //
         // This is the READ PATH — checks for existing summaries and uses them
         // when they save tokens. Also fires generation suggestions for missing
         // summaries if the user has opted into automatic summarization.
-        val enrichedBundle = enrichWithSummaries(bundle)
+        //
+        // SKIPPED when summaryEnabled == false (per-tab toggle). The user has
+        // explicitly disabled summaries for this tab. Context still flows (that's
+        // controlled by bypassMode), but raw files are used instead of summaries.
+        // summaryEnabled == null means "use global setting" — always enrich.
+        val enrichedBundle = if (summaryEnabled == false) {
+            Dev.info(log, "context.summary_skipped",
+                "reason" to "summaryEnabled=false (per-tab toggle)"
+            )
+            bundle  // No enrichment — use raw files as-is
+        } else {
+            enrichWithSummaries(bundle)
+        }
 
         // Step 5: Format the context into a structured prompt section
         val contextNote = formatContextNote(enrichedBundle)
@@ -405,96 +459,22 @@ class ContextAssembler(
 
     // ── Context Detection Heuristics ─────────────────────────────────────
     //
-    // These heuristics determine whether the user's message would benefit
-    // from having IDE context attached. They err on the side of inclusion:
-    // it's better to attach unnecessary context (which the AI ignores) than
-    // to miss context the AI needs (which leads to generic/wrong answers).
-
-    /**
-     * Master decision: should we gather IDE context for this message?
-     *
-     * Returns true if any of these conditions are met:
-     * - The message contains code-related markers (file extensions, code keywords, error terms)
-     * - The message explicitly refers to the current file ("this file", "explain this file")
-     * - A code file is open in the editor AND the message uses generic analysis words
-     *   ("explain", "what does this do") — likely referring to the open file
-     *
-     * @param text The user's raw input
-     * @param editorFile The currently open file in the editor (null if no file is open)
-     * @return True if IDE context should be gathered
-     */
-    internal fun shouldGatherContext(text: String, editorFile: VirtualFile?): Boolean {
-        if (isContextLikelyUseful(text)) return true
-        if (refersToCurrentFile(text)) return true
-
-        // If a code file is open and the user uses generic analysis words,
-        // they're probably asking about the open file
-        val isEditorCodeFile = editorFile?.extension?.lowercase() in CODE_FILE_EXTENSIONS
-        if (isEditorCodeFile) {
-            val t = text.lowercase()
-            val isGenericExplain = GENERIC_ANALYSIS_WORDS.any { it in t }
-            if (isGenericExplain) return true
-        }
-
-        return false
-    }
-
-    /**
-     * Heuristic: does the message contain markers that suggest code-related context would help?
-     *
-     * Checks for:
-     * - Code fences (```)
-     * - Error/exception keywords ("error", "traceback", "stack trace", etc.)
-     * - File extension patterns (".kt", ".java", ".py", etc.)
-     * - File path patterns (backslash or forward slash + filename)
-     * - Code keywords ("import ", "class ", "fun ", etc.)
-     *
-     * Short greetings ("hi", "hello") are explicitly excluded even if they
-     * happen to match some pattern.
-     *
-     * @param text The user's raw input
-     * @return True if code-related markers were detected
-     */
-    internal fun isContextLikelyUseful(text: String): Boolean {
-        val t = text.lowercase()
-
-        // Code fences are a strong signal
-        if ("```" in t) return true
-
-        // Error/exception keywords suggest debugging context is needed
-        if (ERROR_KEYWORDS.any { it in t }) return true
-
-        // File extensions suggest the user is talking about specific files
-        if (FILE_EXTENSION_HINTS.any { it in t }) return true
-
-        // File path patterns (e.g., "src/main/Foo.kt" or "C:\Users\file.py")
-        if (FILE_PATH_REGEX.containsMatchIn(t)) return true
-
-        // Code keywords suggest the user is discussing code
-        if (CODE_KEYWORDS.any { it in t }) return true
-
-        // Short greetings — definitely no context needed.
-        // Check this AFTER the other patterns in case someone says "hi, explain this error"
-        val words = t.split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (words.size <= 3 && GREETINGS.any { it == t || t.startsWith(it) }) return false
-
-        return false
-    }
-
-    /**
-     * Detect deictic phrasing that explicitly refers to the active editor file.
-     *
-     * When the user says "this file" or "explain this file", they mean the file
-     * currently open in the editor — not some abstract concept of a file.
-     * This triggers both context gathering AND inclusion of the full file content.
-     *
-     * @param text The user's raw input
-     * @return True if the message refers to the current editor file
-     */
-    internal fun refersToCurrentFile(text: String): Boolean {
-        val t = text.lowercase()
-        return DEICTIC_FILE_PHRASES.any { it in t }
-    }
+    // MOVED to ContextHeuristicFilter.kt (isolated, toggleable class).
+    //
+    // The heuristic methods (shouldGatherContext, isContextLikelyUseful,
+    // refersToCurrentFile) and all their constants (CODE_FILE_EXTENSIONS,
+    // ERROR_KEYWORDS, etc.) now live in ContextHeuristicFilter.
+    //
+    // Why: the heuristic was embedded in the pipeline and silently dropped
+    // context for messages it didn't recognise as code-related. Extracting
+    // it allows toggling on/off via settings without touching the pipeline.
+    //
+    // The filter is called as an optional first-pass in assemble() above.
+    // buildCurrentFileBlock() below uses filter.refersToCurrentFile() to
+    // decide whether to include the full file content in the prompt.
+    //
+    // @see ContextHeuristicFilter — the standalone filter class
+    // @see ContextSettingsState.heuristicFilterEnabled — the toggle
 
     // ── IDE Context Gathering ────────────────────────────────────────────
 
@@ -785,7 +765,11 @@ class ContextAssembler(
      * @return Formatted file block, or empty string if not applicable
      */
     private fun buildCurrentFileBlock(userInput: String, editorFile: VirtualFile?): String {
-        if (editorFile == null || !refersToCurrentFile(userInput)) return ""
+        // Uses ContextHeuristicFilter.refersToCurrentFile() to detect deictic phrasing
+        // ("this file", "explain this file", etc.). This check runs regardless of whether
+        // the heuristic filter is enabled — it controls full-file inclusion, not filtering.
+        val filter = ContextHeuristicFilter()
+        if (editorFile == null || !filter.refersToCurrentFile(userInput)) return ""
         return formatFileBlock(editorFile)
     }
 
@@ -899,69 +883,16 @@ class ContextAssembler(
          */
         private const val MAX_FILE_CHARS = 50_000
 
-        /**
-         * File extensions that indicate a code file is open in the editor.
-         * When a code file is open AND the user uses generic analysis words,
-         * context is gathered even without explicit code markers in the message.
-         */
-        private val CODE_FILE_EXTENSIONS = setOf(
-            "kt", "kts", "java", "js", "jsx", "ts", "tsx", "py", "php", "rb",
-            "go", "rs", "c", "cpp", "h", "cs", "xml", "json", "yml", "yaml"
-        )
-
-        /**
-         * Generic analysis words that, combined with a code file being open,
-         * suggest the user is asking about the open file.
-         */
-        private val GENERIC_ANALYSIS_WORDS = listOf(
-            "what does this do", "explain", "analyze", "describe"
-        )
-
-        /**
-         * Error-related keywords that strongly suggest debugging context is needed.
-         */
-        private val ERROR_KEYWORDS = listOf(
-            "error", "exception", "traceback", "stack trace", "unresolved reference",
-            "undefined", "cannot find symbol", "no such method", "classnotfound"
-        )
-
-        /**
-         * File extension patterns that suggest the user is discussing specific files.
-         */
-        private val FILE_EXTENSION_HINTS = listOf(
-            ".kt", ".kts", ".java", ".js", ".ts", ".tsx", ".py", ".php", ".rb",
-            ".go", ".rs", ".cpp", ".c", ".h", ".cs", ".xml", ".json", ".gradle",
-            ".yml", ".yaml"
-        )
-
-        /**
-         * Regex for detecting file path patterns (e.g., "src/main/Foo.kt" or "C:\Users\file.py").
-         */
-        private val FILE_PATH_REGEX = Regex("""[\\/].+\.(\w{1,6})""")
-
-        /**
-         * Code keywords that suggest the user is discussing source code.
-         * Note the trailing space on most — prevents matching inside normal words.
-         */
-        private val CODE_KEYWORDS = listOf(
-            "import ", "package ", "class ", "interface ", "fun ", "def ",
-            "require(", "include(", "from ", "new ", "extends ", "implements "
-        )
-
-        /**
-         * Greetings that should NOT trigger context gathering on their own.
-         * Only suppresses context for very short messages (≤3 words).
-         */
-        private val GREETINGS = setOf("hi", "hello", "hey", "yo")
-
-        /**
-         * Deictic phrases that explicitly reference the current editor file.
-         * These trigger both context gathering AND full file content inclusion.
-         */
-        private val DEICTIC_FILE_PHRASES = listOf(
-            "this file", "explain this file", "walk me through this file",
-            "what does this file do", "analyze this file"
-        )
+        // ── Heuristic Constants (MOVED) ──────────────────────────────
+        //
+        // All heuristic keyword lists and regex patterns have been moved
+        // to ContextHeuristicFilter.kt (companion object).
+        //
+        // Previously here: CODE_FILE_EXTENSIONS, GENERIC_ANALYSIS_WORDS,
+        // ERROR_KEYWORDS, FILE_EXTENSION_HINTS, FILE_PATH_REGEX,
+        // CODE_KEYWORDS, GREETINGS, DEICTIC_FILE_PHRASES.
+        //
+        // @see ContextHeuristicFilter — now owns all heuristic constants
     }
 }
 

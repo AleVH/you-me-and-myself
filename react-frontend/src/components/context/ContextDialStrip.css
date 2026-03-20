@@ -1,5 +1,10 @@
 /**
- * ContextDialStrip styles — compact bar for context bypass controls.
+ * ContextDialStrip styles — compact bar for context and summary controls.
+ *
+ * Holds TWO independent dials side by side:
+ *   Left:  Context Dial (scope — what gets gathered)
+ *   Right: Summary Dial (compression — how compact the files are)
+ * See ContextDialStrip.tsx for the full context vs summary explanation.
  *
  * ## Theme
  *
@@ -8,15 +13,19 @@
  *
  * ## BEM Naming
  *
- * .ymm-context-strip              — outer container
- * .ymm-context-strip--expanded    — expanded state modifier
- * .ymm-context-strip__row         — primary row (dial + label + toggle)
- * .ymm-context-strip__label       — mode display text
- * .ymm-context-strip__label--off  — OFF mode color
- * .ymm-context-strip__label--full — FULL mode color
- * .ymm-context-strip__label--selective — SELECTIVE mode color
- * .ymm-context-strip__expand      — expand/collapse toggle button
- * .ymm-context-strip__detail      — expanded detail row (lever)
+ * .ymm-context-strip                    — outer container
+ * .ymm-context-strip--expanded          — expanded state modifier
+ * .ymm-context-strip__row               — primary row (both dials + labels + toggle)
+ * .ymm-context-strip__label             — context mode display text
+ * .ymm-context-strip__label--off        — OFF mode color (context)
+ * .ymm-context-strip__label--full       — FULL mode color (context)
+ * .ymm-context-strip__label--selective  — SELECTIVE mode color (context)
+ * .ymm-context-strip__separator         — vertical divider between context and summary
+ * .ymm-context-strip__summary-label     — summary mode display text
+ * .ymm-context-strip__summary-label--off — OFF mode color (summary)
+ * .ymm-context-strip__summary-label--on  — ON mode color (summary)
+ * .ymm-context-strip__expand            — expand/collapse toggle button
+ * .ymm-context-strip__detail            — expanded detail row (context lever)
  */
 
 /* ── Container ───────────────────────────────────────────────────── */
@@ -44,7 +53,7 @@
     font-size: 11px;
     font-family: system-ui, -apple-system, sans-serif;
     white-space: nowrap;
-    flex: 1; /* Push expand button to the right */
+    flex: none; /* No longer sole occupant — summary label sits next to it */
     transition: color 0.2s ease;
 }
 
@@ -59,6 +68,45 @@
 
 .ymm-context-strip__label--selective {
     color: #dcdcaa;
+}
+
+.ymm-context-strip__label--disabled {
+    color: #555555;
+}
+
+/* ── Separator between context and summary ────────────────────────── */
+
+.ymm-context-strip__separator {
+    width: 1px;
+    height: 14px;
+    background: #444444;
+    flex-shrink: 0;
+    margin: 0 2px; /* Small extra breathing room around the line */
+}
+
+/* ── Summary mode label (independent from context) ────────────────── */
+
+.ymm-context-strip__summary-label {
+    font-size: 11px;
+    font-family: system-ui, -apple-system, sans-serif;
+    white-space: nowrap;
+    flex: 1; /* Push expand button to the right */
+    transition: color 0.2s ease;
+}
+
+/* Summary OFF: grey — no compression, raw files */
+.ymm-context-strip__summary-label--off {
+    color: #808080;
+}
+
+/* Summary ON: green — files compressed before sending */
+.ymm-context-strip__summary-label--on {
+    color: #6a9955;
+}
+
+/* Summary globally disabled */
+.ymm-context-strip__summary-label--disabled {
+    color: #555555;
 }
 
 /* ── Expand/collapse toggle ──────────────────────────────────────── */
