@@ -75,6 +75,8 @@ class SummaryCache(private val project: Project) {
      */
     data class Entry(
         val path: String,
+        /** Identifies a sub-file element (class or method). Null = file-level entry. */
+        val elementSignature: String? = null,
         val languageId: String?,
         val state: SummaryState = SummaryState.MISSING,
         val summaryVersion: Int = 1,
@@ -596,6 +598,233 @@ class SummaryCache(private val project: Project) {
         } catch (_: Throwable) {
             0
         }
+    }
+
+    // ==================== Element-Level Cache API ====================
+    //
+    // These methods support sub-file granularity (individual methods, classes).
+    // Keys use the format "path::elementSignature" to distinguish from
+    // file-level entries which use just the path.
+
+    /**
+     * Build the map key for an element-level entry.
+     * Uses "::" as separator — safe because it doesn't appear in file paths or FQNs.
+     */
+    private fun elementKey(path: String, elementSignature: String): String = "$path::$elementSignature"
+
+    /**
+     * Get cached synopsis for a specific element within a file.
+     *
+     * Checks state — returns null if MISSING or GENERATING.
+     * Returns (synopsis, isStale) where isStale is true if INVALIDATED
+     * or if the hash has changed.
+     *
+     * @param path Absolute file path
+     * @param elementSignature The element's unique signature (e.g., "com.foo.Bar#doThing(String,Int)")
+     * @param currentElementHash Current semantic hash of the element (for staleness check). Null = skip.
+     * @return Pair of (synopsis text or null, is stale flag)
+     */
+    fun getCachedElementSynopsis(
+        path: String,
+        elementSignature: String,
+        currentElementHash: String?
+    ): Pair<String?, Boolean> {
+        val key = elementKey(path, elementSignature)
+        val current = entries[key] ?: return null to false
+
+        return when (current.state) {
+            SummaryState.MISSING -> null to false
+            SummaryState.GENERATING -> null to false
+            SummaryState.READY -> {
+                val isStale = currentElementHash != null &&
+                        current.contentHashAtSummary != null &&
+                        current.contentHashAtSummary != currentElementHash
+                current.modelSynopsis to isStale
+            }
+            SummaryState.INVALIDATED -> {
+                // Stale summary — still return it, but flag as stale
+                current.modelSynopsis to true
+            }
+        }
+    }
+
+    /**
+     * Claim a specific element for generation (single-flight).
+     *
+     * Same semantics as [tryClaim] but for element-level entries.
+     *
+     * @return true if claim was acquired
+     */
+    fun tryClaimElement(
+        path: String,
+        elementSignature: String,
+        languageId: String?
+    ): Boolean {
+        val key = elementKey(path, elementSignature)
+        var claimed = false
+
+        entries.compute(key) { _, curr ->
+            val now = Instant.now()
+            when {
+                curr == null -> {
+                    claimed = true
+                    Entry(
+                        path = path,
+                        elementSignature = elementSignature,
+                        languageId = languageId,
+                        state = SummaryState.GENERATING,
+                        claimedAt = now
+                    )
+                }
+                curr.state == SummaryState.MISSING || curr.state == SummaryState.INVALIDATED -> {
+                    claimed = true
+                    curr.copy(
+                        state = SummaryState.GENERATING,
+                        claimedAt = now,
+                        dirtyDuringGeneration = false
+                    )
+                }
+                curr.state == SummaryState.GENERATING && isClaimExpired(curr) -> {
+                    inflightFutures.remove(key)?.complete(null)
+                    claimed = true
+                    curr.copy(claimedAt = now, dirtyDuringGeneration = false)
+                }
+                else -> curr
+            }
+        }
+
+        if (claimed) {
+            inflightFutures[key] = CompletableFuture()
+            Dev.info(log, "cache.element.claimed",
+                "path" to path,
+                "element" to elementSignature
+            )
+        }
+
+        return claimed
+    }
+
+    /**
+     * Complete a claim for a specific element.
+     *
+     * Transitions state to READY (or INVALIDATED if dirty during generation).
+     * Broadcasts the result to waiters.
+     *
+     * @return true if the claim was completed successfully
+     */
+    fun completeElementClaim(
+        path: String,
+        elementSignature: String,
+        languageId: String?,
+        synopsis: String,
+        contentHash: String?
+    ): Boolean {
+        val key = elementKey(path, elementSignature)
+        var completed = false
+
+        entries.compute(key) { _, curr ->
+            if (curr == null || curr.state != SummaryState.GENERATING) return@compute curr
+
+            completed = true
+            val finalState = if (curr.dirtyDuringGeneration) SummaryState.INVALIDATED else SummaryState.READY
+
+            Dev.info(log, "cache.element.completed",
+                "path" to path,
+                "element" to elementSignature,
+                "state" to finalState.name,
+                "synopsisLength" to synopsis.length,
+                "wasDirty" to curr.dirtyDuringGeneration
+            )
+
+            curr.copy(
+                state = finalState,
+                modelSynopsis = synopsis,
+                contentHashAtSummary = contentHash,
+                lastSummarizedAt = Instant.now(),
+                claimedAt = null,
+                dirtyDuringGeneration = false
+            )
+        }
+
+        // Broadcast to any waiters
+        inflightFutures.remove(key)?.complete(synopsis)
+        return completed
+    }
+
+    /**
+     * Invalidate specific elements within a file based on hash comparison.
+     *
+     * Called by the watcher when a file changes. For each element, compares
+     * the new hash against the stored hash. Only entries whose hash actually
+     * changed are invalidated.
+     *
+     * Elements not in [elementHashes] are left untouched.
+     *
+     * @param path Absolute file path
+     * @param elementHashes Map of elementSignature → newSemanticHash
+     */
+    fun onElementHashChanges(
+        path: String,
+        elementHashes: Map<String, String>
+    ) {
+        for ((signature, newHash) in elementHashes) {
+            val key = elementKey(path, signature)
+            entries.compute(key) { _, curr ->
+                if (curr == null) return@compute null
+
+                // Hash matches — element hasn't changed semantically
+                if (curr.contentHashAtSummary == newHash) return@compute curr
+
+                when (curr.state) {
+                    SummaryState.READY -> {
+                        Dev.info(log, "cache.element.stale",
+                            "path" to path,
+                            "element" to signature,
+                            "oldHash" to (curr.contentHashAtSummary?.take(8) ?: "NONE"),
+                            "newHash" to newHash.take(8)
+                        )
+                        curr.copy(state = SummaryState.INVALIDATED)
+                    }
+                    SummaryState.GENERATING -> {
+                        Dev.info(log, "cache.element.dirty_during_generation",
+                            "path" to path,
+                            "element" to signature
+                        )
+                        curr.copy(dirtyDuringGeneration = true)
+                    }
+                    else -> curr
+                }
+            }
+        }
+    }
+
+    /**
+     * Get all element entries for a file, optionally filtered by state.
+     *
+     * Scans all entries whose key starts with the file path followed by "::".
+     * Used by the pipeline to check what's valid before cascading.
+     *
+     * @param path Absolute file path
+     * @param stateFilter If provided, only return entries in these states. Null = all entries.
+     * @return Map of elementSignature → Entry
+     */
+    fun getElementEntries(
+        path: String,
+        stateFilter: Set<SummaryState>? = null
+    ): Map<String, Entry> {
+        val prefix = "$path::"
+        val result = mutableMapOf<String, Entry>()
+
+        for ((key, entry) in entries) {
+            if (key.startsWith(prefix)) {
+                if (stateFilter == null || entry.state in stateFilter) {
+                    val signature = key.removePrefix(prefix)
+                    result[signature] = entry
+                }
+            }
+        }
+
+        return result
     }
 
     companion object {

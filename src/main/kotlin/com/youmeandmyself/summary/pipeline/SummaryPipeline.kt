@@ -7,6 +7,8 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.youmeandmyself.dev.Dev
+import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VirtualFile
 import com.youmeandmyself.summary.cache.SummaryCache
 import com.youmeandmyself.summary.cache.SummaryState
 import com.youmeandmyself.summary.config.ConfigChangeListener
@@ -16,6 +18,12 @@ import com.youmeandmyself.summary.config.SummaryMode
 import com.youmeandmyself.summary.config.SummaryQueue
 import com.youmeandmyself.summary.config.SummaryRequest
 import com.youmeandmyself.summary.config.SummaryTrigger
+import com.youmeandmyself.summary.model.CodeElement
+import com.youmeandmyself.summary.model.CodeElementKind
+import com.youmeandmyself.summary.structure.CodeStructureProvider
+import com.youmeandmyself.summary.structure.CodeStructureProviderFactory
+import com.youmeandmyself.summary.structure.DetectionScope
+import com.youmeandmyself.summary.structure.ElementLevel
 import com.youmeandmyself.storage.model.ExchangePurpose
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -111,6 +119,11 @@ class SummaryPipeline(private val project: Project) : Disposable {
     /** Lazy reference to summarization service — the single execution point. */
     private val summarizationService: SummarizationService by lazy {
         SummarizationService.getInstance(project)
+    }
+
+    /** Lazy reference to structure provider factory — for PSI-based code detection. */
+    private val structureFactory: CodeStructureProviderFactory by lazy {
+        CodeStructureProviderFactory.getInstance(project)
     }
 
     init {
@@ -474,15 +487,39 @@ class SummaryPipeline(private val project: Project) : Disposable {
                 return
             }
 
+            // --- Resolve VirtualFile for PSI-based detection ---
+            val virtualFile = LocalFileSystem.getInstance().findFileByPath(path)
+
+            // --- Get the structure provider (null = PSI unavailable) ---
+            val structureProvider = structureFactory.get()
+
             // --- Attempt hierarchical generation ---
-            // Try to detect code elements and build bottom-up.
-            // Falls back to direct file summarization if detection yields nothing.
-            val hierarchicalResult = tryHierarchicalGeneration(
-                path = path,
-                languageId = languageId,
-                sourceText = sourceText,
-                provider = provider
-            )
+            // Try to detect code elements via PSI and build bottom-up.
+            // Falls back to direct file summarization if:
+            // - PSI is unavailable (dumb mode, unsupported language)
+            // - VirtualFile not found
+            // - No code elements detected (e.g., config file, script without classes)
+            val hierarchicalResult = if (structureProvider != null && virtualFile != null) {
+                tryHierarchicalGeneration(
+                    path = path,
+                    file = virtualFile,
+                    languageId = languageId,
+                    structureProvider = structureProvider,
+                    aiProvider = provider
+                )
+            } else {
+                Dev.info(log, "pipeline.psi_unavailable",
+                    "path" to path,
+                    "hasProvider" to (structureProvider != null),
+                    "hasVirtualFile" to (virtualFile != null),
+                    "reason" to when {
+                        structureProvider == null -> "PSI unavailable (dumb mode or unsupported language)"
+                        virtualFile == null -> "VirtualFile not found"
+                        else -> "unknown"
+                    }
+                )
+                null
+            }
 
             val (promptTemplate, effectiveContent, purpose) = if (hierarchicalResult != null) {
                 // Hierarchical path: we have class contracts, use FILE_TEMPLATE
@@ -490,19 +527,30 @@ class SummaryPipeline(private val project: Project) : Disposable {
                     "path" to path,
                     "classContracts" to hierarchicalResult.childContracts.size
                 )
-                val structuralContext = StructuralContextExtractor.forFile(sourceText, languageId)
+                // Extract file-level structural context via PSI
+                // We need a file-level CodeElement for this — create a lightweight one
+                val fileContext = if (structureProvider != null && virtualFile != null) {
+                    // Detect at file level for structural context
+                    val fileElements = structureProvider.detectElements(virtualFile, DetectionScope.ClassesOnly)
+                    if (fileElements.isNotEmpty()) {
+                        // Use the first element's file range for context extraction
+                        structureProvider.extractStructuralContext(virtualFile, fileElements.first(), ElementLevel.FILE)
+                    } else ""
+                } else ""
+
                 val prompt = SummaryExtractor.buildHierarchicalPrompt(
                     purpose = ExchangePurpose.FILE_SUMMARY,
                     languageId = languageId,
                     childSummaries = hierarchicalResult.childContracts,
-                    structuralContext = structuralContext
+                    structuralContext = fileContext
                 )
                 Triple(prompt, "", ExchangePurpose.FILE_SUMMARY)
             } else {
                 // Fallback: direct file summarization from source (original behavior)
+                // This path is taken when PSI is unavailable or no classes detected.
                 Dev.info(log, "pipeline.direct_path",
                     "path" to path,
-                    "reason" to "no code elements detected or hierarchical generation failed"
+                    "reason" to "PSI unavailable or no code elements detected"
                 )
                 val directTemplate = """
                     |Summarize this ${languageId ?: "code"} code concisely in plain text.
@@ -603,13 +651,55 @@ class SummaryPipeline(private val project: Project) : Disposable {
         }
     }
 
+    // ==================== Validation Rule: Every Level, Every Time ====================
+
+    /**
+     * Returns a cached summary ONLY if it is valid (READY and hash matches).
+     * Returns null if missing, invalidated, or stale.
+     *
+     * This is the single point where validation happens. Every level of the
+     * cascade calls this before using a cached summary. No summary is ever
+     * used without passing through this check.
+     *
+     * @param filePath Absolute file path
+     * @param element The code element to check
+     * @param structureProvider PSI provider for computing the current semantic hash
+     * @param file VirtualFile for hash computation
+     * @return The cached synopsis if valid, or null if it needs regeneration
+     */
+    private fun getValidSummary(
+        filePath: String,
+        element: CodeElement,
+        structureProvider: CodeStructureProvider,
+        file: VirtualFile
+    ): String? {
+        val currentHash = structureProvider.computeElementHash(file, element)
+        val (synopsis, isStale) = cache.getCachedElementSynopsis(filePath, element.signature, currentHash)
+
+        return if (synopsis != null && !isStale) {
+            Dev.info(log, "pipeline.validation.valid",
+                "element" to element.signature,
+                "action" to "reuse"
+            )
+            synopsis
+        } else {
+            Dev.info(log, "pipeline.validation.invalid",
+                "element" to element.signature,
+                "hasSynopsis" to (synopsis != null),
+                "isStale" to isStale,
+                "action" to "regenerate"
+            )
+            null
+        }
+    }
+
     // ==================== Hierarchical Generation ====================
 
     /**
-     * Attempt hierarchical generation for a file summary.
+     * Attempt hierarchical generation for a file summary using PSI-based detection.
      *
-     * Detects classes and methods in the source code, generates method and class
-     * summaries bottom-up, and returns the class contracts for file-level consumption.
+     * Detects classes and methods via PSI, generates method and class summaries
+     * bottom-up, and returns the class contracts for file-level consumption.
      *
      * Returns null if:
      * - No code elements detected (e.g., config file, script without classes)
@@ -618,39 +708,46 @@ class SummaryPipeline(private val project: Project) : Disposable {
      *
      * The caller falls back to direct source-code summarization on null.
      *
-     * @param path File path (for cache key construction)
+     * @param path File path (for cache key construction and logging)
+     * @param file VirtualFile for PSI detection
      * @param languageId Programming language
-     * @param sourceText Full file source code
-     * @param provider AI provider for generation
+     * @param structureProvider PSI-based structure provider (non-null, already checked by caller)
+     * @param aiProvider AI provider for generation
      * @return Hierarchical result with class contracts, or null to fall back
      */
     private suspend fun tryHierarchicalGeneration(
         path: String,
+        file: VirtualFile,
         languageId: String?,
-        sourceText: String,
-        provider: com.youmeandmyself.ai.providers.AiProvider
+        structureProvider: CodeStructureProvider,
+        aiProvider: com.youmeandmyself.ai.providers.AiProvider
     ): HierarchicalResult? {
-        // Detect classes in the file
-        val classes = CodeElementDetector.detectClasses(sourceText, languageId)
-        if (classes.isEmpty()) {
-            Dev.info(log, "pipeline.hierarchical.no_classes", "path" to path)
+        // Detect classes in the file via PSI
+        val classElements = structureProvider.detectElements(file, DetectionScope.ClassesOnly)
+        if (classElements.isEmpty()) {
+            Dev.info(log, "pipeline.hierarchical.no_classes",
+                "path" to path,
+                "reason" to "PSI detected no classes in file"
+            )
             return null
         }
 
         Dev.info(log, "pipeline.hierarchical.classes_found",
             "path" to path,
-            "count" to classes.size,
-            "names" to classes.map { it.name }.joinToString(", ")
+            "count" to classElements.size,
+            "names" to classElements.map { it.name }.joinToString(", ")
         )
 
         val classContracts = mutableListOf<String>()
 
-        for (classElement in classes) {
+        for (classElement in classElements) {
             val classContract = generateClassSummaryIfNeeded(
                 filePath = path,
+                file = file,
                 classElement = classElement,
                 languageId = languageId,
-                provider = provider
+                structureProvider = structureProvider,
+                aiProvider = aiProvider
             )
             if (classContract != null) {
                 classContracts.add(classContract)
@@ -659,7 +756,8 @@ class SummaryPipeline(private val project: Project) : Disposable {
                 classContracts.add("${classElement.name}: (summary generation failed — see source)")
                 Dev.warn(log, "pipeline.hierarchical.class_failed", null,
                     "path" to path,
-                    "class" to classElement.name
+                    "class" to classElement.name,
+                    "signature" to classElement.signature
                 )
             }
         }
@@ -674,32 +772,46 @@ class SummaryPipeline(private val project: Project) : Disposable {
     /**
      * Generate a class summary from its method contracts, if not already cached.
      *
+     * Uses PSI to detect methods within the class, generates method summaries
+     * bottom-up, then builds the class summary from method contracts.
+     *
+     * @param filePath File path for cache key construction
+     * @param file VirtualFile for PSI detection
+     * @param classElement The class element detected by PSI
+     * @param languageId Programming language
+     * @param structureProvider PSI-based structure provider
+     * @param aiProvider AI provider for generation
      * @return The class contract string for file-level consumption, or null on failure
      */
     private suspend fun generateClassSummaryIfNeeded(
         filePath: String,
+        file: VirtualFile,
         classElement: CodeElement,
         languageId: String?,
-        provider: com.youmeandmyself.ai.providers.AiProvider
+        structureProvider: CodeStructureProvider,
+        aiProvider: com.youmeandmyself.ai.providers.AiProvider
     ): String? {
-        val classKey = "$filePath#${classElement.name}"
-
-        // Check cache for existing class summary
-        val (cached, _) = cache.getCachedSynopsis(classKey, null)
-        if (cached != null) {
-            // Try to extract contract from cached summary
-            val contract = SummaryExtractor.extractContract(cached)
+        // Validation rule: check if a VALID (non-stale, non-invalidated) class summary exists.
+        // This is the "every level, every time" check.
+        val validClassSummary = getValidSummary(filePath, classElement, structureProvider, file)
+        if (validClassSummary != null) {
+            val contract = SummaryExtractor.extractContract(validClassSummary)
             if (contract != null) return contract
-            // If no contract marker in cached version, use the whole summary as contract
-            return "${classElement.name}: $cached"
+            return "${classElement.name}: $validClassSummary"
         }
 
-        // Detect methods in this class
-        val methods = CodeElementDetector.detectMethods(classElement.body, languageId)
+        // No valid class summary — need to generate from method summaries.
+        // But first, ensure all method summaries are valid too (cascade down).
+        val classKey = "$filePath#${classElement.signature}"
+
+        // Detect methods in this class via PSI
+        val methods = structureProvider.detectElements(file, DetectionScope.MethodsOf(classElement.name))
+            .filter { it.kind in setOf(CodeElementKind.METHOD, CodeElementKind.FUNCTION) }
 
         Dev.info(log, "pipeline.hierarchical.methods_found",
             "class" to classElement.name,
-            "count" to methods.size
+            "count" to methods.size,
+            "methods" to methods.map { it.name }.joinToString(", ")
         )
 
         // Generate method summaries bottom-up
@@ -707,18 +819,22 @@ class SummaryPipeline(private val project: Project) : Disposable {
         for (method in methods) {
             val methodContract = generateMethodSummaryIfNeeded(
                 filePath = filePath,
+                file = file,
                 className = classElement.name,
                 methodElement = method,
                 languageId = languageId,
-                provider = provider
+                structureProvider = structureProvider,
+                aiProvider = aiProvider
             )
             if (methodContract != null) {
                 methodContracts.add(methodContract)
             }
         }
 
-        // Build class summary from method contracts
-        val structuralContext = StructuralContextExtractor.forClass(classElement.body, languageId)
+        // Build class summary from method contracts using PSI structural context
+        val structuralContext = structureProvider.extractStructuralContext(
+            file, classElement, ElementLevel.CLASS
+        )
         val prompt = SummaryExtractor.buildHierarchicalPrompt(
             purpose = ExchangePurpose.CLASS_SUMMARY,
             languageId = languageId,
@@ -727,13 +843,14 @@ class SummaryPipeline(private val project: Project) : Disposable {
         )
 
         val result = summarizationService.summarize(
-            provider = provider,
+            provider = aiProvider,
             content = if (methodContracts.isEmpty()) classElement.body else "",
             promptTemplate = prompt,
             purpose = ExchangePurpose.CLASS_SUMMARY,
             metadata = mapOf(
                 "filePath" to filePath,
                 "className" to classElement.name,
+                "signature" to classElement.signature,
                 "languageId" to (languageId ?: "unknown"),
                 "methodCount" to methods.size.toString()
             )
@@ -743,46 +860,73 @@ class SummaryPipeline(private val project: Project) : Disposable {
             val cleanSummary = SummaryExtractor.extractSummaryOnly(result.summaryText)
             val contract = SummaryExtractor.extractContract(result.summaryText)
 
-            // Cache the class summary
-            cache.completeClaim(
-                path = classKey,
+            // Cache the class summary at element level
+            val classHash = structureProvider.computeElementHash(file, classElement)
+            cache.completeElementClaim(
+                path = filePath,
+                elementSignature = classElement.signature,
                 languageId = languageId,
                 synopsis = cleanSummary,
-                contentHash = null
+                contentHash = classHash
+            )
+
+            Dev.info(log, "pipeline.hierarchical.class_summary_generated",
+                "class" to classElement.name,
+                "signature" to classElement.signature,
+                "summaryLength" to cleanSummary.length,
+                "hasContract" to (contract != null)
             )
 
             return contract ?: "${classElement.name}: $cleanSummary"
         }
 
+        Dev.warn(log, "pipeline.hierarchical.class_generation_failed", null,
+            "class" to classElement.name,
+            "signature" to classElement.signature,
+            "error" to (result.errorMessage ?: "empty summary")
+        )
         return null
     }
 
     /**
      * Generate a method summary from source code, if not already cached.
      *
-     * Methods are leaf nodes — generated directly from source + structural context.
+     * Methods are leaf nodes — generated directly from source + PSI structural context.
      *
+     * @param filePath File path for cache key construction
+     * @param file VirtualFile for PSI structural context extraction
+     * @param className Name of the containing class
+     * @param methodElement The method element detected by PSI
+     * @param languageId Programming language
+     * @param structureProvider PSI-based structure provider
+     * @param aiProvider AI provider for generation
      * @return The method contract string for class-level consumption, or null on failure
      */
     private suspend fun generateMethodSummaryIfNeeded(
         filePath: String,
+        file: VirtualFile,
         className: String,
         methodElement: CodeElement,
         languageId: String?,
-        provider: com.youmeandmyself.ai.providers.AiProvider
+        structureProvider: CodeStructureProvider,
+        aiProvider: com.youmeandmyself.ai.providers.AiProvider
     ): String? {
-        val methodKey = "$filePath#$className#${methodElement.name}"
-
-        // Check cache for existing method summary
-        val (cached, _) = cache.getCachedSynopsis(methodKey, null)
-        if (cached != null) {
-            val contract = SummaryExtractor.extractContract(cached)
+        // Validation rule: check if a VALID (non-stale, non-invalidated) summary exists.
+        // This is the "every level, every time" check.
+        val validSummary = getValidSummary(filePath, methodElement, structureProvider, file)
+        if (validSummary != null) {
+            val contract = SummaryExtractor.extractContract(validSummary)
             if (contract != null) return contract
-            return "${methodElement.name}: $cached"
+            return "${methodElement.name}: $validSummary"
         }
 
-        // Generate from source code (leaf node)
-        val structuralContext = StructuralContextExtractor.forMethod(methodElement.body, languageId)
+        // No valid summary — need to generate
+        val methodKey = "$filePath#${methodElement.signature}"
+
+        // Generate from source code (leaf node) with PSI structural context
+        val structuralContext = structureProvider.extractStructuralContext(
+            file, methodElement, ElementLevel.METHOD
+        )
         val prompt = SummaryExtractor.buildHierarchicalPrompt(
             purpose = ExchangePurpose.METHOD_SUMMARY,
             languageId = languageId,
@@ -791,7 +935,7 @@ class SummaryPipeline(private val project: Project) : Disposable {
         )
 
         val result = summarizationService.summarize(
-            provider = provider,
+            provider = aiProvider,
             content = "",  // prompt already contains source text
             promptTemplate = prompt,
             purpose = ExchangePurpose.METHOD_SUMMARY,
@@ -799,6 +943,7 @@ class SummaryPipeline(private val project: Project) : Disposable {
                 "filePath" to filePath,
                 "className" to className,
                 "methodName" to methodElement.name,
+                "signature" to methodElement.signature,
                 "languageId" to (languageId ?: "unknown")
             )
         )
@@ -807,17 +952,31 @@ class SummaryPipeline(private val project: Project) : Disposable {
             val cleanSummary = SummaryExtractor.extractSummaryOnly(result.summaryText)
             val contract = SummaryExtractor.extractContract(result.summaryText)
 
-            // Cache the method summary
-            cache.completeClaim(
-                path = methodKey,
+            // Cache the method summary at element level
+            val methodHash = structureProvider.computeElementHash(file, methodElement)
+            cache.completeElementClaim(
+                path = filePath,
+                elementSignature = methodElement.signature,
                 languageId = languageId,
                 synopsis = cleanSummary,
-                contentHash = null
+                contentHash = methodHash
+            )
+
+            Dev.info(log, "pipeline.hierarchical.method_summary_generated",
+                "method" to methodElement.name,
+                "signature" to methodElement.signature,
+                "summaryLength" to cleanSummary.length,
+                "hasContract" to (contract != null)
             )
 
             return contract ?: "${methodElement.name}: $cleanSummary"
         }
 
+        Dev.warn(log, "pipeline.hierarchical.method_generation_failed", null,
+            "method" to methodElement.name,
+            "signature" to methodElement.signature,
+            "error" to (result.errorMessage ?: "empty summary")
+        )
         return null
     }
 
@@ -995,267 +1154,7 @@ data class HierarchicalResult(
     val childContracts: List<String>
 )
 
-/**
- * A detected code element (class, method, function, interface, object).
- *
- * Used by [CodeElementDetector] to represent structural code elements
- * found via regex heuristics. These are NOT full PSI nodes — they're
- * pragmatic approximations good enough for hierarchical summarization.
- *
- * @property name Element name (e.g., "SummaryPipeline", "executeSummarization")
- * @property body The source code of this element (including signature and body)
- * @property kind What kind of element this is (class, method, interface, etc.)
- */
-data class CodeElement(
-    val name: String,
-    val body: String,
-    val kind: CodeElementKind
-)
-
-enum class CodeElementKind {
-    CLASS, INTERFACE, OBJECT, ENUM, METHOD, FUNCTION
-}
-
-/**
- * Regex-based code element detector.
- *
- * Detects classes, interfaces, objects, and methods in source code using
- * regex heuristics. This is intentionally pragmatic — not a full parser.
- *
- * ## Why Regex Instead of PSI?
- *
- * - PSI requires read actions and can be slow for large files
- * - PSI isn't available in all contexts (dumb mode, background threads)
- * - The LLM understands code well even without perfect structural boundaries
- * - Regex is fast, predictable, and good enough for launch
- *
- * ## Limitations
- *
- * - Brace matching is approximate (counts nesting depth, doesn't handle strings)
- * - Nested classes may not be perfectly bounded
- * - Unusual code formatting may cause missed or mis-bounded elements
- *
- * These limitations are acceptable because:
- * 1. The LLM can handle imperfect boundaries (it reads code, not just contracts)
- * 2. The fallback path (direct file summarization) always works
- * 3. PSI integration can replace this incrementally
- */
-object CodeElementDetector {
-
-    private val log = Logger.getInstance(CodeElementDetector::class.java)
-
-    // ==================== Class Detection ====================
-
-    /**
-     * Detect top-level classes, interfaces, objects, and enums in source code.
-     *
-     * @param source Full file source code
-     * @param languageId Programming language
-     * @return List of detected class-level elements with their bodies
-     */
-    fun detectClasses(source: String, languageId: String?): List<CodeElement> {
-        val lang = normalizeLanguage(languageId)
-        return when (lang) {
-            LangFamily.JVM -> detectJvmClasses(source)
-            LangFamily.JS_TS -> detectJsTsClasses(source)
-            LangFamily.OTHER -> emptyList()
-        }
-    }
-
-    /**
-     * Detect methods/functions within a class body.
-     *
-     * @param classBody The source code of the class (including declaration)
-     * @param languageId Programming language
-     * @return List of detected method elements with their bodies
-     */
-    fun detectMethods(classBody: String, languageId: String?): List<CodeElement> {
-        val lang = normalizeLanguage(languageId)
-        return when (lang) {
-            LangFamily.JVM -> detectJvmMethods(classBody)
-            LangFamily.JS_TS -> detectJsTsMethods(classBody)
-            LangFamily.OTHER -> emptyList()
-        }
-    }
-
-    // ==================== JVM (Kotlin/Java) ====================
-
-    private fun detectJvmClasses(source: String): List<CodeElement> {
-        // Match class/interface/object/enum declarations
-        // Pattern: optional modifiers + (class|interface|object|enum class) + name + optional generics + optional supers + {
-        val pattern = Regex(
-            """(?:^|\n)\s*(?:(?:public|private|protected|internal|open|abstract|sealed|data|inner|value|annotation)\s+)*(?:(enum\s+class|class|interface|object))\s+(\w+)""",
-            RegexOption.MULTILINE
-        )
-
-        val elements = mutableListOf<CodeElement>()
-        for (match in pattern.findAll(source)) {
-            val kind = when (match.groupValues[1]) {
-                "class" -> CodeElementKind.CLASS
-                "interface" -> CodeElementKind.INTERFACE
-                "object" -> CodeElementKind.OBJECT
-                "enum class" -> CodeElementKind.ENUM
-                else -> CodeElementKind.CLASS
-            }
-            val name = match.groupValues[2]
-            val body = extractBraceBlock(source, match.range.first)
-
-            if (body != null && body.length > 10) { // skip trivially empty
-                elements.add(CodeElement(name = name, body = body, kind = kind))
-            }
-        }
-
-        Dev.info(log, "detect.jvm_classes",
-            "count" to elements.size,
-            "names" to elements.map { it.name }.joinToString(", ")
-        )
-
-        return elements
-    }
-
-    private fun detectJvmMethods(classBody: String): List<CodeElement> {
-        // Match fun/method declarations
-        // Kotlin: fun name(...)
-        // Java: returnType name(...)
-        // We focus on Kotlin `fun` keyword as primary, with Java method pattern as secondary
-        val kotlinPattern = Regex(
-            """(?:^|\n)\s*(?:(?:public|private|protected|internal|override|open|abstract|suspend|inline|tailrec|operator)\s+)*fun\s+(?:\w+\.)?(\w+)\s*\(""",
-            RegexOption.MULTILINE
-        )
-
-        val elements = mutableListOf<CodeElement>()
-        for (match in kotlinPattern.findAll(classBody)) {
-            val name = match.groupValues[1]
-            val body = extractBraceBlock(classBody, match.range.first)
-                ?: extractExpressionBody(classBody, match.range.first)
-
-            if (body != null && body.length > 5) {
-                elements.add(CodeElement(name = name, body = body, kind = CodeElementKind.METHOD))
-            }
-        }
-
-        return elements
-    }
-
-    // ==================== JS/TS ====================
-
-    private fun detectJsTsClasses(source: String): List<CodeElement> {
-        val pattern = Regex(
-            """(?:^|\n)\s*(?:export\s+)?(?:abstract\s+)?class\s+(\w+)""",
-            RegexOption.MULTILINE
-        )
-
-        val elements = mutableListOf<CodeElement>()
-        for (match in pattern.findAll(source)) {
-            val name = match.groupValues[1]
-            val body = extractBraceBlock(source, match.range.first)
-            if (body != null && body.length > 10) {
-                elements.add(CodeElement(name = name, body = body, kind = CodeElementKind.CLASS))
-            }
-        }
-
-        return elements
-    }
-
-    private fun detectJsTsMethods(classBody: String): List<CodeElement> {
-        // Detect methods in JS/TS classes:
-        // - methodName(...) {
-        // - async methodName(...) {
-        // - static methodName(...) {
-        // - get/set propertyName() {
-        val pattern = Regex(
-            """(?:^|\n)\s*(?:(?:public|private|protected|static|async|get|set)\s+)*(\w+)\s*\([^)]*\)\s*(?::\s*\S+\s*)?\{""",
-            RegexOption.MULTILINE
-        )
-
-        val elements = mutableListOf<CodeElement>()
-        for (match in pattern.findAll(classBody)) {
-            val name = match.groupValues[1]
-            if (name in setOf("if", "for", "while", "switch", "catch")) continue // skip control flow
-            val body = extractBraceBlock(classBody, match.range.first)
-            if (body != null && body.length > 5) {
-                elements.add(CodeElement(name = name, body = body, kind = CodeElementKind.METHOD))
-            }
-        }
-
-        return elements
-    }
-
-    // ==================== Brace Matching ====================
-
-    /**
-     * Extract a brace-delimited block starting from the first `{` after startIndex.
-     *
-     * Uses brace counting (nesting depth) to find the matching `}`.
-     * This is approximate — doesn't handle braces inside strings or comments perfectly.
-     * Good enough for the LLM to work with.
-     *
-     * @param source Full source code
-     * @param startIndex Position to start searching for the opening `{`
-     * @return The text from startIndex through the matching `}`, or null if not found
-     */
-    private fun extractBraceBlock(source: String, startIndex: Int): String? {
-        val openIndex = source.indexOf('{', startIndex)
-        if (openIndex == -1 || openIndex > startIndex + 500) return null // opening brace too far away
-
-        var depth = 0
-        var i = openIndex
-        while (i < source.length) {
-            when (source[i]) {
-                '{' -> depth++
-                '}' -> {
-                    depth--
-                    if (depth == 0) {
-                        return source.substring(startIndex, i + 1)
-                    }
-                }
-            }
-            i++
-        }
-
-        // Unmatched braces — return what we have (truncated)
-        Dev.info(log, "detect.brace_unmatched",
-            "startIndex" to startIndex,
-            "sourceLength" to source.length
-        )
-        return null
-    }
-
-    /**
-     * Extract a Kotlin expression body (= ...) for single-expression functions.
-     *
-     * Handles: fun name() = someExpression
-     * Takes from startIndex to the next newline that isn't a continuation.
-     */
-    private fun extractExpressionBody(source: String, startIndex: Int): String? {
-        val equalsIndex = source.indexOf('=', startIndex)
-        if (equalsIndex == -1 || equalsIndex > startIndex + 500) return null
-
-        // Check it's not == or =>
-        if (equalsIndex + 1 < source.length && source[equalsIndex + 1] in setOf('=', '>')) return null
-
-        // Take until double newline or next fun/class declaration
-        val afterEquals = source.substring(startIndex)
-        val endPattern = Regex("""\n\s*\n|\n\s*(?:fun|class|interface|object|val|var)\s""")
-        val endMatch = endPattern.find(afterEquals)
-        return if (endMatch != null) {
-            afterEquals.substring(0, endMatch.range.first).trim()
-        } else {
-            afterEquals.take(2000).trim() // safety cap
-        }
-    }
-
-    // ==================== Helpers ====================
-
-    private enum class LangFamily { JVM, JS_TS, OTHER }
-
-    private fun normalizeLanguage(languageId: String?): LangFamily {
-        if (languageId == null) return LangFamily.OTHER
-        val id = languageId.lowercase()
-        return when {
-            id.contains("kotlin") || id == "kt" || id.contains("java") && !id.contains("javascript") -> LangFamily.JVM
-            id.contains("javascript") || id.contains("typescript") || id in setOf("js", "ts", "jsx", "tsx") -> LangFamily.JS_TS
-            else -> LangFamily.OTHER
-        }
-    }
-}
+// CodeElement and CodeElementKind have been moved to com.youmeandmyself.summary.model
+// CodeElementDetector (regex-based) has been replaced by PsiCodeStructureProvider
+// See: summary/structure/PsiCodeStructureProvider.kt
+// See: summary/model/CodeElement.kt

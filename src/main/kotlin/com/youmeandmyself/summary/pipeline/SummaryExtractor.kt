@@ -338,7 +338,7 @@ object SummaryExtractor {
      * @param sourceText Raw source code (used for METHOD_SUMMARY leaf nodes)
      * @param childSummaries Contracts from child-level summaries (used for CLASS and above).
      *                       Each string is a contract line from a child element.
-     * @param structuralContext Structural info from [StructuralContextExtractor]
+     * @param structuralContext Structural info from [CodeStructureProvider.extractStructuralContext]
      *                          (annotations, types, visibility, etc.)
      * @param customTemplate Optional user-provided template override. If provided, takes
      *                       precedence over the built-in template for this purpose.

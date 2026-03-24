@@ -96,11 +96,12 @@
         <!-- Runs on project open: initializes storage, rebuilds SQLite from JSONL if needed -->
         <postStartupActivity implementation="com.youmeandmyself.storage.StorageInitializer"/>
 
-        <!-- Summarization: config, cache, pipeline, file-change watcher -->
+        <!-- Summarization: config, cache, pipeline, file-change watcher, structure detection -->
         <projectService serviceImplementation="com.youmeandmyself.summary.config.SummaryConfigService"/>
         <projectService serviceImplementation="com.youmeandmyself.summary.cache.SummaryCache"/>
         <projectService serviceImplementation="com.youmeandmyself.summary.pipeline.SummaryPipeline"/>
         <projectService serviceImplementation="com.youmeandmyself.summary.watcher.VfsSummaryWatcher"/>
+        <projectService serviceImplementation="com.youmeandmyself.summary.structure.CodeStructureProviderFactory"/>
 
         <!-- Library: full-text search and bookmark/collection management -->
         <projectService serviceImplementation="com.youmeandmyself.storage.search.SearchService"/>
@@ -118,12 +119,6 @@
         <!-- Stores metrics user preferences (showMetricsBar, etc.).
              Persisted to ymmMetricsSettings.xml in the project config dir. -->
         <projectService serviceImplementation="com.youmeandmyself.ai.settings.MetricsSettingsState"/>
-
-        <!-- ── TabSettingsState — project-level persistent state ────────── -->
-        <!-- Stores tab preferences (keepTabs, maxTabs).
-             Persisted to ymmTabSettings.xml in the project config dir.
-             Read by TabStateService and GeneralConfigurable. -->
-        <projectService serviceImplementation="com.youmeandmyself.ai.settings.TabSettingsState"/>
 
         <!-- ── MetricsConfigurable — settings UI page ─────────────────────── -->
         <!-- Settings → Tools → YMM Assistant → Metrics

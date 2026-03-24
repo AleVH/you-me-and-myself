@@ -16,6 +16,8 @@ import com.youmeandmyself.summary.config.SummaryConfigService
 import com.youmeandmyself.summary.config.SummaryMode
 import com.youmeandmyself.summary.cache.SummaryCache
 import com.youmeandmyself.summary.pipeline.SummaryPipeline
+import com.youmeandmyself.summary.structure.CodeStructureProviderFactory
+import com.youmeandmyself.summary.structure.DetectionScope
 import com.youmeandmyself.dev.Dev
 import java.io.InputStream
 import java.security.MessageDigest
@@ -60,6 +62,11 @@ class VfsSummaryWatcher(
     /** Lazy reference to config service. */
     private val configService: SummaryConfigService by lazy {
         SummaryConfigService.getInstance(project)
+    }
+
+    /** Lazy reference to structure provider factory — for element-level hash comparison. */
+    private val structureFactory: CodeStructureProviderFactory by lazy {
+        CodeStructureProviderFactory.getInstance(project)
     }
 
     private val connection: MessageBusConnection = project.messageBus.connect()
@@ -113,10 +120,16 @@ class VfsSummaryWatcher(
 
     private fun onContentChanged(vf: VirtualFile) {
         if (!isProcessable(vf)) return
-        val (hash, _) = computeHashAndLang(vf) ?: return
+        val (hash, languageId) = computeHashAndLang(vf) ?: return
 
-        // Always track hash changes
+        // Always track file-level hash changes (cheap, no PSI needed)
         pipeline.onFileChanged(vf.path, hash)
+
+        // Attempt element-level invalidation via PSI
+        // If PSI is unavailable (dumb mode, unsupported language), we skip this.
+        // The file-level hash change is still recorded above, so staleness is
+        // detected on next access via the validation rule.
+        performElementLevelInvalidation(vf, languageId)
     }
 
     private fun onMovedOrRenamed(vf: VirtualFile) {
@@ -130,6 +143,65 @@ class VfsSummaryWatcher(
     private fun onDeleted(path: String) {
         // Always handle deletions — cache cleanup is free
         pipeline.onFileDeleted(path)
+    }
+
+    // -------- Element-Level Invalidation --------
+
+    /**
+     * Compute element-level semantic hashes and update the cache.
+     *
+     * Uses PSI to detect all elements in the file and compute their
+     * semantic fingerprints. Only elements whose fingerprint has changed
+     * are invalidated in the cache — others remain READY.
+     *
+     * If PSI is unavailable (dumb mode, unsupported language), this is a no-op.
+     * The file-level hash change is still tracked by the caller, so staleness
+     * is caught on next access via the validation rule (every level, every time).
+     */
+    private fun performElementLevelInvalidation(vf: VirtualFile, languageId: String?) {
+        try {
+            val provider = structureFactory.get()
+            if (provider == null) {
+                // PSI unavailable — skip element-level invalidation.
+                // File-level hash change was already recorded.
+                Dev.info(log, "vfs.element_invalidation.skipped",
+                    "path" to vf.path,
+                    "reason" to "PSI unavailable (dumb mode or unsupported language)"
+                )
+                return
+            }
+
+            // Detect all elements in the file
+            val elements = provider.detectElements(vf, DetectionScope.All)
+            if (elements.isEmpty()) {
+                Dev.info(log, "vfs.element_invalidation.no_elements",
+                    "path" to vf.path
+                )
+                return
+            }
+
+            // Compute semantic hash for each element
+            val elementHashes = mutableMapOf<String, String>()
+            for (element in elements) {
+                val hash = provider.computeElementHash(vf, element)
+                elementHashes[element.signature] = hash
+            }
+
+            // Update the cache — only entries whose hash differs are invalidated
+            cache.onElementHashChanges(vf.path, elementHashes)
+
+            Dev.info(log, "vfs.element_invalidation.completed",
+                "path" to vf.path,
+                "elementsChecked" to elementHashes.size
+            )
+        } catch (e: Throwable) {
+            // Element-level invalidation is an optimisation, not a requirement.
+            // If it fails, the file-level hash change still ensures staleness
+            // is detected on next access.
+            Dev.warn(log, "vfs.element_invalidation.error", e,
+                "path" to vf.path
+            )
+        }
     }
 
     // -------- Helpers (unchanged from original) --------

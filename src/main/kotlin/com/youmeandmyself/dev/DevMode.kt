@@ -57,7 +57,9 @@ object DevMode {
         "/dev-summary-status" to "Show summary system status (mode, budget, queue)",
         "/dev-summary-stop" to "Cancel all queued summaries and disable summarization",
         "/dev-git-test" to "Test git branch detection step by step",
-        "/dev-context-test" to "Test full IDE context capture (file, tabs, language, module, branch)"
+        "/dev-context-test" to "Test full IDE context capture (file, tabs, language, module, branch)",
+        "/dev-structure-inspect" to "Inspect current file with PSI detection (classes, methods, hashes, context, cache state)",
+        "/dev-structure-inspect ClassName" to "Inspect a specific class and its methods"
     )
 
     /**

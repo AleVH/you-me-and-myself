@@ -6,6 +6,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import com.youmeandmyself.summary.config.SummaryConfigService
 import com.youmeandmyself.summary.pipeline.SummaryPipeline
+import com.youmeandmyself.summary.structure.CodeStructureProviderFactory
+import com.youmeandmyself.summary.structure.DetectionScope
+import com.youmeandmyself.summary.structure.ElementLevel
+import com.youmeandmyself.summary.cache.SummaryCache
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.storage.model.AiExchange
 import com.youmeandmyself.storage.model.ExchangePurpose
@@ -58,6 +62,8 @@ import com.youmeandmyself.storage.model.IdeContextCapture
  * - /dev-summary-stop: Emergency stop — cancel all queued summaries
  * - /dev-git-test: Test git branch detection step by step
  * - /dev-context-test: Test full IDE context capture
+ * - /dev-structure-inspect: Inspect current file with PSI (classes, methods, hashes, context, cache)
+ * - /dev-structure-inspect ClassName: Inspect a specific class and its methods
  */
 class DevCommandHandler(
     private val project: Project,
@@ -124,6 +130,8 @@ class DevCommandHandler(
             command == "/dev-git-test" -> runGitTest()
             command == "/dev-context-test" -> runContextTest()
             command == "/dev-summary-mock" -> runMockSummary()
+            command == "/dev-structure-inspect" -> runPsiInspect()
+            command.startsWith("/dev-structure-inspect ") -> runPsiInspect(command.removePrefix("/dev-structure-inspect ").trim())
             else -> {
                 output("Unknown dev command: $input\nType /dev-help to see available commands.")
             }
@@ -471,6 +479,195 @@ class DevCommandHandler(
             "🛑 Summarization stopped. Cancelled $cancelled queued items. Kill switch is now OFF. " +
                     "Re-enable in Settings → Tools → YMM Assistant → Summary."
         )
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  PSI STRUCTURE INSPECTION
+    //
+    //  Tests the PSI-based code structure detection that replaced regex.
+    //  Runs against the currently open file, showing:
+    //  - What classes and methods PSI detects
+    //  - Semantic fingerprint hashes for each element
+    //  - Structural context for each element
+    //  - Cache state for each element (if any summaries exist)
+    //
+    //  Usage:
+    //    /dev-structure-inspect           → inspect entire file (all elements)
+    //    /dev-structure-inspect ClassName → inspect one class and its methods
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Inspect the current file using PSI-based code structure detection.
+     *
+     * Shows detection results, semantic hashes, structural context, and
+     * cache state for each detected element. Useful for verifying PSI
+     * integration is working correctly without triggering AI calls.
+     *
+     * @param filterClass Optional class name to inspect just that class and its methods.
+     *                    If null, inspects all elements in the file.
+     */
+    private fun runPsiInspect(filterClass: String? = null) {
+        // Get the currently open file
+        val editor = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).selectedTextEditor
+        val virtualFile = editor?.virtualFile
+
+        if (virtualFile == null) {
+            output("⚠️ No file open in editor. Open a file and run /dev-structure-inspect again.")
+            return
+        }
+
+        val languageId = virtualFile.fileType?.name
+        val filePath = virtualFile.path
+
+        output("🔍 PSI Inspect: ${virtualFile.name} (language: $languageId)")
+        output("─".repeat(60))
+
+        // Step 1: Check if the factory can provide a provider
+        val factory = CodeStructureProviderFactory.getInstance(project)
+        val provider = factory.get()
+
+        if (provider == null) {
+            val reason = if (com.intellij.openapi.project.DumbService.isDumb(project)) {
+                "IDE is in dumb mode (indexing). PSI is not available yet. Wait for indexing to finish."
+            } else {
+                "No Structure View available for this file. The IDE may not support this language."
+            }
+            output("⛔ Provider: null — $reason")
+            return
+        }
+
+        output("✅ Provider: PsiCodeStructureProvider (PSI available)")
+        output("")
+
+        // Step 2: Determine detection scope
+        val scope = if (filterClass != null) {
+            output("🔎 Scope: SingleClass('$filterClass', includeMethods=true)")
+            DetectionScope.SingleClass(filterClass, includeMethods = true)
+        } else {
+            output("🔎 Scope: All (classes + methods + top-level functions)")
+            DetectionScope.All
+        }
+        output("")
+
+        // Step 3: Detect elements
+        val elements = provider.detectElements(virtualFile, scope)
+
+        if (elements.isEmpty()) {
+            output("⚠️ No elements detected.")
+            if (filterClass != null) {
+                output("   Did you spell the class name correctly? Try /dev-structure-inspect without a class name to see all elements.")
+            }
+            return
+        }
+
+        output("📦 Detected ${elements.size} element(s):")
+        output("")
+
+        // Step 4: Get cache for state checking
+        val cache = SummaryCache.getInstance(project)
+
+        // Step 5: Display each element
+        for ((index, element) in elements.withIndex()) {
+            val kindIcon = when (element.kind) {
+                com.youmeandmyself.summary.model.CodeElementKind.CLASS -> "📦"
+                com.youmeandmyself.summary.model.CodeElementKind.INTERFACE -> "📐"
+                com.youmeandmyself.summary.model.CodeElementKind.OBJECT -> "🔹"
+                com.youmeandmyself.summary.model.CodeElementKind.ENUM -> "📋"
+                com.youmeandmyself.summary.model.CodeElementKind.METHOD -> "  🔧"
+                com.youmeandmyself.summary.model.CodeElementKind.FUNCTION -> "  ⚡"
+                com.youmeandmyself.summary.model.CodeElementKind.PROPERTY -> "  📎"
+                com.youmeandmyself.summary.model.CodeElementKind.CONSTRUCTOR -> "  🔨"
+                com.youmeandmyself.summary.model.CodeElementKind.OTHER -> "  ❓"
+            }
+
+            output("$kindIcon ${element.kind}: ${element.name}")
+            output("   Signature: ${element.signature}")
+            output("   Offset: ${element.offsetRange.first}..${element.offsetRange.last} (${element.offsetRange.last - element.offsetRange.first} chars)")
+            output("   Parent: ${element.parentName ?: "(top-level)"}")
+
+            // Semantic hash
+            val hash = try {
+                provider.computeElementHash(virtualFile, element)
+            } catch (e: Throwable) {
+                "ERROR: ${e.message}"
+            }
+            output("   Semantic hash: ${hash.take(16)}…")
+
+            // Cache state
+            val (cachedSynopsis, isStale) = cache.getCachedElementSynopsis(filePath, element.signature, hash)
+            val cacheStatus = when {
+                cachedSynopsis != null && !isStale -> "✅ READY (${cachedSynopsis.length} chars)"
+                cachedSynopsis != null && isStale -> "⚠️ INVALIDATED (stale, ${cachedSynopsis.length} chars)"
+                else -> "❌ No cached summary"
+            }
+            output("   Cache: $cacheStatus")
+
+            // Structural context
+            val context = try {
+                val level = when (element.kind) {
+                    com.youmeandmyself.summary.model.CodeElementKind.METHOD,
+                    com.youmeandmyself.summary.model.CodeElementKind.FUNCTION -> ElementLevel.METHOD
+                    else -> ElementLevel.CLASS
+                }
+                provider.extractStructuralContext(virtualFile, element, level)
+            } catch (e: Throwable) {
+                "ERROR: ${e.message}"
+            }
+            if (context.isNotBlank()) {
+                output("   Structural context:")
+                context.lines().forEach { line ->
+                    output("     $line")
+                }
+            } else {
+                output("   Structural context: (none)")
+            }
+
+            // Body preview (first 100 chars)
+            val preview = element.body.take(100).replace("\n", "\\n")
+            output("   Body preview: $preview…")
+
+            if (index < elements.size - 1) output("")
+        }
+
+        output("")
+        output("─".repeat(60))
+
+        // Summary stats
+        val classes = elements.count { it.kind in setOf(
+            com.youmeandmyself.summary.model.CodeElementKind.CLASS,
+            com.youmeandmyself.summary.model.CodeElementKind.INTERFACE,
+            com.youmeandmyself.summary.model.CodeElementKind.OBJECT,
+            com.youmeandmyself.summary.model.CodeElementKind.ENUM
+        )}
+        val methods = elements.count { it.kind in setOf(
+            com.youmeandmyself.summary.model.CodeElementKind.METHOD,
+            com.youmeandmyself.summary.model.CodeElementKind.FUNCTION
+        )}
+        output("📊 Total: $classes class-level + $methods method-level = ${elements.size} elements")
+
+        // Hash consistency check: detect all elements again and compare hashes
+        // This verifies the semantic hash is stable (same input → same output)
+        output("")
+        output("🔁 Hash stability check (detect again, compare hashes)...")
+        val elements2 = provider.detectElements(virtualFile, scope)
+        var allStable = true
+        for (element in elements) {
+            val hash1 = try { provider.computeElementHash(virtualFile, element) } catch (_: Throwable) { "err1" }
+            val matching = elements2.find { it.signature == element.signature }
+            if (matching != null) {
+                val hash2 = try { provider.computeElementHash(virtualFile, matching) } catch (_: Throwable) { "err2" }
+                if (hash1 != hash2) {
+                    output("   ❌ UNSTABLE: ${element.signature} — hash changed between two identical detections!")
+                    allStable = false
+                }
+            } else {
+                output("   ⚠️ Element ${element.signature} not found in second detection")
+                allStable = false
+            }
+        }
+        if (allStable) {
+            output("   ✅ All hashes stable across two detections")
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
