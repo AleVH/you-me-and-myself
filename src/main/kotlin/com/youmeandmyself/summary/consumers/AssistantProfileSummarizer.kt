@@ -25,10 +25,6 @@ import com.youmeandmyself.summary.pipeline.SummaryExtractor
  *
  * This class is stateless. It receives everything it needs as parameters.
  *
- * ## Replaces
- *
- * `ProfileSummarizer.kt` — the Chunk 3.6 stub in `summary/consumers/`.
- * That stub logged and returned null. This is the real implementation.
  *
  * ## Multi-Profile Future
  *

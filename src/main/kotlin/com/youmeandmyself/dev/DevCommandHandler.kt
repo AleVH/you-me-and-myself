@@ -1,11 +1,13 @@
 package com.youmeandmyself.dev
 
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.youmeandmyself.ai.providers.parsing.ui.CorrectionFlowHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import com.youmeandmyself.summary.config.SummaryConfigService
 import com.youmeandmyself.summary.pipeline.SummaryPipeline
+import com.youmeandmyself.summary.model.CodeElementKind
 import com.youmeandmyself.summary.structure.CodeStructureProviderFactory
 import com.youmeandmyself.summary.structure.DetectionScope
 import com.youmeandmyself.summary.structure.ElementLevel
@@ -64,6 +66,7 @@ import com.youmeandmyself.storage.model.IdeContextCapture
  * - /dev-context-test: Test full IDE context capture
  * - /dev-structure-inspect: Inspect current file with PSI (classes, methods, hashes, context, cache)
  * - /dev-structure-inspect ClassName: Inspect a specific class and its methods
+ * - /dev-summary-health: Health check for element summary system (cache vs SQLite consistency)
  */
 class DevCommandHandler(
     private val project: Project,
@@ -132,6 +135,11 @@ class DevCommandHandler(
             command == "/dev-summary-mock" -> runMockSummary()
             command == "/dev-structure-inspect" -> runPsiInspect()
             command.startsWith("/dev-structure-inspect ") -> runPsiInspect(command.removePrefix("/dev-structure-inspect ").trim())
+            command == "/dev-summary-health" -> runSummaryHealth()
+            // Context gathering dry-run commands (no AI calls, no tokens)
+            command == "/dev-context-single" -> runContextDry("single")
+            command == "/dev-context-radius" -> runContextDry("radius")
+            command == "/dev-context-chain" -> runContextDry("chain")
             else -> {
                 output("Unknown dev command: $input\nType /dev-help to see available commands.")
             }
@@ -569,15 +577,15 @@ class DevCommandHandler(
         // Step 5: Display each element
         for ((index, element) in elements.withIndex()) {
             val kindIcon = when (element.kind) {
-                com.youmeandmyself.summary.model.CodeElementKind.CLASS -> "📦"
-                com.youmeandmyself.summary.model.CodeElementKind.INTERFACE -> "📐"
-                com.youmeandmyself.summary.model.CodeElementKind.OBJECT -> "🔹"
-                com.youmeandmyself.summary.model.CodeElementKind.ENUM -> "📋"
-                com.youmeandmyself.summary.model.CodeElementKind.METHOD -> "  🔧"
-                com.youmeandmyself.summary.model.CodeElementKind.FUNCTION -> "  ⚡"
-                com.youmeandmyself.summary.model.CodeElementKind.PROPERTY -> "  📎"
-                com.youmeandmyself.summary.model.CodeElementKind.CONSTRUCTOR -> "  🔨"
-                com.youmeandmyself.summary.model.CodeElementKind.OTHER -> "  ❓"
+                CodeElementKind.CLASS -> "📦"
+                CodeElementKind.INTERFACE -> "📐"
+                CodeElementKind.OBJECT -> "🔹"
+                CodeElementKind.ENUM -> "📋"
+                CodeElementKind.METHOD -> "  🔧"
+                CodeElementKind.FUNCTION -> "  ⚡"
+                CodeElementKind.PROPERTY -> "  📎"
+                CodeElementKind.CONSTRUCTOR -> "  🔨"
+                CodeElementKind.OTHER -> "  ❓"
             }
 
             output("$kindIcon ${element.kind}: ${element.name}")
@@ -605,8 +613,8 @@ class DevCommandHandler(
             // Structural context
             val context = try {
                 val level = when (element.kind) {
-                    com.youmeandmyself.summary.model.CodeElementKind.METHOD,
-                    com.youmeandmyself.summary.model.CodeElementKind.FUNCTION -> ElementLevel.METHOD
+                    CodeElementKind.METHOD,
+                    CodeElementKind.FUNCTION -> ElementLevel.METHOD
                     else -> ElementLevel.CLASS
                 }
                 provider.extractStructuralContext(virtualFile, element, level)
@@ -634,14 +642,14 @@ class DevCommandHandler(
 
         // Summary stats
         val classes = elements.count { it.kind in setOf(
-            com.youmeandmyself.summary.model.CodeElementKind.CLASS,
-            com.youmeandmyself.summary.model.CodeElementKind.INTERFACE,
-            com.youmeandmyself.summary.model.CodeElementKind.OBJECT,
-            com.youmeandmyself.summary.model.CodeElementKind.ENUM
+            CodeElementKind.CLASS,
+            CodeElementKind.INTERFACE,
+            CodeElementKind.OBJECT,
+            CodeElementKind.ENUM
         )}
         val methods = elements.count { it.kind in setOf(
-            com.youmeandmyself.summary.model.CodeElementKind.METHOD,
-            com.youmeandmyself.summary.model.CodeElementKind.FUNCTION
+            CodeElementKind.METHOD,
+            CodeElementKind.FUNCTION
         )}
         output("📊 Total: $classes class-level + $methods method-level = ${elements.size} elements")
 
@@ -812,5 +820,237 @@ class DevCommandHandler(
         }
 
         output(report)
+    }
+
+    // ==================== /dev-summary-health ====================
+    //
+    // Safeguard #2: Diagnostic command that reports the health of the element
+    // summary system. Checks consistency between in-memory cache and SQLite.
+    //
+    // See: BUG FIX — Element Summary Hash Validation.md, Safeguard #2
+    //
+
+    private fun runSummaryHealth() {
+        output("🏥 Summary Health Check")
+        output("════════════════════════════════════════════════════════════")
+
+        val cache = SummaryCache.getInstance(project)
+        val storage = LocalStorageFacade.getInstance(project)
+
+        // 1. In-memory cache stats
+        val allEntries = cache.getElementEntries("", null) // empty prefix = won't match — need a different approach
+        // Use reflection or expose a method to get total count.
+        // For now, report what we can directly.
+
+        output("")
+        output("📊 Stale-Served Counter")
+        output("   Times hash validation caught a stale summary: ${cache.staleCaughtCount.get()}")
+        output("   (If this is 0 after active development, validation may not be running)")
+
+        // 2. Check SQLite element summaries
+        output("")
+        output("💾 SQLite Element Summaries")
+        try {
+            val projectId = storage.resolveProjectId()
+            val elementRows = storage.loadElementSummaries(projectId)
+            val withSynopsis = elementRows.count { it.synopsis.isNotBlank() }
+            val withHash = elementRows.count { it.contentHashAtGen.isNotBlank() }
+            val nullHash = elementRows.count { it.contentHashAtGen.isBlank() }
+
+            output("   Total in summaries table: ${elementRows.size}")
+            output("   With synopsis text: $withSynopsis")
+            output("   With content hash: $withHash")
+            output("   With NULL/empty hash: $nullHash")
+
+            if (nullHash > 0) {
+                output("   ⚠️ WARNING: $nullHash entries have no hash. These cannot be validated for freshness.")
+                output("   This should be ZERO after the fix. If not, the persistence path regressed.")
+            } else {
+                output("   ✅ All entries have hashes. Persistence is working correctly.")
+            }
+
+            // 3. PSI validation sample (if PSI available)
+            output("")
+            output("🔬 PSI Validation Sample (up to 10 entries)")
+            val factory = CodeStructureProviderFactory.getInstance(project)
+            val provider = factory.get()
+
+            if (provider == null) {
+                output("   ⛔ PSI unavailable (dumb mode). Skipping validation sample.")
+            } else {
+                var checked = 0
+                var valid = 0
+                var stale = 0
+                var skipped = 0
+
+                for (row in elementRows.take(10)) {
+                    try {
+                        val vf = LocalFileSystem.getInstance()
+                            .findFileByPath(row.filePath) ?: run { skipped++; continue }
+
+                        val elements = provider.detectElements(vf, DetectionScope.All)
+                        val element = elements.find { it.name == row.elementName }
+                        if (element == null) { skipped++; continue }
+
+                        val currentHash = provider.computeElementHash(vf, element)
+                        checked++
+
+                        if (currentHash == row.contentHashAtGen) {
+                            valid++
+                        } else {
+                            stale++
+                            output("   ⚠️ STALE: ${row.filePath}#${row.elementName}")
+                            output("      stored=${row.contentHashAtGen.take(16)} current=${currentHash.take(16)}")
+                        }
+                    } catch (e: Throwable) {
+                        skipped++
+                    }
+                }
+
+                output("   Checked: $checked | Valid: $valid | Stale: $stale | Skipped: $skipped")
+                if (stale == 0 && checked > 0) {
+                    output("   ✅ All sampled summaries are fresh.")
+                }
+            }
+        } catch (e: Exception) {
+            output("   ❌ ERROR: ${e.message}")
+        }
+
+        // 4. Cache warmed status
+        output("")
+        output("🔥 Cache Status")
+        output("   Warmed from storage: ${cache.isWarmed()}")
+
+        output("")
+        output("════════════════════════════════════════════════════════════")
+        output("Done.")
+    }
+
+    // ==================== /dev-context-single, /dev-context-radius, /dev-context-chain ====================
+
+    /**
+     * Dry-run context gathering commands. No AI calls, no tokens spent.
+     *
+     * - "single": Resolves the current file + element at cursor via PSI.
+     *   Shows what would be attached as context for the current file only.
+     *
+     * - "radius": Resolves cursor element, then shows what the RelevantFiles
+     *   detector would gather (neighbouring files).
+     *   TODO: Implement radius traversal once traversalRadius setting is wired.
+     *
+     * - "chain": Full dry-run of the context assembly pipeline (detectors +
+     *   enrichment). Shows the complete context that would be sent with a request.
+     *   TODO: Wire to ContextAssembler.assemble() in dry-run mode.
+     */
+    private fun runContextDry(mode: String) {
+        output("🧪 Context Dry Run — mode: $mode")
+        output("════════════════════════════════════════════════════════════")
+
+        when (mode) {
+            "single" -> runContextDrySingle()
+            "radius" -> {
+                output("")
+                output("⚠️ /dev-context-radius is a stub.")
+                output("   Traversal radius requires the traversalRadius setting to be wired")
+                output("   to RelevantFilesDetector. See: Action Plan Phase D.3.")
+                output("   For now, use /dev-context-single to inspect the current file.")
+            }
+            "chain" -> {
+                output("")
+                output("⚠️ /dev-context-chain is a stub.")
+                output("   Full chain requires ContextAssembler.assemble() to support a dry-run flag")
+                output("   that skips the AI call but still runs detectors + enrichment.")
+                output("   See: Action Plan Phase B.1.")
+                output("   For now, use /dev-context-single to inspect the current file.")
+            }
+        }
+
+        output("")
+        output("════════════════════════════════════════════════════════════")
+        output("Done.")
+    }
+
+    /**
+     * Single-file context dry run: resolve cursor element via PSI,
+     * check for cached summary, show what would be attached.
+     */
+    private fun runContextDrySingle() {
+        // Step 1: Resolve cursor position
+        val resolved = com.youmeandmyself.ai.chat.context.EditorElementResolver.resolve(project)
+
+        if (resolved == null) {
+            output("⚠️ No file open in editor.")
+            return
+        }
+
+        output("")
+        output("📄 File: ${resolved.file.name}")
+        output("   Path: ${resolved.file.path}")
+        output("   Cursor offset: ${resolved.cursorOffset}")
+        output("   Selected text: ${if (resolved.selectedText != null) "\"${resolved.selectedText.take(50)}...\"" else "(none)"}")
+
+        val element = resolved.elementAtCursor
+        val containingClass = resolved.containingClass
+
+        if (element == null) {
+            output("   Element at cursor: (none — cursor is between elements)")
+            output("")
+            output("   📎 Would attach: full file (raw content)")
+            return
+        }
+
+        output("")
+        output("🔍 Element at cursor:")
+        output("   Name: ${element.name}")
+        output("   Kind: ${element.kind}")
+        output("   Signature: ${element.signature}")
+        output("   Body size: ${element.body.length} chars (~${element.body.length / 4} tokens)")
+
+        if (containingClass != null) {
+            output("")
+            output("📦 Containing class:")
+            output("   Name: ${containingClass.name}")
+            output("   Signature: ${containingClass.signature}")
+            output("   Body size: ${containingClass.body.length} chars (~${containingClass.body.length / 4} tokens)")
+        }
+
+        // Step 2: Check for cached summaries
+        output("")
+        output("💾 Cache check:")
+
+        val structureProvider = com.youmeandmyself.summary.structure.CodeStructureProviderFactory
+            .getInstance(project).get()
+
+        if (structureProvider == null) {
+            output("   ⚠️ PSI unavailable (dumb mode). Cannot compute hash or check cache.")
+            return
+        }
+
+        try {
+            val hash = structureProvider.computeElementHash(resolved.file, element)
+            output("   Element hash: ${hash.take(16)}…")
+
+            val cache = SummaryCache.getInstance(project)
+            val cached = cache.getCachedElementSynopsis(resolved.file.path, element.signature, hash)
+            if (cached.first != null && !cached.second) {
+                output("   ✅ Summary cached: ${cached.first!!.length} chars (VALID)")
+                output("   📎 Would attach: element summary")
+            } else if (cached.first != null && cached.second) {
+                output("   ⚠️ Summary cached but STALE (hash mismatch)")
+                output("   📎 Would attach: regenerate summary synchronously, then attach")
+            } else {
+                output("   ❌ No cached summary")
+                output("   📎 Would attach: generate summary synchronously, then attach")
+            }
+        } catch (e: Throwable) {
+            output("   ❌ Error computing hash: ${e.message}")
+        }
+
+        // Step 3: Show what context assembly would produce
+        output("")
+        output("📋 Context assembly preview:")
+        output("   Force context: would guarantee this element is attached")
+        output("   Heuristic + smart mode: would also gather neighbouring files (see /dev-context-radius)")
+        output("   Full chain: would run all detectors + enrichment (see /dev-context-chain)")
     }
 }

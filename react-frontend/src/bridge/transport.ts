@@ -272,6 +272,7 @@ function handleMockCommand(command: BridgeCommand): void {
                     modelId: "mock-model",
                     contextSummary: null,
                     contextTimeMs: null,
+                    contextFiles: [],
                     tokenUsage: { promptTokens: 42, completionTokens: 128, totalTokens: 170 },
                 },
                 800,

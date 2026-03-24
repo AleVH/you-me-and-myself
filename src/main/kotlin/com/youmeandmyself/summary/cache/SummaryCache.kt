@@ -92,6 +92,19 @@ class SummaryCache(private val project: Project) {
     private val entries = ConcurrentHashMap<String, Entry>()
 
     /**
+     * Safeguard #4: Stale-served counter.
+     *
+     * Increments every time hash validation catches a stale summary.
+     * Exposed via /dev-summary-health.
+     *
+     * Interpretation:
+     * - > 0 across sessions = validation working, code changing, summaries refreshed. Good.
+     * - = 0 across many sessions with active dev = suspicious (hash not reaching comparison?)
+     * - Very high = summaries invalidated too aggressively (hashing too sensitive?)
+     */
+    val staleCaughtCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
      * Futures for in-flight generation — keyed by file path.
      * Created when a claim is made, completed when generation finishes or fails.
      * Secondary callers await these instead of duplicating the AI call.
@@ -639,6 +652,22 @@ class SummaryCache(private val project: Project) {
                 val isStale = currentElementHash != null &&
                         current.contentHashAtSummary != null &&
                         current.contentHashAtSummary != currentElementHash
+
+                // Safeguard #1: Log a WARN when hash validation catches a stale summary.
+                // If we see these after code changes, validation is working.
+                // If we NEVER see them despite active development, something is broken.
+                if (isStale) {
+                    staleCaughtCount.incrementAndGet()
+                    Dev.warn(log, "cache.element.hash_mismatch", null,
+                        "path" to path,
+                        "element" to elementSignature,
+                        "storedHash" to (current.contentHashAtSummary?.take(16) ?: "NULL"),
+                        "currentHash" to (currentElementHash?.take(16) ?: "NULL"),
+                        "action" to "marked_stale",
+                        "totalCaught" to staleCaughtCount.get()
+                    )
+                }
+
                 current.modelSynopsis to isStale
             }
             SummaryState.INVALIDATED -> {

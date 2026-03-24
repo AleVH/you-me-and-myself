@@ -157,7 +157,8 @@ class ChatOrchestrator(
         providerId: String? = null,
         bypassMode: String? = null,
         selectiveLevel: Int? = null,
-        summaryEnabled: Boolean? = null
+        summaryEnabled: Boolean? = null,
+        forceContextScope: String? = null
     ): ChatResult {
         // ── Step 1: Resolve provider ──────────────────────────────────
         // Per-tab provider takes precedence over global selection.
@@ -197,7 +198,8 @@ class ChatOrchestrator(
             // null = full context gathering, "FULL" = skip all context,
             // "SELECTIVE" = per-component control at the given selectiveLevel.
             val assembled = contextAssembler.assemble(
-                userInput, scope, bypassMode, selectiveLevel, summaryEnabled
+                userInput, scope, bypassMode, selectiveLevel, summaryEnabled,
+                forceContextScope = forceContextScope
             )
 
             // Check if context gathering was blocked by IDE indexing
@@ -398,6 +400,7 @@ class ChatOrchestrator(
                 providerId = provider.id,
                 contextSummary = assembled.contextSummary,
                 contextTimeMs = assembled.contextTimeMs,
+                contextFiles = assembled.contextFiles,
                 responseTimeMs = responseTimeMs
             )
 

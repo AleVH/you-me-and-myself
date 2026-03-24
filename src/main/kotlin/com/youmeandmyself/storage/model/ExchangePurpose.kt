@@ -62,8 +62,7 @@ enum class ExchangePurpose {
 
     /** Summarization of user's AI profile YAML.
      *  Triggered on profile edit. Uses profile-specific prompt template.
-     *  Not implemented yet — see Block 4 (Profile system).
-     *  @see com.youmeandmyself.summary.consumers.ProfileSummarizer */
+     *  @see com.youmeandmyself.summary.consumers.AssistantProfileSummarizer */
     PROFILE_SUMMARY,
 
     /** Compression of older conversation turns to save context window tokens.

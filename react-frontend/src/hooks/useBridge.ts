@@ -192,6 +192,18 @@ export interface TabData {
      * @see ContextAssembler.buildDetectorsForLevel — backend uses this value
      */
     selectiveLevel: number;
+    /**
+     * Force Context scope from the control strip button.
+     *
+     * null = no force (normal heuristic-driven path).
+     * "method" = force the method at cursor into context.
+     * "class" = force the class at cursor into context.
+     *
+     * Complements automatic context — does NOT override it.
+     * If the forced element is already in automatic context, no duplication.
+     * Resets to null after each Send.
+     */
+    forceContextScope: "method" | "class" | null;
 }
 
 /** R4: Lightweight tab descriptor for the TabBar component. */
@@ -344,6 +356,16 @@ export interface BridgeState {
      * Applied to newly created tabs from defaultBypassMode in ContextSettingsEvent.
      */
     defaultBypassMode: "OFF" | "ON" | "CUSTOM";
+
+    // ── Force Context ────────────────────────────────────────────
+    /** Current force context scope for the active tab. */
+    forceContextScope: "method" | "class" | null;
+    /** Set the force context scope (cycles: null → method → class → null). */
+    setForceContextScope: (scope: "method" | "class" | null) => void;
+    /** Ghost badge data from RESOLVE_FORCE_CONTEXT_RESULT. Null = no ghost badge. */
+    ghostBadge: { elementName: string; elementScope: string; estimatedTokens: number } | null;
+    /** Navigate to a source file/element in the IDE editor. */
+    navigateToSource: (filePath: string | null, elementSignature: string | null) => void;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -391,6 +413,7 @@ function createTab(data?: Partial<TabData>): TabData {
         // User perspective: "ON" = context on (default). Translated to backend by dialToBackendBypass().
         bypassMode: data?.bypassMode ?? "ON",
         selectiveLevel: data?.selectiveLevel ?? 2,
+        forceContextScope: null,
     };
 
     log.info("useBridge", "createTab", {
@@ -505,6 +528,7 @@ export function useBridge(): BridgeState {
     const activeSummaryEnabled = activeTab?.summaryEnabled ?? true;
     const activeBypassMode = activeTab?.bypassMode ?? "ON";
     const activeSelectiveLevel = activeTab?.selectiveLevel ?? 2;
+    const activeForceContextScope = activeTab?.forceContextScope ?? null;
 
     const tabs= tabOrder
         .map((id) => {
@@ -795,6 +819,7 @@ export function useBridge(): BridgeState {
                         bypassMode: restoredBypassMode,
                         selectiveLevel: dto.selectiveLevel ?? 2,
                         summaryEnabled: dto.summaryEnabled ?? true, // default ON for restored tabs
+                        forceContextScope: null,
                     });
                     newOrder.push(dto.id);
                     if (dto.isActive) newActiveId = dto.id;
@@ -1035,6 +1060,30 @@ export function useBridge(): BridgeState {
             }),
         );
 
+        // RESOLVE_FORCE_CONTEXT_RESULT → update ghost badge state
+        unsubscribers.push(
+            onEvent(EventType.RESOLVE_FORCE_CONTEXT_RESULT, (event: BridgeEvent) => {
+                const e = event as import("../bridge/types").ResolveForceContextResultEvent;
+                log.info("useBridge", "RESOLVE_FORCE_CONTEXT_RESULT", {
+                    alreadyIncluded: e.alreadyIncluded,
+                    elementName: e.elementName,
+                    elementScope: e.elementScope,
+                });
+
+                if (e.alreadyIncluded || !e.elementName) {
+                    // Element is already part of automatic context — no ghost badge
+                    setGhostBadge(null);
+                } else {
+                    // Element NOT in automatic context — show ghost badge
+                    setGhostBadge({
+                        elementName: e.elementName,
+                        elementScope: e.elementScope ?? "file",
+                        estimatedTokens: e.estimatedTokens ?? 0,
+                    });
+                }
+            }),
+        );
+
         // DEV_OUTPUT → active tab (same as SYSTEM_MESSAGE)
         unsubscribers.push(
             onEvent(EventType.DEV_OUTPUT, (event: BridgeEvent) => {
@@ -1107,6 +1156,7 @@ export function useBridge(): BridgeState {
             let tabBypassMode: string | null = null;
             let tabSelectiveLevel: number | null = null;
             let tabSummaryEnabled: boolean = true;
+            let tabForceContextScope: "method" | "class" | null = null;
 
             setTabMap((prev) => {
                 const tab = prev.get(targetId);
@@ -1121,6 +1171,8 @@ export function useBridge(): BridgeState {
                 tabSelectiveLevel = tab.bypassMode === "CUSTOM" ? tab.selectiveLevel : null;
                 // Per-tab summary toggle (independent from context mode)
                 tabSummaryEnabled = tab.summaryEnabled;
+                // Per-tab force context scope (resets to null after send)
+                tabForceContextScope = tab.forceContextScope;
 
                 const newMsg: ChatMessage = {
                     id: `msg-${Date.now()}-${++idCounter.current}`,
@@ -1138,7 +1190,8 @@ export function useBridge(): BridgeState {
                 const title = tab.messages.length === 0 ? titleFromMessage(text) : tab.title;
 
                 const next = new Map(prev);
-                next.set(targetId, { ...tab, messages: [...tab.messages, newMsg], title });
+                // Reset forceContextScope after send — it's per-request, not persistent
+                next.set(targetId, { ...tab, messages: [...tab.messages, newMsg], title, forceContextScope: null });
                 return next;
             });
 
@@ -1158,6 +1211,7 @@ export function useBridge(): BridgeState {
                 bypassMode: tabBypassMode,
                 selectiveLevel: tabSelectiveLevel,
                 summaryEnabled: tabSummaryEnabled,
+                forceContextScope: tabForceContextScope,
             });
             persistTabState();
         },
@@ -1458,6 +1512,50 @@ export function useBridge(): BridgeState {
         persistTabState();
     }, [updateTab, persistTabState]);
 
+    // ── Force Context ────────────────────────────────────────────────
+
+    /** Ghost badge state from RESOLVE_FORCE_CONTEXT_RESULT */
+    const [ghostBadge, setGhostBadge] = useState<{
+        elementName: string;
+        elementScope: string;
+        estimatedTokens: number;
+    } | null>(null);
+
+    /**
+     * Set the force context scope for the active tab.
+     * Cycles: null → "method" → "class" → null.
+     * Sends RESOLVE_FORCE_CONTEXT to backend to check if ghost badge is needed.
+     * Ghost badge clears when scope resets to null.
+     */
+    const setForceContextScope = useCallback((scope: "method" | "class" | null) => {
+        updateTab(activeTabIdRef.current, (tab) => ({
+            ...tab,
+            forceContextScope: scope,
+        }));
+
+        if (scope === null) {
+            // Clear ghost badge when force scope is reset
+            setGhostBadge(null);
+        } else {
+            // Ask backend if this element is already in automatic context
+            sendCommand({
+                type: CommandType.RESOLVE_FORCE_CONTEXT,
+                scope,
+            });
+        }
+    }, [updateTab, sendCommand]);
+
+    // ── Navigate to source ────────────────────────────────────────
+    // Sends a command to the backend to open a file and position the
+    // cursor at a specific element. Used when clicking badges.
+    const navigateToSource = useCallback((filePath: string | null, elementSignature: string | null) => {
+        sendCommand({
+            type: CommandType.NAVIGATE_TO_SOURCE,
+            filePath,
+            elementSignature,
+        });
+    }, [sendCommand]);
+
     return {
         messages: activeMessages,
         isThinking: activeIsThinking,
@@ -1498,5 +1596,9 @@ export function useBridge(): BridgeState {
         globalContextEnabled,
         globalSummaryEnabled,
         defaultBypassMode,
+        forceContextScope: activeForceContextScope,
+        setForceContextScope,
+        ghostBadge,
+        navigateToSource,
     };
 }

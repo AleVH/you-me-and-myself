@@ -12,10 +12,12 @@ import com.youmeandmyself.ai.metrics.DefaultContextWindows
 import com.youmeandmyself.ai.metrics.MetricsService
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.storage.TabStateService
+import com.youmeandmyself.ai.chat.context.ContextFileDetail
 import com.youmeandmyself.ai.settings.ContextSettingsState
 import com.youmeandmyself.ai.settings.MetricsSettingsState
 import com.youmeandmyself.ai.settings.TabSettingsListener
 import com.youmeandmyself.summary.config.SummaryConfigService
+import com.youmeandmyself.summary.model.CodeElementKind
 import com.youmeandmyself.tier.CompositeTierProvider
 import com.youmeandmyself.tier.Feature
 import kotlinx.coroutines.CoroutineScope
@@ -117,6 +119,10 @@ class BridgeDispatcher(
             is BridgeMessage.FrontendLog -> handleFrontendLog(command)
             // Block 5: Context settings request
             is BridgeMessage.RequestContextSettings -> handleRequestContextSettings()
+            // Force context ghost badge resolution
+            is BridgeMessage.ResolveForceContext -> handleResolveForceContext(command)
+            // Badge click: navigate to source file/element in IDE editor
+            is BridgeMessage.NavigateToSource -> handleNavigateToSource(command)
         }
     }
 
@@ -142,7 +148,8 @@ class BridgeDispatcher(
                     providerId = command.providerId,
                     bypassMode = command.bypassMode,
                     selectiveLevel = command.selectiveLevel,
-                    summaryEnabled = command.summaryEnabled
+                    summaryEnabled = command.summaryEnabled,
+                    forceContextScope = command.forceContextScope
                 )
 
                 if (result.contextSummary != null) {
@@ -785,6 +792,175 @@ class BridgeDispatcher(
         }
     }
 
+    // ── Force Context: Ghost Badge Resolution ──────────────────────
+
+    /**
+     * Handle RESOLVE_FORCE_CONTEXT command.
+     *
+     * Lightweight read-only check: resolves the element at cursor via PSI,
+     * then checks if that element would already be included in the automatic
+     * context (based on current dial/lever settings).
+     *
+     * No AI calls, no generation, no side effects.
+     *
+     * Responds with [BridgeMessage.ResolveForceContextResult].
+     */
+    private fun handleResolveForceContext(command: BridgeMessage.ResolveForceContext) {
+        try {
+            // Resolve cursor element via PSI (same as ContextAssembler does)
+            val resolved = com.youmeandmyself.ai.chat.context.EditorElementResolver.resolve(project)
+
+            if (resolved == null || resolved.elementAtCursor == null) {
+                // No element at cursor — can't force anything
+                Dev.info(log, "bridge.resolve_force.no_element",
+                    "scope" to command.scope
+                )
+                emit(BridgeMessage.ResolveForceContextResult(
+                    alreadyIncluded = false,
+                    elementName = null,
+                    elementScope = null,
+                    estimatedTokens = null
+                ))
+                return
+            }
+
+            // When scope=class, use the containing class (not the method at cursor).
+            // When scope=method, use the element at cursor directly.
+            // If scope=class but there's no containing class (e.g., cursor is on a
+            // top-level function), fall back to the element at cursor.
+            val element = when (command.scope) {
+                "class" -> resolved.containingClass ?: resolved.elementAtCursor
+                else -> resolved.elementAtCursor
+            }
+
+            val elementScope = when (element.kind) {
+                CodeElementKind.METHOD,
+                CodeElementKind.FUNCTION,
+                CodeElementKind.CONSTRUCTOR -> "method"
+                CodeElementKind.CLASS,
+                CodeElementKind.INTERFACE,
+                CodeElementKind.OBJECT,
+                CodeElementKind.ENUM -> "class"
+                else -> "other"
+            }
+
+            // The ghost badge ALWAYS shows when the user clicks Force Context.
+            // The force button is the user saying "I want this element in context."
+            // Whether the element would also be included automatically (via heuristics
+            // or smart mode) is irrelevant at this point — the user wants visual
+            // confirmation that their action was registered.
+            //
+            // Duplication prevention happens at assembly time (when Send is clicked),
+            // not here. The assembler checks if the forced element is already in the
+            // gathered context and avoids attaching it twice.
+            //
+            // On Send: the ghost badge is replaced by real badges from contextFiles[].
+            // The forced element appears as a real badge (with forced=true), alongside
+            // all other context entries the pipeline gathered (neighbours, related files).
+            val alreadyIncluded = false
+
+            // Estimate tokens from element body length (~4 chars per token)
+            val estimatedTokens = element.body.length / 4
+
+            Dev.info(log, "bridge.resolve_force",
+                "scope" to command.scope,
+                "element" to element.name,
+                "elementScope" to elementScope,
+                "alreadyIncluded" to alreadyIncluded,
+                "estimatedTokens" to estimatedTokens
+            )
+
+            emit(BridgeMessage.ResolveForceContextResult(
+                alreadyIncluded = alreadyIncluded,
+                elementName = element.name,
+                elementScope = elementScope,
+                estimatedTokens = estimatedTokens
+            ))
+        } catch (e: Throwable) {
+            Dev.warn(log, "bridge.resolve_force.failed", e)
+            emit(BridgeMessage.ResolveForceContextResult(
+                alreadyIncluded = false,
+                elementName = null,
+                elementScope = null,
+                estimatedTokens = null
+            ))
+        }
+    }
+
+    // ── Navigate to Source Handler ──────────────────────────────────
+
+    /**
+     * Handle NAVIGATE_TO_SOURCE — open a file in the IDE editor and position cursor.
+     *
+     * Called when the user clicks a badge in the badge tray.
+     * If filePath is provided, opens that file. If elementSignature is also
+     * provided, positions the cursor at that element.
+     * If both are null, focuses the currently open editor (for ghost badge clicks).
+     */
+    private fun handleNavigateToSource(command: BridgeMessage.NavigateToSource) {
+        try {
+            val filePath = command.filePath
+
+            if (filePath == null) {
+                // Ghost badge click — just focus the editor
+                Dev.info(log, "bridge.navigate.focus_editor")
+                com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                    val editor = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
+                    editor.selectedTextEditor?.contentComponent?.requestFocusInWindow()
+                }
+                return
+            }
+
+            // Open the file
+            val virtualFile = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+                .findFileByPath(filePath)
+
+            if (virtualFile == null) {
+                Dev.warn(log, "bridge.navigate.file_not_found", null, "path" to filePath)
+                return
+            }
+
+            Dev.info(log, "bridge.navigate",
+                "file" to virtualFile.name,
+                "element" to (command.elementSignature ?: "(file-level)")
+            )
+
+            com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                val editorManager = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
+                editorManager.openFile(virtualFile, true)
+
+                // If we have an element signature, position the cursor at it
+                val signature = command.elementSignature
+                if (signature != null) {
+                    val provider = com.youmeandmyself.summary.structure.CodeStructureProviderFactory
+                        .getInstance(project).get()
+                    if (provider != null) {
+                        try {
+                            val elements = provider.detectElements(
+                                virtualFile,
+                                com.youmeandmyself.summary.structure.DetectionScope.All
+                            )
+                            val target = elements.find { it.signature == signature }
+                            if (target != null) {
+                                val editor = editorManager.selectedTextEditor
+                                editor?.caretModel?.moveToOffset(target.offsetRange.first)
+                                editor?.scrollingModel?.scrollToCaret(
+                                    com.intellij.openapi.editor.ScrollType.CENTER
+                                )
+                            }
+                        } catch (e: Throwable) {
+                            Dev.warn(log, "bridge.navigate.element_not_found", e,
+                                "signature" to signature
+                            )
+                        }
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            Dev.warn(log, "bridge.navigate.failed", e)
+        }
+    }
+
     // ── Block 5C: Frontend Logging Handler ─────────────────────────
 
     /**
@@ -828,6 +1004,21 @@ class BridgeDispatcher(
                     promptTokens = it.promptTokens,
                     completionTokens = it.completionTokens,
                     totalTokens = it.effectiveTotal
+                )
+            },
+            // Map internal ContextFileDetail to bridge DTO
+            contextFiles = result.contextFiles.map { detail ->
+                BridgeMessage.ContextFileDetailDto(
+                    path = detail.path,
+                    name = detail.name,
+                    scope = detail.scope,
+                    lang = detail.lang,
+                    kind = detail.kind,
+                    freshness = detail.freshness,
+                    tokens = detail.tokens,
+                    isStale = detail.isStale,
+                    forced = detail.forced,
+                    elementSignature = detail.elementSignature
                 )
             }
         )

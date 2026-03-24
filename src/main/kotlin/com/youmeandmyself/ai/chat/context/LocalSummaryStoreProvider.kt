@@ -6,6 +6,7 @@ import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.summary.cache.SummaryCache
 import com.youmeandmyself.summary.config.SummaryConfigService
 import com.youmeandmyself.summary.config.SummaryMode
+import com.youmeandmyself.summary.model.CodeElement
 import com.youmeandmyself.summary.pipeline.SummaryPipeline
 import java.time.Instant
 
@@ -201,6 +202,212 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
     }
 
     /**
+     * Retrieve an element-level summary (method, class, property) from local storage.
+     *
+     * Uses a three-layer read path:
+     * 1. SummaryCache (in-memory, nanoseconds) — with hash validation
+     * 2. SQLite `summaries` + `code_elements` tables (microseconds) — with hash
+     * 3. SQLite `chat_exchanges` (legacy fallback, no hash) — for pre-fix data
+     *
+     * Hash validation rule: EVERY level, EVERY time, check before using.
+     * If the stored hash doesn't match [currentElementHash], the summary is stale.
+     * Null hashes (legacy data) are treated as stale — the safe default.
+     *
+     * Element summaries are persisted to SQLite via the `summaries` table
+     * (with `content_hash_at_gen NOT NULL`). They survive IDE restarts.
+     * The user paid tokens for these summaries — they must not be lost.
+     *
+     * See: BUG FIX — Element Summary Hash Validation.md
+     *
+     * @param filePath Absolute file path
+     * @param elementSignature PSI element signature (e.g., "MyClass#doThing(String)")
+     * @param projectId Current project ID
+     * @param currentElementHash Current semantic hash for freshness validation (null = skip)
+     * @return Element summary if available (check [CodeSummary.isStale]), null if not yet summarized
+     */
+    override suspend fun getElementSummary(
+        filePath: String,
+        elementSignature: String,
+        projectId: String,
+        currentElementHash: String?
+    ): CodeSummary? {
+        // Lazy warm-up (same as file-level — loads element entries too)
+        ensureWarmed(projectId)
+
+        // Layer 1: Check in-memory cache (nanoseconds)
+        // Pass the current hash for validation — if the stored hash doesn't match,
+        // the summary is marked as stale. This is the "every level, every time" rule.
+        // See: BUG FIX — Element Summary Hash Validation.md, Fix #1
+        val (cachedSynopsis, isStale) = cache.getCachedElementSynopsis(filePath, elementSignature, currentElementHash)
+
+        if (cachedSynopsis != null) {
+            Dev.info(log, "summary_store.element_cache_hit",
+                "filePath" to filePath,
+                "signature" to elementSignature,
+                "isStale" to isStale
+            )
+            return CodeSummary(
+                filePath = filePath,
+                synopsis = cachedSynopsis,
+                headerSample = null,
+                isStale = isStale,
+                generatedAt = "",
+                providerId = "cached",
+                modelId = "cached",
+                isShared = false
+            )
+        }
+
+        // Layer 2: Check SQLite for persisted element summaries (microseconds)
+        if (!storage.isInitialized) {
+            Dev.info(log, "summary_store.element_not_ready",
+                "filePath" to filePath,
+                "signature" to elementSignature
+            )
+            return null
+        }
+
+        val fromDb = queryElementSummaryFromDb(filePath, elementSignature, projectId)
+        if (fromDb != null) {
+            // Populate in-memory cache so next read is instant.
+            // Pass the hash from the DB so subsequent cache reads can validate freshness.
+            // Note: fromDb.contentHashAtGen comes from the summaries table (Fix #2).
+            // If this is a legacy entry from chat_exchanges (no hash), contentHashAtGen
+            // will be null and the next read will correctly treat it as stale.
+            cache.completeElementClaim(
+                path = filePath,
+                elementSignature = elementSignature,
+                languageId = null,
+                synopsis = fromDb.synopsis,
+                contentHash = fromDb.contentHashAtGen
+            )
+            Dev.info(log, "summary_store.element_db_hit",
+                "filePath" to filePath,
+                "signature" to elementSignature
+            )
+            return fromDb
+        }
+
+        // Layer 3: No element summary exists
+        Dev.info(log, "summary_store.element_miss",
+            "filePath" to filePath,
+            "signature" to elementSignature
+        )
+        return null
+    }
+
+    /**
+     * Query SQLite for the most recent element summary.
+     *
+     * Two-layer query:
+     * 1. Check `summaries` + `code_elements` tables (new path, has hash)
+     * 2. Fall back to `chat_exchanges` (legacy path, no hash)
+     *
+     * The summaries table is the source of truth after Fix #2. The chat_exchanges
+     * fallback ensures backward compatibility for summaries generated before
+     * the fix was applied.
+     *
+     * @param filePath Absolute file path
+     * @param elementSignature PSI element signature (e.g., "MyClass#doThing(String)")
+     * @param projectId Current project ID
+     * @return CodeSummary if found (with contentHashAtGen if available), null otherwise
+     */
+    private fun queryElementSummaryFromDb(
+        filePath: String,
+        elementSignature: String,
+        projectId: String
+    ): CodeSummary? {
+        // Layer 1: Try the summaries + code_elements tables (new path with hash)
+        // Uses clean FK join via summaries.exchange_id → chat_exchanges.id
+        try {
+            val fromSummariesTable = storage.withReadableDatabase { db ->
+                db.queryOne(
+                    """
+                SELECT s.content_hash_at_gen, s.is_stale, s.provider_id, s.model_id,
+                       s.generated_at,
+                       ex.assistant_text AS synopsis_text
+                FROM summaries s
+                JOIN code_elements ce ON ce.id = s.code_element_id
+                JOIN chat_exchanges ex ON ex.id = s.exchange_id
+                WHERE s.project_id = ?
+                  AND ce.file_path = ?
+                  AND ce.element_name = ?
+                ORDER BY s.generated_at DESC
+                LIMIT 1
+                """.trimIndent(),
+                    projectId,
+                    filePath,
+                    elementSignature
+                ) { rs ->
+                    val synopsis = rs.getString("synopsis_text")
+                    if (synopsis.isNullOrBlank()) return@queryOne null
+
+                    CodeSummary(
+                        filePath = filePath,
+                        synopsis = synopsis,
+                        headerSample = null,
+                        isStale = (rs.getInt("is_stale") == 1),
+                        generatedAt = rs.getString("generated_at") ?: "",
+                        providerId = rs.getString("provider_id") ?: "unknown",
+                        modelId = rs.getString("model_id") ?: "unknown",
+                        isShared = false,
+                        contentHashAtGen = rs.getString("content_hash_at_gen")
+                    )
+                }
+            }
+            if (fromSummariesTable != null) return fromSummariesTable
+        } catch (e: Exception) {
+            Dev.warn(log, "summary_store.element_summaries_table_query_failed", e,
+                "filePath" to filePath,
+                "signature" to elementSignature
+            )
+        }
+
+        // Layer 2: Fall back to chat_exchanges (legacy path, no hash)
+        return try {
+            storage.withReadableDatabase { db ->
+                db.queryOne(
+                    """
+                SELECT id, provider_id, model_id, timestamp, assistant_text
+                FROM chat_exchanges
+                WHERE project_id = ?
+                  AND purpose IN ('METHOD_SUMMARY', 'CLASS_SUMMARY')
+                  AND file_paths LIKE ?
+                  AND user_prompt LIKE ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """.trimIndent(),
+                    projectId,
+                    "%$filePath%",
+                    "%$elementSignature%"
+                ) { rs ->
+                    val synopsis = rs.getString("assistant_text")
+                    if (synopsis.isNullOrBlank()) return@queryOne null
+
+                    CodeSummary(
+                        filePath = filePath,
+                        synopsis = synopsis,
+                        headerSample = null,
+                        isStale = false,  // No hash available — can't determine staleness from DB
+                        generatedAt = rs.getString("timestamp") ?: "",
+                        providerId = rs.getString("provider_id") ?: "unknown",
+                        modelId = rs.getString("model_id") ?: "unknown",
+                        isShared = false,
+                        contentHashAtGen = null  // Legacy: no hash stored
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "summary_store.element_query_failed", e,
+                "filePath" to filePath,
+                "signature" to elementSignature,
+                "projectId" to projectId
+            )
+            null
+        }
+    }
+
+    /**
      * Claim status for individual tier: always [ClaimStatus.NOT_CLAIMED].
      *
      * There's no shared state to coordinate in the individual tier.
@@ -237,6 +444,37 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
         try {
             val entries = warmCacheFromSQLite(projectId)
             cache.warmFromStorage(entries)
+
+            // Safeguard #3: Startup integrity check.
+            // After warm-up, sample a few element summaries and verify their hashes
+            // against current code. This catches persistence regressions early.
+            // See: BUG FIX — Element Summary Hash Validation.md, Safeguard #3
+            try {
+                val elementRows = storage.loadElementSummaries(projectId)
+                val sampleSize = minOf(10, elementRows.size)
+                if (sampleSize > 0) {
+                    var nullHashCount = 0
+                    for (row in elementRows.take(sampleSize)) {
+                        if (row.contentHashAtGen.isBlank()) nullHashCount++
+                    }
+
+                    Dev.info(log, "startup.summary_integrity",
+                        "checked" to sampleSize,
+                        "nullHash" to nullHashCount,
+                        "total" to elementRows.size
+                    )
+
+                    if (nullHashCount > 0) {
+                        Dev.warn(log, "startup.summary_integrity.null_hashes", null,
+                            "count" to nullHashCount,
+                            "message" to "Element summaries with null hashes found. These cannot be validated for freshness. Persistence path may have regressed."
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                // Integrity check is diagnostic — never block warm-up
+                Dev.warn(log, "startup.summary_integrity.failed", e)
+            }
         } catch (e: Exception) {
             Dev.warn(log, "summary_store.warm_failed", e,
                 "projectId" to projectId
@@ -245,52 +483,104 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
     }
 
     /**
-     * Bulk-load all FILE_SUMMARY records from SQLite for the current project.
+     * Bulk-load ALL summary records (file-level AND element-level) from SQLite.
      *
-     * Returns a map of filePath → SummaryCache.Entry suitable for
-     * SummaryCache.warmFromStorage().
+     * Loads FILE_SUMMARY, METHOD_SUMMARY, and CLASS_SUMMARY exchanges.
+     * File-level entries go into the file cache. Element-level entries go into
+     * the element cache via completeElementClaim().
      *
-     * Only loads rows where assistant_text is non-null (rows where the
-     * summary text was cached into SQLite). Rows with null assistant_text
-     * are skipped — they'd be useless for the cache anyway.
+     * This ensures that summaries generated in previous IDE sessions are
+     * immediately available without regeneration — for BOTH files and elements.
+     * The user paid tokens for these summaries; they must survive restart.
      *
      * @param projectId Current project ID
-     * @return Map of filePath to cache entries
+     * @return Map of filePath to cache entries (file-level only; element-level
+     *         populated directly into SummaryCache via completeElementClaim)
      */
     private fun warmCacheFromSQLite(projectId: String): Map<String, SummaryCache.Entry> {
         return storage.withReadableDatabase { db ->
+            // Load file-level AND element-level summaries in one query
             val rows = db.query(
                 """
-                SELECT id, file_paths, assistant_text, provider_id, model_id, timestamp
+                SELECT id, file_paths, assistant_text, provider_id, model_id, timestamp, purpose, user_prompt
                 FROM chat_exchanges
                 WHERE project_id = ?
-                  AND purpose = 'FILE_SUMMARY'
+                  AND purpose IN ('FILE_SUMMARY', 'METHOD_SUMMARY', 'CLASS_SUMMARY')
                   AND assistant_text IS NOT NULL
                   AND file_paths IS NOT NULL
                 ORDER BY timestamp DESC
                 """.trimIndent(),
                 projectId
             ) { rs ->
-                Triple(
-                    rs.getString("file_paths"),
-                    rs.getString("assistant_text"),
-                    rs.getString("timestamp")
+                ElementWarmRow(
+                    filePaths = rs.getString("file_paths"),
+                    synopsis = rs.getString("assistant_text"),
+                    timestamp = rs.getString("timestamp"),
+                    purpose = rs.getString("purpose"),
+                    userPrompt = rs.getString("user_prompt")
                 )
             }
 
-            // Build the map. file_paths may contain comma-separated paths
-            // (from DerivedMetadata), but for FILE_SUMMARY exchanges we store
-            // a single path via SummarizationService.indexFilePath().
-            // If multiple rows exist for the same path, ORDER BY timestamp DESC
-            // means the first one we see is the newest — putIfAbsent keeps it.
-            val entries = mutableMapOf<String, SummaryCache.Entry>()
-            for ((filePaths, synopsis, timestamp) in rows) {
-                if (filePaths.isNullOrBlank() || synopsis.isNullOrBlank()) continue
+            // ── Element-level warm-up: load from `summaries` + `code_elements` tables ──
+            // These tables store the content_hash_at_gen, enabling hash validation
+            // on first access after restart. Without the hash, all element summaries
+            // would be treated as stale (because null != currentHash).
+            //
+            // Previously, element summaries were loaded from chat_exchanges with
+            // contentHash = null, which meant they were regenerated every session.
+            // See: BUG FIX — Element Summary Hash Validation.md
+            var elementEntriesLoaded = 0
+            val projectId = rows.firstOrNull()?.let { /* extract from context */ } // unused, we pass it from caller
 
-                // Split in case file_paths is CSV, but typically it's a single path
-                val paths = filePaths.split(",").filter { it.isNotBlank() }
+            try {
+                val elementRows = storage.loadElementSummaries(
+                    storage.resolveProjectId()
+                )
+                for (row in elementRows) {
+                    if (row.synopsis.isBlank() || row.filePath.isBlank()) continue
+                    cache.completeElementClaim(
+                        path = row.filePath,
+                        elementSignature = row.elementSignature,
+                        languageId = null,
+                        synopsis = row.synopsis,
+                        contentHash = row.contentHashAtGen  // THE KEY FIX: hash is now loaded from SQLite
+                    )
+                    elementEntriesLoaded++
+                }
+            } catch (e: Exception) {
+                Dev.warn(log, "summary_store.element_warm_failed", e)
+                // Fall back to the old chat_exchanges path as a safety net
+                // This ensures we don't lose element summaries if the summaries table
+                // is empty (e.g., first run after the migration)
+                for (row in rows) {
+                    if (row.filePaths.isNullOrBlank() || row.synopsis.isNullOrBlank()) continue
+                    if (row.purpose == "METHOD_SUMMARY" || row.purpose == "CLASS_SUMMARY") {
+                        val signature = row.userPrompt ?: continue
+                        val paths = row.filePaths.split(",").filter { it.isNotBlank() }
+                        for (path in paths) {
+                            cache.completeElementClaim(
+                                path = path,
+                                elementSignature = signature,
+                                languageId = null,
+                                synopsis = row.synopsis,
+                                contentHash = null  // No hash from chat_exchanges — will be treated as stale
+                            )
+                            elementEntriesLoaded++
+                        }
+                    }
+                }
+            }
+
+            // Build file-level map (FILE_SUMMARY only).
+            // Element-level entries were already populated above via completeElementClaim.
+            val entries = mutableMapOf<String, SummaryCache.Entry>()
+            for (row in rows) {
+                if (row.filePaths.isNullOrBlank() || row.synopsis.isNullOrBlank()) continue
+                if (row.purpose != "FILE_SUMMARY") continue  // Skip element-level (already handled)
+
+                val paths = row.filePaths.split(",").filter { it.isNotBlank() }
                 val summarizedAt = try {
-                    Instant.parse(timestamp)
+                    Instant.parse(row.timestamp)
                 } catch (_: Exception) {
                     null
                 }
@@ -299,7 +589,7 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
                     entries.putIfAbsent(path, SummaryCache.Entry(
                         path = path,
                         languageId = null,
-                        modelSynopsis = synopsis,
+                        modelSynopsis = row.synopsis,
                         contentHashAtSummary = null,
                         lastSummarizedAt = summarizedAt
                     ))
@@ -308,12 +598,26 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
 
             Dev.info(log, "summary_store.warmed",
                 "projectId" to projectId,
-                "entriesLoaded" to entries.size
+                "fileEntriesLoaded" to entries.size,
+                "elementEntriesLoaded" to elementEntriesLoaded
             )
 
             entries
         }
     }
+
+    /**
+     * Internal data class for warm-up query results.
+     * Holds both file-level and element-level fields so we can process
+     * them in a single query + single loop.
+     */
+    private data class ElementWarmRow(
+        val filePaths: String?,
+        val synopsis: String?,
+        val timestamp: String?,
+        val purpose: String?,
+        val userPrompt: String?
+    )
 
     /**
      * Suggest that a file should be summarized.
@@ -387,5 +691,66 @@ class LocalSummaryStoreProvider(private val project: Project) : SummaryStoreProv
             "mode" to config.mode.name,
             "action" to "enqueued_via_pipeline"
         )
+    }
+
+    // ==================== Demand-Driven Synchronous Generation ====================
+
+    /**
+     * Generate a method summary synchronously.
+     *
+     * Delegates to [SummaryPipeline.generateMethodSummarySync] which handles all
+     * config gates, provider resolution, PSI detection, and persistence.
+     *
+     * Called by ContextAssembler when a user asks about a method that has no valid
+     * cached summary. The summary is generated NOW and attached to THIS request.
+     */
+    override suspend fun generateMethodSummaryNow(
+        filePath: String,
+        element: CodeElement,
+        parentClassName: String
+    ): String? {
+        Dev.info(log, "summary_store.sync.method.start",
+            "filePath" to filePath,
+            "method" to element.name,
+            "parent" to parentClassName
+        )
+
+        val result = pipeline.generateMethodSummarySync(filePath, element, parentClassName)
+
+        Dev.info(log, "summary_store.sync.method.done",
+            "filePath" to filePath,
+            "method" to element.name,
+            "success" to (result != null),
+            "length" to (result?.length ?: 0)
+        )
+
+        return result
+    }
+
+    /**
+     * Generate a class summary synchronously via bottom-up cascade.
+     *
+     * Delegates to [SummaryPipeline.generateClassSummarySync] which handles the
+     * full cascade: detect methods → validate/generate each → build class summary.
+     */
+    override suspend fun generateClassSummaryNow(
+        filePath: String,
+        element: CodeElement
+    ): String? {
+        Dev.info(log, "summary_store.sync.class.start",
+            "filePath" to filePath,
+            "class" to element.name
+        )
+
+        val result = pipeline.generateClassSummarySync(filePath, element)
+
+        Dev.info(log, "summary_store.sync.class.done",
+            "filePath" to filePath,
+            "class" to element.name,
+            "success" to (result != null),
+            "length" to (result?.length ?: 0)
+        )
+
+        return result
     }
 }

@@ -1,5 +1,7 @@
 package com.youmeandmyself.ai.chat.context
 
+import com.youmeandmyself.summary.model.CodeElement
+
 /**
  * Interface for reading code summaries during context assembly.
  *
@@ -95,6 +97,85 @@ interface SummaryStoreProvider {
      * @param projectId The project context
      */
     suspend fun suggestSummarization(filePath: String, projectId: String)
+
+    /**
+     * Retrieve the summary for a specific code element (method, class, property).
+     *
+     * Element-level summaries are more precise than file-level — they describe
+     * what a single method or class does, not the entire file. When the user is
+     * looking at a specific method, attaching the method summary (50-200 tokens)
+     * is much cheaper and more relevant than the whole file summary (500-5000 tokens).
+     *
+     * ## Lookup
+     *
+     * The element is identified by its PSI signature (e.g.,
+     * "MyService#processRefund(String, Int)"). This signature is stable across
+     * renames of local variables, formatting changes, etc. — only structural
+     * changes (parameter types, return type, visibility) affect it.
+     *
+     * ## Staleness
+     *
+     * The returned summary includes an [CodeSummary.isStale] flag. The caller
+     * MUST check this at every level before using a cached summary. If stale,
+     * the summary should be regenerated (Phase B.1) or skipped.
+     *
+     * @param filePath Absolute file path
+     * @param elementSignature PSI element signature (e.g., "MyClass#doThing(String)")
+     * @param projectId The project context
+     * @return Element summary if available, null if not summarized yet
+     */
+    suspend fun getElementSummary(
+        filePath: String,
+        elementSignature: String,
+        projectId: String,
+        currentElementHash: String? = null
+    ): CodeSummary?
+
+    // ==================== Demand-Driven Synchronous Generation ====================
+    //
+    // These methods generate summaries synchronously and return the synopsis text.
+    // Called by ContextAssembler when the current request needs a summary that
+    // doesn't exist or is stale. The summary is generated NOW and attached to
+    // THIS request — not fire-and-forget for the next one.
+    //
+    // See: Summarization — Agreed Direction.md
+
+    /**
+     * Generate a method summary synchronously and return the synopsis text.
+     *
+     * Called when ContextAssembler detects the user is asking about a method
+     * that has no valid cached summary. Generates, caches (memory + SQLite),
+     * and returns the text for immediate attachment.
+     *
+     * Returns null if generation is not possible (config, no provider, dumb mode, error).
+     *
+     * @param filePath Absolute file path containing the method
+     * @param element The method element (from PSI detection)
+     * @param parentClassName The containing class name
+     * @return Synopsis text, or null
+     */
+    suspend fun generateMethodSummaryNow(
+        filePath: String,
+        element: CodeElement,
+        parentClassName: String
+    ): String?
+
+    /**
+     * Generate a class summary synchronously via bottom-up cascade.
+     *
+     * Triggers the full cascade: detect methods → validate/generate each →
+     * build class summary from method summaries. Only generates what's missing.
+     *
+     * Returns null if generation is not possible.
+     *
+     * @param filePath Absolute file path containing the class
+     * @param element The class element (from PSI detection)
+     * @return Class synopsis text, or null
+     */
+    suspend fun generateClassSummaryNow(
+        filePath: String,
+        element: CodeElement
+    ): String?
 }
 
 /**
@@ -125,7 +206,16 @@ data class CodeSummary(
     val generatedAt: String,
     val providerId: String,
     val modelId: String,
-    val isShared: Boolean = false
+    val isShared: Boolean = false,
+    /**
+     * The semantic hash of the code element at the time this summary was generated.
+     * Used to validate freshness: if the current code hash differs from this,
+     * the summary is stale and must be regenerated.
+     *
+     * Null for legacy summaries that were stored without a hash (pre-fix).
+     * Null hashes are treated as stale on retrieval — the safe default.
+     */
+    val contentHashAtGen: String? = null
 )
 
 /**

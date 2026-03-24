@@ -72,6 +72,18 @@ data class ChatResult(
     val contextSummary: String?,
     val contextTimeMs: Long?,
     /**
+     * Structured context metadata for the badge tray and sidebar.
+     *
+     * Each entry represents one piece of context (method, class, file)
+     * that was attached to the request. Flows through to ChatResultEvent
+     * and then to the React frontend for badge rendering.
+     *
+     * Phase D.2 — Stub: Currently always emptyList().
+     *
+     * @see com.youmeandmyself.ai.chat.context.ContextFileDetail
+     */
+    val contextFiles: List<com.youmeandmyself.ai.chat.context.ContextFileDetail> = emptyList(),
+    /**
      * Wall-clock time for the AI provider call in milliseconds.
      *
      * Measured in [ChatOrchestrator.send] from before provider.chat()

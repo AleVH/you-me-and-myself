@@ -47,6 +47,7 @@ import ProviderSelector from "./ProviderSelector";
 import MetricsBar from "../metrics/MetricsBar";
 import TabBar from "./TabBar";
 import ContextDialStrip from "./context/ContextDialStrip";
+import ContextBadgeTray from "./context/ContextBadgeTray";
 import { log } from "../utils/log";
 
 log.info("ChatApp", `[BUILD] ${__BUILD_DATE__} ${__BUILD_TIMESTAMP__}`);
@@ -123,11 +124,37 @@ function ChatApp() {
                 summaryMode={bridge.summaryEnabled ? "ON" : "OFF"}
                 onSummaryModeChange={(mode) => bridge.setSummaryEnabled(mode === "ON")}
                 globalSummaryEnabled={bridge.globalSummaryEnabled}
+                /* ── Force Context props ── */
+                forceContextScope={bridge.forceContextScope}
+                onForceContextChange={bridge.setForceContextScope}
             />
 
             <InputBar
                 onSend={bridge.sendMessage}
                 disabled={bridge.isThinking}
+            />
+
+            {/* Badge tray sits BELOW the prompt input.
+                Shows ghost badges (from Force Context) and real badges (after Send).
+                See: Context System — Complete UI & Behaviour Specification.md */}
+            <ContextBadgeTray
+                badges={bridge.messages.length > 0
+                    ? (bridge.messages[bridge.messages.length - 1] as any).contextFiles ?? []
+                    : []}
+                ghostBadge={bridge.ghostBadge}
+                isThinking={bridge.isThinking}
+                onBadgeClick={(badge) => {
+                    // Navigate to the source file in the IDE editor.
+                    // The backend opens the file and positions the cursor at the element.
+                    bridge.navigateToSource(badge.path, badge.elementSignature);
+                }}
+                onGhostBadgeClick={() => {
+                    // Ghost badge = forced element at cursor.
+                    // The cursor is already on the element, but we still send the
+                    // command so the backend can focus the editor (in case the user
+                    // switched to another file after clicking Force).
+                    bridge.navigateToSource(null, null);
+                }}
             />
 
             {!bridge.isProduction && (

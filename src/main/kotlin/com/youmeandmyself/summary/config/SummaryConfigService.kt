@@ -7,6 +7,7 @@ import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.youmeandmyself.ai.providers.ProviderRegistry
 import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.model.ExchangePurpose
 import java.nio.file.FileSystems
@@ -334,7 +335,7 @@ class SummaryConfigService(
         val estimatedTokens = (lineCount * 40 / 4) // ~40 chars/line, ~4 chars/token
 
         val providerInfo = try {
-            val provider = com.youmeandmyself.ai.providers.ProviderRegistry.selectedSummaryProvider(project)
+            val provider = ProviderRegistry.selectedSummaryProvider(project)
             provider?.let { "${it.displayName} (${it.id})" }
         } catch (_: Throwable) { null }
 

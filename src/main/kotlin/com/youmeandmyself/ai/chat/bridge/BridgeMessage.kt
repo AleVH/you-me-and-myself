@@ -96,7 +96,29 @@ object BridgeMessage {
          *
          * Null = use global setting (backward compat with old frontends).
          */
-        val summaryEnabled: Boolean? = null
+        val summaryEnabled: Boolean? = null,
+
+        /**
+         * Force Context scope. Set by the Force Context button in the control strip.
+         *
+         * Values: null (no force), "method" (force current method), "class" (force current class).
+         *
+         * ## Behaviour
+         *
+         * Force Context COMPLEMENTS automatic context gathering — it does NOT override it.
+         * - If the forced element is already part of the automatically gathered context,
+         *   nothing extra happens (no duplication, no ghost badge).
+         * - If the forced element is NOT in the automatic context (e.g., heuristic
+         *   couldn't figure out what the user wants), it gets added explicitly.
+         *
+         * ## Phase C.1 — Stub
+         *
+         * Field exists for frontend-backend contract. Backend ignores it until
+         * Phase C.1 implementation wires it into ContextAssembler.
+         *
+         * @see ContextAssembler.assemble — will read this field in Phase C.1
+         */
+        val forceContextScope: String? = null
     ) : Command()
 
     @Serializable
@@ -109,6 +131,34 @@ object BridgeMessage {
     @SerialName("REQUEST_CORRECTION")
     data class RequestCorrection(
         override val type: String = "REQUEST_CORRECTION"
+    ) : Command()
+
+    /**
+     * Lightweight query: check if a forced context scope would already be included
+     * in the automatic context. Used to decide whether to show a ghost badge.
+     *
+     * The frontend sends this when the user cycles the Force Context button.
+     * Backend checks the current editor element and context configuration,
+     * responds with RESOLVE_FORCE_CONTEXT_RESULT.
+     *
+     * No AI calls, no generation — pure read-only query.
+     *
+     * @param scope "method" or "class" — what the user wants to force
+     */
+    @Serializable
+    @SerialName("RESOLVE_FORCE_CONTEXT")
+    data class ResolveForceContext(
+        override val type: String = "RESOLVE_FORCE_CONTEXT",
+        val scope: String  // "method" or "class"
+    ) : Command()
+
+    /** Navigate to a source file/element in the IDE editor. Sent when badge is clicked. */
+    @Serializable
+    @SerialName("NAVIGATE_TO_SOURCE")
+    data class NavigateToSource(
+        override val type: String = "NAVIGATE_TO_SOURCE",
+        val filePath: String? = null,
+        val elementSignature: String? = null
     ) : Command()
 
     @Serializable
@@ -402,8 +452,43 @@ object BridgeMessage {
         val modelId: String?,
         val contextSummary: String?,
         val contextTimeMs: Long?,
-        val tokenUsage: TokenUsageDto?
+        val tokenUsage: TokenUsageDto?,
+
+        /**
+         * Structured context metadata for the badge tray and sidebar.
+         *
+         * Each entry represents one piece of context (method, class, file)
+         * that was attached to the request. The frontend renders these as badges.
+         *
+         * ## Phase D.2 — Stub
+         *
+         * Currently always emptyList() (populated from AssembledPrompt.contextFiles).
+         * Will carry real data once element-level context scoping is implemented (Phase A.3).
+         *
+         * @see com.youmeandmyself.ai.chat.context.ContextFileDetail
+         */
+        val contextFiles: List<ContextFileDetailDto> = emptyList()
     ) : Event()
+
+    /**
+     * DTO mirror of [com.youmeandmyself.ai.chat.context.ContextFileDetail].
+     *
+     * Separate from the internal model to maintain bridge contract stability.
+     * If the internal model changes, this DTO can remain stable for the frontend.
+     */
+    @Serializable
+    data class ContextFileDetailDto(
+        val path: String,
+        val name: String,
+        val scope: String,
+        val lang: String,
+        val kind: String,
+        val freshness: String,
+        val tokens: Int,
+        val isStale: Boolean,
+        val forced: Boolean = false,
+        val elementSignature: String? = null
+    )
 
     @Serializable
     data class TokenUsageDto(
@@ -411,6 +496,27 @@ object BridgeMessage {
         val completionTokens: Int?,
         val totalTokens: Int?
     )
+
+    /**
+     * Response to [ResolveForceContext] command.
+     *
+     * Tells the frontend whether the forced element would already be included
+     * in the automatic context (no ghost badge needed) and provides element
+     * metadata for the ghost badge if it IS needed.
+     *
+     * @param alreadyIncluded true = element is part of automatic context, no ghost badge
+     * @param elementName Display name (e.g., "processRefund") — null if no element at cursor
+     * @param elementScope "method" or "class" — null if no element at cursor
+     * @param estimatedTokens Rough token estimate for the element — null if unknown
+     */
+    @Serializable
+    data class ResolveForceContextResult(
+        override val type: String = "RESOLVE_FORCE_CONTEXT_RESULT",
+        val alreadyIncluded: Boolean,
+        val elementName: String? = null,
+        val elementScope: String? = null,
+        val estimatedTokens: Int? = null
+    ) : Event()
 
     @Serializable
     data class ShowThinkingEvent(
@@ -779,6 +885,10 @@ object BridgeMessage {
                 "FRONTEND_LOG" -> json.decodeFromString<FrontendLog>(jsonString)
                 // Block 5: Context settings request
                 "REQUEST_CONTEXT_SETTINGS" -> json.decodeFromString<RequestContextSettings>(jsonString)
+                // Force context ghost badge resolution
+                "RESOLVE_FORCE_CONTEXT" -> json.decodeFromString<ResolveForceContext>(jsonString)
+                // Badge click: navigate to source in IDE editor
+                "NAVIGATE_TO_SOURCE" -> json.decodeFromString<NavigateToSource>(jsonString)
                 else -> {
                     Dev.warn(log, "bridge.parse.unknown_command", null,
                         "type" to (typeField ?: "null")
@@ -815,6 +925,8 @@ object BridgeMessage {
             is DevOutputEvent -> json.encodeToString(DevOutputEvent.serializer(), event)
             // Block 5: Context settings
             is ContextSettingsEvent -> json.encodeToString(ContextSettingsEvent.serializer(), event)
+            // Force context ghost badge resolution
+            is ResolveForceContextResult -> json.encodeToString(ResolveForceContextResult.serializer(), event)
         }
     }
 }

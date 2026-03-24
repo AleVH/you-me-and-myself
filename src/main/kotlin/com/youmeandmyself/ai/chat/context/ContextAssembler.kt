@@ -8,6 +8,7 @@ import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.youmeandmyself.context.orchestrator.ContextBundle
+import com.youmeandmyself.context.orchestrator.ContextFile
 import com.youmeandmyself.context.orchestrator.ContextKind
 import com.youmeandmyself.context.orchestrator.ContextOrchestrator
 import com.youmeandmyself.context.orchestrator.ContextRequest
@@ -23,6 +24,8 @@ import com.youmeandmyself.dev.Dev
 import com.youmeandmyself.storage.LocalStorageFacade
 import com.youmeandmyself.summary.config.SummaryConfigService
 import com.youmeandmyself.summary.config.SummaryMode
+import com.youmeandmyself.summary.model.CodeElementKind
+import com.youmeandmyself.summary.structure.CodeStructureProviderFactory
 import kotlinx.coroutines.CoroutineScope
 import java.nio.charset.Charset
 
@@ -124,7 +127,20 @@ class ContextAssembler(
         scope: CoroutineScope,
         bypassMode: String? = null,
         selectiveLevel: Int? = null,
-        summaryEnabled: Boolean? = null
+        summaryEnabled: Boolean? = null,
+        /**
+         * Force Context scope from the control strip button.
+         *
+         * null = no force (normal heuristic-driven path).
+         * "method" = force the method at cursor into context.
+         * "class" = force the class at cursor into context.
+         *
+         * Complements automatic context — does NOT override it.
+         * If the forced element is already in automatic context, no duplication.
+         *
+         * Phase C.1 — Stub: parameter accepted but not yet used in the pipeline.
+         */
+        forceContextScope: String? = null
     ): AssembledPrompt {
         // ── Step -1: Global context kill-switch ──────────────────────────
         // Settings → Tools → YMM Assistant → Context → "Enable context gathering"
@@ -240,10 +256,25 @@ class ContextAssembler(
                 "effectivePromptLength" to effectivePrompt.length
             )
 
+            // Build badge data for the single attached file
+            val bypassBadge = listOf(ContextFileDetail(
+                path = editorFile.path,
+                name = editorFile.name,
+                scope = "file",
+                lang = fenceLangFor(editorFile),
+                kind = if (attachmentKind == "existing summary") "SUMMARY" else "RAW",
+                freshness = if (summary != null && !summary.isStale) "cached" else "fresh",
+                tokens = contentBlock.length / 4,
+                isStale = summary?.isStale ?: false,
+                forced = false,
+                elementSignature = null
+            ))
+
             return AssembledPrompt(
                 effectivePrompt = effectivePrompt,
                 contextSummary = "[Context: bypass=FULL, $attachmentKind attached]",
-                contextTimeMs = null
+                contextTimeMs = null,
+                contextFiles = bypassBadge
             )
         }
 
@@ -295,10 +326,26 @@ class ContextAssembler(
                     attachmentKind = "raw file"
                 }
                 val effectivePrompt = if (contentBlock.isNotBlank()) "$contentBlock\n\n$userInput" else userInput
+
+                // Build badge data for the single attached file (same as FULL bypass)
+                val selectiveMinBadge = listOf(ContextFileDetail(
+                    path = editorFile.path,
+                    name = editorFile.name,
+                    scope = "file",
+                    lang = fenceLangFor(editorFile),
+                    kind = if (attachmentKind == "existing summary") "SUMMARY" else "RAW",
+                    freshness = if (summary != null && !summary.isStale) "cached" else "fresh",
+                    tokens = contentBlock.length / 4,
+                    isStale = summary?.isStale ?: false,
+                    forced = false,
+                    elementSignature = null
+                ))
+
                 return AssembledPrompt(
                     effectivePrompt = effectivePrompt,
                     contextSummary = "[Context: selective=Minimal, $attachmentKind attached]",
-                    contextTimeMs = null
+                    contextTimeMs = null,
+                    contextFiles = selectiveMinBadge
                 )
             }
 
@@ -322,11 +369,18 @@ class ContextAssembler(
                 Dev.info(log, "context.skipped", "reason" to "ide_indexing_selective")
                 return AssembledPrompt.indexingBlocked()
             }
+            // Resolve cursor context for element-level scoping (same as normal path)
+            val resolvedContext = EditorElementResolver.resolve(project)
+            Dev.info(log, "context.selective.resolved_editor",
+                "level" to level,
+                "elementAtCursor" to (resolvedContext?.elementAtCursor?.name ?: "none")
+            )
+
             val (bundle, metrics) = gatherIdeContext(scope, buildDetectorsForLevel(level))
             Dev.info(log, "context.gathered.selective",
                 "level" to level, "files" to bundle.files.size, "timeMs" to metrics.totalMillis
             )
-            val enrichedBundle = enrichWithSummaries(bundle)
+            val enrichedBundle = enrichWithSummaries(bundle, resolvedContext)
             val contextNote = formatContextNote(enrichedBundle)
             val manifest = enrichedBundle.manifestLine()
             val filesBlock = enrichedBundle.filesSection()
@@ -336,10 +390,18 @@ class ContextAssembler(
                 if (fileBlock.isNotBlank()) { appendLine(); appendLine(fileBlock) }
                 appendLine(); append(userInput)
             }
+            // Build badge data from the enriched bundle
+            val selectiveBadges = buildContextFileDetails(
+                files = enrichedBundle.files,
+                resolvedContext = resolvedContext,
+                forceContextScope = forceContextScope
+            )
+
             return AssembledPrompt(
                 effectivePrompt = effectivePrompt,
                 contextSummary = "[Context: selective=level$level, ${enrichedBundle.manifestLine()}]",
-                contextTimeMs = metrics.totalMillis
+                contextTimeMs = metrics.totalMillis,
+                contextFiles = selectiveBadges
             )
         }
 
@@ -369,6 +431,22 @@ class ContextAssembler(
                 contextTimeMs = null
             )
         }
+
+        // Step 1.5: Resolve editor element context (cursor position → code element)
+        //
+        // This gives us the method/class the user is currently looking at,
+        // enabling element-level context scoping instead of whole-file.
+        // If resolution fails (no editor, dumb mode, etc.), resolvedContext is null
+        // and we fall back to file-level context (no regression).
+        val resolvedContext = EditorElementResolver.resolve(project)
+
+        Dev.info(log, "context.resolved_editor",
+            "file" to (resolvedContext?.file?.name ?: "none"),
+            "elementAtCursor" to (resolvedContext?.elementAtCursor?.name ?: "none"),
+            "elementKind" to (resolvedContext?.elementAtCursor?.kind?.name ?: "none"),
+            "containingClass" to (resolvedContext?.containingClass?.name ?: "none"),
+            "forceContextScope" to (forceContextScope ?: "none")
+        )
 
         // Step 2: Check if IDE is in "dumb mode" (indexing files)
         // Context gathering requires IntelliJ's index, which isn't available during indexing
@@ -418,7 +496,7 @@ class ContextAssembler(
             )
             bundle  // No enrichment — use raw files as-is
         } else {
-            enrichWithSummaries(bundle)
+            enrichWithSummaries(bundle, resolvedContext)
         }
 
         // Step 5: Format the context into a structured prompt section
@@ -450,10 +528,19 @@ class ContextAssembler(
             "summaryFiles" to enrichedBundle.files.count { it.kind == ContextKind.SUMMARY }
         )
 
+        // Build structured context file details for badge tray.
+        // Each entry becomes a badge the user can hover/inspect in the frontend.
+        val contextFiles = buildContextFileDetails(
+            files = enrichedBundle.files,
+            resolvedContext = resolvedContext,
+            forceContextScope = forceContextScope
+        )
+
         return AssembledPrompt(
             effectivePrompt = effectivePrompt,
             contextSummary = manifest,
-            contextTimeMs = metrics.totalMillis
+            contextTimeMs = metrics.totalMillis,
+            contextFiles = contextFiles
         )
     }
 
@@ -499,6 +586,41 @@ class ContextAssembler(
         // partial results are returned (whatever finished in time).
         val request = ContextRequest(project = project, maxMillis = MAX_CONTEXT_GATHER_MS)
 
+        // ═══════════════════════════════════════════════════════════════════
+        // STUB — Phase D.3: Traversal Radius & Infrastructure Visibility
+        // ═══════════════════════════════════════════════════════════════════
+        //
+        // Two settings in ContextSettingsState that are defined but not yet read:
+        //
+        // 1. traversalRadius (Int, 1-5):
+        //    Controls how many hops from the cursor position the context assembler
+        //    reaches into the dependency graph.
+        //    - radius=1: only the element at cursor + its immediate callers/callees
+        //    - radius=2: their callers/callees too
+        //    - radius=5: deep transitive dependency reach
+        //    When implemented, this should be passed to RelevantFilesDetector to
+        //    scope its file discovery. The IDE's reference search (PSI) provides
+        //    the dependency graph — we do NOT build our own.
+        //
+        // 2. infrastructureVisibility ("OFF" | "BRIEF" | "DETAIL"):
+        //    Controls how cross-cutting infrastructure classes (Auth, Logger,
+        //    DI containers, Middleware) are included in context:
+        //    - OFF: excluded entirely (saves tokens, focused context)
+        //    - BRIEF: summary only (one-line description of what it does)
+        //    - DETAIL: full content (for questions specifically about infrastructure)
+        //    When implemented, this should filter the ContextBundle AFTER gathering
+        //    and BEFORE enrichment. The filter reads the element's package/path to
+        //    classify it as infrastructure or not.
+        //
+        // Both settings are per-project (global) with per-tab overrides in TabStateDto.
+        //
+        // READ from: ContextSettingsState.getInstance(project).state.traversalRadius
+        //            ContextSettingsState.getInstance(project).state.infrastructureVisibility
+        //
+        // See: Context System — Complete UI & Behaviour Specification.md
+        // See: Action Plan — Context System Implementation.md, Phase D.3
+        // ═══════════════════════════════════════════════════════════════════
+
         return orchestrator.gather(request, scope)
     }
 
@@ -514,6 +636,35 @@ class ContextAssembler(
     private fun buildDetectorsForLevel(level: Int): List<Detector> = when (level) {
         1    -> listOf(LanguageDetector(), FrameworkDetector(), RelevantFilesDetector())
         else -> listOf(LanguageDetector(), FrameworkDetector(), ProjectStructureDetector(), RelevantFilesDetector())
+
+        // ═══════════════════════════════════════════════════════════════════
+        // STUB — Phase D.1: SELECTIVE Lever Extension Points
+        // ═══════════════════════════════════════════════════════════════════
+        //
+        // The context lever (visible when Context Dial is set to "Custom") lets the
+        // user select different context compositions. Each lever level corresponds
+        // to a different combination of:
+        //
+        //   - Which detectors run (this method)
+        //   - Traversal radius (how many dependency hops from cursor) — see D.3 stub
+        //   - Infrastructure visibility (Auth, Logger, DI classes) — see D.3 stub
+        //   - File scope (current file, current module, full project)
+        //
+        // The lever positions are NOT quantity-based — they represent different
+        // context configurations tailored for different kinds of questions.
+        //
+        // When the lever is at its lowest position, it means "no context" — the lever
+        // should disappear and the Context Dial should move to "Off". This is the
+        // original behaviour restored: lowest lever = off.
+        //
+        // Lever levels CANNOT be defined until the backend capabilities are fully
+        // understood (requires Phases A and B to be complete). Each new capability
+        // (element-level scoping, traversal radius, infrastructure filtering) may
+        // add or modify lever levels.
+        //
+        // See: Context System — Complete UI & Behaviour Specification.md, Section 3.4
+        // See: Action Plan — Context System Implementation.md, Phase D.1
+        // ═══════════════════════════════════════════════════════════════════
     }
 
     // ── Summary Enrichment (READ PATH) ──────────────────────────────────
@@ -552,8 +703,46 @@ class ContextAssembler(
      * @param bundle The context bundle with all-RAW files from MergePolicy
      * @return A new bundle with files replaced by summaries where beneficial
      */
-    private suspend fun enrichWithSummaries(bundle: ContextBundle): ContextBundle {
+    private suspend fun enrichWithSummaries(
+        bundle: ContextBundle,
+        resolvedContext: ResolvedEditorContext? = null
+    ): ContextBundle {
         if (bundle.files.isEmpty()) return bundle
+
+        // ═══════════════════════════════════════════════════════════════════
+        // STUB — Phase D.4: Module/Project-Level Demand-Driven Cascade (2.2)
+        // ═══════════════════════════════════════════════════════════════════
+        //
+        // When the user asks about relationships between classes/files that
+        // span a module boundary, the assembler would need to:
+        //
+        // 1. Detect that the question requires module-level understanding
+        //    (heuristic or NLP analysis of user input — separate concern)
+        //
+        // 2. Trigger SummaryPipeline module-level cascade with CONFIRMATION GATE.
+        //    Module/project summaries are large and expensive — they MUST require
+        //    user confirmation before generation ("This summary covers N files
+        //    across M modules. Estimated cost: ~X tokens. Proceed?")
+        //
+        // 3. Wait for all file summaries → module summary → project summary
+        //    (bottom-up cascade, same as method → class but one level up)
+        //
+        // 4. Attach the module/project summary instead of individual file summaries
+        //    (saves tokens when the question is about architecture, not a specific file)
+        //
+        // Requirements for implementation:
+        // - Module boundary detection via IDE's project model (NOT regex or custom parsing)
+        // - Confirmation UI in the frontend (modal or inline prompt)
+        // - Integration with SummaryPipeline confirmation gate (templates exist)
+        // - Budget check before generation (module summaries can be expensive)
+        //
+        // This is ON-DEMAND ONLY. Module/project summaries are NEVER generated
+        // automatically in the background.
+        //
+        // See: Summarization — Agreed Direction.md, "Three-Step Execution Order"
+        // See: Plugin Infrastructure Principles.md — use IDE's module system
+        // See: Action Plan — Context System Implementation.md, Phase D.4
+        // ═══════════════════════════════════════════════════════════════════
 
         val projectId = try {
             LocalStorageFacade.getInstance(project).resolveProjectId()
@@ -575,12 +764,150 @@ class ContextAssembler(
             "suggestionsAllowed" to suggestionsAllowed
         )
 
+        // Identify the current file path for element-level scoping.
+        // If the user has a file open with cursor on a specific element, we try
+        // to use the element's summary (method/class level) instead of the whole file.
+        val currentFilePath = resolvedContext?.file?.path
+        val elementAtCursor = resolvedContext?.elementAtCursor
+        val containingClass = resolvedContext?.containingClass
+
+        // Compute the current semantic hash for the element at cursor.
+        // This is used to validate cached summaries: if the hash changed since
+        // the summary was generated, the summary is stale and must not be used.
+        // The hash is based on structural/behavioural properties (signature, control
+        // flow, dependencies) — not cosmetic changes (variable names, whitespace).
+        //
+        // Validation rule: EVERY level, EVERY time, check before using.
+        val currentElementHash: String? = if (resolvedContext?.file != null && elementAtCursor != null) {
+            try {
+                val provider = CodeStructureProviderFactory
+                    .getInstance(project).get()
+                provider?.computeElementHash(resolvedContext.file, elementAtCursor)
+            } catch (e: Throwable) {
+                Dev.warn(log, "context.enrichment.hash_failed", e,
+                    "element" to elementAtCursor.name
+                )
+                null  // Can't validate — treat as stale, fall through to file-level
+            }
+        } else null
+
         // Rebuild the files list, replacing with summaries where beneficial
         var totalChars = 0
         var summariesUsed = 0
         var suggestionsQueued = 0
+        var elementLevelUsed = 0
 
         val enrichedFiles = bundle.files.map { cf ->
+            // ── Element-level enrichment for the current file ──
+            // If this is the file the user has open AND we know what element they're
+            // looking at, try to use the element-level summary instead of the file-level one.
+            // This is much more precise: a method summary is typically 50-200 tokens vs
+            // 500-5000 for a whole file summary.
+            if (cf.path == currentFilePath && elementAtCursor != null) {
+                val elementSummary = summaryStore.getElementSummary(
+                    cf.path, elementAtCursor.signature, projectId, currentElementHash
+                )
+
+                if (elementSummary != null && !elementSummary.isStale) {
+                    val synopsisChars = elementSummary.synopsis.length
+                    if (synopsisChars < cf.charCount * SUMMARY_BENEFIT_RATIO) {
+                        elementLevelUsed++
+                        summariesUsed++
+                        totalChars += synopsisChars
+
+                        Dev.info(log, "context.enrichment.element_level",
+                            "file" to cf.path,
+                            "element" to elementAtCursor.name,
+                            "elementKind" to elementAtCursor.kind.name,
+                            "synopsisChars" to synopsisChars,
+                            "rawChars" to cf.charCount
+                        )
+
+                        return@map cf.copy(
+                            kind = ContextKind.SUMMARY,
+                            charCount = synopsisChars,
+                            truncated = false,
+                            modelSynopsis = elementSummary.synopsis,
+                            headerSample = elementSummary.headerSample,
+                            isStale = false,
+                            source = "element-summary"
+                        )
+                    }
+                }
+
+                // Element summary not available, stale, or not beneficial.
+                // Attempt synchronous generation if config allows — the user asked NOW,
+                // so the summary should be available NOW, not on the next request.
+                //
+                // This is the core of demand-driven summarization (Agreed Direction, Steps 2-3).
+                // Only the element at cursor gets synchronous generation — other files in the
+                // bundle continue with fire-and-forget suggestions (less critical, supporting context).
+                val needsGeneration = elementSummary == null || elementSummary.isStale
+                if (needsGeneration && suggestionsAllowed) {
+                    Dev.info(log, "context.enrichment.element_sync_gen",
+                        "file" to cf.path,
+                        "element" to elementAtCursor.name,
+                        "elementKind" to elementAtCursor.kind.name,
+                        "reason" to if (elementSummary == null) "no_summary" else "stale"
+                    )
+
+                    // Determine if this is a method or class and call the appropriate generator
+                    val parentName = elementAtCursor.parentName ?: ""
+                    val syncSynopsis: String? = when (elementAtCursor.kind) {
+                        CodeElementKind.METHOD,
+                        CodeElementKind.FUNCTION,
+                        CodeElementKind.CONSTRUCTOR -> {
+                            summaryStore.generateMethodSummaryNow(cf.path, elementAtCursor, parentName)
+                        }
+                        CodeElementKind.CLASS,
+                        CodeElementKind.INTERFACE,
+                        CodeElementKind.OBJECT,
+                        CodeElementKind.ENUM -> {
+                            summaryStore.generateClassSummaryNow(cf.path, elementAtCursor)
+                        }
+                        else -> null  // Properties, OTHER — too small to warrant summarization
+                    }
+
+                    if (syncSynopsis != null) {
+                        val synopsisChars = syncSynopsis.length
+                        if (synopsisChars < cf.charCount * SUMMARY_BENEFIT_RATIO) {
+                            elementLevelUsed++
+                            summariesUsed++
+                            totalChars += synopsisChars
+
+                            Dev.info(log, "context.enrichment.element_sync_success",
+                                "file" to cf.path,
+                                "element" to elementAtCursor.name,
+                                "synopsisChars" to synopsisChars,
+                                "rawChars" to cf.charCount
+                            )
+
+                            return@map cf.copy(
+                                kind = ContextKind.SUMMARY,
+                                charCount = synopsisChars,
+                                truncated = false,
+                                modelSynopsis = syncSynopsis,
+                                headerSample = null,
+                                isStale = false,
+                                source = "element-summary-sync"
+                            )
+                        }
+                    }
+                }
+
+                // Sync generation failed or not allowed — fall through to file-level
+                Dev.info(log, "context.enrichment.element_fallback",
+                    "file" to cf.path,
+                    "element" to elementAtCursor.name,
+                    "reason" to when {
+                        !needsGeneration -> "not_beneficial"
+                        !suggestionsAllowed -> "config_denied"
+                        else -> "generation_failed"
+                    }
+                )
+            }
+
+            // ── File-level enrichment (original path) ──
             val summary = summaries[cf.path]
 
             if (summary != null) {
@@ -621,6 +948,7 @@ class ContextAssembler(
 
         Dev.info(log, "context.enrichment.done",
             "summariesUsed" to summariesUsed,
+            "elementLevelUsed" to elementLevelUsed,
             "suggestionsQueued" to suggestionsQueued,
             "rawKept" to (enrichedFiles.size - summariesUsed),
             "totalChars" to totalChars
@@ -860,6 +1188,87 @@ class ContextAssembler(
         }
     }
 
+    // ── Badge Data Builder ────────────────────────────────────────────────
+
+    /**
+     * Build a list of [ContextFileDetail] from enriched context files.
+     *
+     * Each entry becomes a badge in the frontend tray. Extracts metadata
+     * from the enriched [ContextFile] list and the optional [ResolvedEditorContext]
+     * to determine scope (method/class/file), freshness, and forced status.
+     *
+     * @param files The enriched context files from the bundle
+     * @param resolvedContext The cursor context (null if no element resolved)
+     * @param forceContextScope The user's force context selection (null/"method"/"class")
+     * @return Structured badge data for the frontend
+     */
+    private fun buildContextFileDetails(
+        files: List<ContextFile>,
+        resolvedContext: ResolvedEditorContext? = null,
+        forceContextScope: String? = null
+    ): List<ContextFileDetail> {
+        val currentFilePath = resolvedContext?.file?.path
+        val elementAtCursor = resolvedContext?.elementAtCursor
+
+        return files.map { cf ->
+            // Determine scope: if this is the cursor file and we have an element,
+            // report the element's scope. Otherwise, it's file-level.
+            val isCurrentFile = cf.path == currentFilePath && elementAtCursor != null
+            val scope = if (isCurrentFile && (cf.source == "element-summary" || cf.source == "element-summary-sync")) {
+                when (elementAtCursor?.kind) {
+                    CodeElementKind.METHOD,
+                    CodeElementKind.FUNCTION,
+                    CodeElementKind.CONSTRUCTOR -> "method"
+                    CodeElementKind.CLASS,
+                    CodeElementKind.INTERFACE,
+                    CodeElementKind.OBJECT,
+                    CodeElementKind.ENUM -> "class"
+                    else -> "file"
+                }
+            } else {
+                "file"
+            }
+
+            // Determine freshness based on source and staleness
+            val freshness = when {
+                cf.isStale -> "rough"
+                cf.kind == ContextKind.RAW -> "fresh"
+                cf.source == "element-summary" || cf.source == "element-summary-sync" -> "cached"
+                cf.source == "local-summary" -> "cached"
+                cf.source == "shared-summary" -> "cached"
+                else -> "fresh"
+            }
+
+            // Determine display name: element name for element-level, file name for file-level
+            val name = if (isCurrentFile && (cf.source == "element-summary" || cf.source == "element-summary-sync") && elementAtCursor != null) {
+                elementAtCursor.name
+            } else {
+                cf.path.substringAfterLast("/")
+            }
+
+            // Determine if this was forced by the user
+            val forced = forceContextScope != null && isCurrentFile
+
+            // Estimate tokens (~4 chars per token is a rough but standard heuristic)
+            val tokens = cf.charCount / 4
+
+            ContextFileDetail(
+                path = cf.path,
+                name = name,
+                scope = scope,
+                lang = cf.languageId ?: "",
+                kind = if (cf.kind == ContextKind.SUMMARY) "SUMMARY" else "RAW",
+                freshness = freshness,
+                tokens = tokens,
+                isStale = cf.isStale,
+                forced = forced,
+                elementSignature = if (isCurrentFile && elementAtCursor != null) {
+                    elementAtCursor.signature
+                } else null
+            )
+        }
+    }
+
     // ── Constants ────────────────────────────────────────────────────────
 
     companion object {
@@ -916,7 +1325,29 @@ data class AssembledPrompt(
     val effectivePrompt: String,
     val contextSummary: String?,
     val contextTimeMs: Long?,
-    val isBlockedByIndexing: Boolean = false
+    val isBlockedByIndexing: Boolean = false,
+
+    /**
+     * Structured metadata about each piece of context attached to this request.
+     *
+     * ## Purpose
+     *
+     * Feeds the badge tray in the frontend — each entry becomes a badge
+     * the user can hover/inspect. Also feeds the sidebar (conversation-level
+     * audit trail of all context attached across messages).
+     *
+     * ## Data flow
+     *
+     * AssembledPrompt.contextFiles → ChatResultEvent.contextFiles → React ContextBadgeTray
+     *
+     * ## Phase D.2 — Stub
+     *
+     * Currently always emptyList(). Populated in Phase A.3 once element-level
+     * context scoping is implemented.
+     *
+     * @see ContextFileDetail
+     */
+    val contextFiles: List<ContextFileDetail> = emptyList()
 ) {
     companion object {
         /**
@@ -933,6 +1364,57 @@ data class AssembledPrompt(
         )
     }
 }
+
+/**
+ * Metadata about a single piece of context attached to a request.
+ *
+ * ## Purpose
+ *
+ * Each instance represents one context entry (a method, class, file, or config)
+ * that was included in the prompt. The frontend displays these as badges in the
+ * badge tray (below the prompt) and in the sidebar (conversation audit trail).
+ *
+ * ## Why structured, not just a string
+ *
+ * The frontend needs to:
+ * - Show scope icons (method/class/file)
+ * - Color-code freshness (fresh/cached/rough)
+ * - Display token estimates
+ * - Distinguish forced vs automatic context
+ * - Show stale warnings
+ *
+ * A single summary string can't provide this. Structured data can.
+ *
+ * ## Lifecycle
+ *
+ * Created during context assembly → serialized to JSON in ChatResultEvent →
+ * deserialized in React → rendered as badges → migrated to sidebar on Send.
+ *
+ * @param path Absolute file path
+ * @param name Display name (file name, method name, class name)
+ * @param scope Granularity: "method", "class", "file", "module", "config"
+ * @param lang Programming language (e.g., "kotlin", "java", "python")
+ * @param kind Whether this is "RAW" (full code) or "SUMMARY" (compressed)
+ * @param freshness Summary freshness: "fresh" (just generated), "cached" (from store), "rough" (stale but usable)
+ * @param tokens Estimated token count for this entry
+ * @param isStale Whether the summary is outdated (source changed since last summarization)
+ * @param forced Whether the user explicitly forced this via the Force Context button
+ * @param elementSignature PSI element signature (null for file-level entries).
+ *                         Used for element-level cache lookups and invalidation.
+ */
+@kotlinx.serialization.Serializable
+data class ContextFileDetail(
+    val path: String,
+    val name: String,
+    val scope: String,
+    val lang: String,
+    val kind: String,
+    val freshness: String,
+    val tokens: Int,
+    val isStale: Boolean,
+    val forced: Boolean = false,
+    val elementSignature: String? = null
+)
 
 // ── Extension Functions ─────────────────────────────────────────────────
 //

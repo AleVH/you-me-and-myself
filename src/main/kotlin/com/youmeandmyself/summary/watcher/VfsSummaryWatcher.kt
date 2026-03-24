@@ -69,6 +69,11 @@ class VfsSummaryWatcher(
         CodeStructureProviderFactory.getInstance(project)
     }
 
+    /** Lazy reference to storage facade — for marking SQLite entries as stale (Fix #4). */
+    private val storage: com.youmeandmyself.storage.LocalStorageFacade by lazy {
+        com.youmeandmyself.storage.LocalStorageFacade.getInstance(project)
+    }
+
     private val connection: MessageBusConnection = project.messageBus.connect()
 
     init {
@@ -187,8 +192,43 @@ class VfsSummaryWatcher(
                 elementHashes[element.signature] = hash
             }
 
-            // Update the cache — only entries whose hash differs are invalidated
+            // Update the in-memory cache — only entries whose hash differs are invalidated
             cache.onElementHashChanges(vf.path, elementHashes)
+
+            // Also mark SQLite entries as stale (Fix #4).
+            // This ensures consistency between memory and disk. If the IDE crashes
+            // (no graceful shutdown), the next warm-up loads is_stale = 1 from SQLite
+            // and treats the summary correctly.
+            // See: BUG FIX — Element Summary Hash Validation.md, Fix #4
+            try {
+                // Collect signatures of elements that were actually invalidated
+                // (i.e., whose hash changed, not all elements in the file)
+                val invalidatedSignatures = mutableListOf<String>()
+                for ((signature, newHash) in elementHashes) {
+                    val entry = cache.getElementEntries(vf.path)
+                    val cached = entry[signature]
+                    // If the entry is INVALIDATED, it was just invalidated by onElementHashChanges
+                    if (cached != null && cached.state == com.youmeandmyself.summary.cache.SummaryState.INVALIDATED) {
+                        invalidatedSignatures.add(signature)
+                    }
+                }
+
+                if (invalidatedSignatures.isNotEmpty()) {
+                    val projectId = storage.resolveProjectId()
+                    storage.markElementSummariesStale(projectId, vf.path, invalidatedSignatures)
+
+                    Dev.info(log, "vfs.element_invalidation.sqlite_marked",
+                        "path" to vf.path,
+                        "count" to invalidatedSignatures.size
+                    )
+                }
+            } catch (e: Throwable) {
+                // SQLite marking is a safety net, not critical path.
+                // If it fails, the in-memory invalidation still works for this session.
+                Dev.warn(log, "vfs.element_invalidation.sqlite_mark_failed", e,
+                    "path" to vf.path
+                )
+            }
 
             Dev.info(log, "vfs.element_invalidation.completed",
                 "path" to vf.path,

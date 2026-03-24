@@ -133,6 +133,29 @@
     outline-offset: 1px;
 }
 
+/* ── Force Context button ────────────────────────────────────────── */
+
+.ymm-context-strip__force {
+    background: none;
+    border: 1px solid transparent;
+    color: #808080;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 3px;
+    transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.ymm-context-strip__force:hover {
+    color: #d4d4d4;
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+.ymm-context-strip__force--active {
+    color: #c586c0;
+    border-color: #c586c0;
+}
+
 /* ── Detail row (expanded lever area) ────────────────────────────── */
 
 .ymm-context-strip__detail {

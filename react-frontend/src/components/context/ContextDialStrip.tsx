@@ -122,6 +122,16 @@ export interface ContextDialStripProps {
      * Global overrules local — always.
      */
     globalSummaryEnabled?: boolean;
+
+    // ── Force Context props ──────────────────────────────────────────
+    /**
+     * Current force context scope for the active tab.
+     * null = no force. "method" = force method at cursor. "class" = force class at cursor.
+     * Cycles: null → method → class → null on button click.
+     */
+    forceContextScope?: "method" | "class" | null;
+    /** Called when the user cycles the Force Context button. */
+    onForceContextChange?: (scope: "method" | "class" | null) => void;
 }
 
 // ── Human-readable mode labels (user perspective) ────────────────────
@@ -156,6 +166,8 @@ function ContextDialStrip({
     summaryMode = "ON",
     onSummaryModeChange,
     globalSummaryEnabled = true,
+    forceContextScope = null,
+    onForceContextChange,
 }: ContextDialStripProps) {
     // Expanded state — controls whether the lever row is visible.
     // Only meaningful when mode is SELECTIVE. Persists while the
@@ -168,6 +180,19 @@ function ContextDialStrip({
 
     // The lever is only relevant in CUSTOM mode — it controls the reach of context gathering
     const showLever = mode === "CUSTOM" && expanded;
+
+    // Force Context button: cycles null → method → class → null
+    const cycleForceContext = useCallback(() => {
+        if (!onForceContextChange) return;
+        const next = forceContextScope === null ? "method"
+            : forceContextScope === "method" ? "class"
+            : null;
+        onForceContextChange(next as "method" | "class" | null);
+    }, [forceContextScope, onForceContextChange]);
+
+    const forceLabel = forceContextScope === null ? "Force: -"
+        : forceContextScope === "method" ? "Force: Method"
+        : "Force: Class";
 
     // ── Context label ────────────────────────────────────────────────
     // When globally disabled, show that context gathering is off
@@ -210,6 +235,25 @@ function ContextDialStrip({
                 <span className={`ymm-context-strip__summary-label ymm-context-strip__summary-label--${summaryMode.toLowerCase()}${!globalSummaryEnabled ? " ymm-context-strip__summary-label--disabled" : ""}`}>
                     {summaryLabel}
                 </span>
+
+                {/* ── Force Context button ── */}
+                {/* Visible whenever global context is ON, regardless of per-tab dial.
+                    The user can force a method/class even if the tab dial is OFF.
+                    Force is per-tab and overrides the per-tab dial (but NOT the global kill switch). */}
+                {globalContextEnabled && (
+                    <>
+                        <span className="ymm-context-strip__separator" aria-hidden="true" />
+                        <button
+                            className={`ymm-context-strip__force ${forceContextScope ? "ymm-context-strip__force--active" : ""}`}
+                            onClick={cycleForceContext}
+                            title="Force context: cycle through Nothing / Method / Class"
+                            aria-label={forceLabel}
+                            type="button"
+                        >
+                            {forceLabel}
+                        </button>
+                    </>
+                )}
 
                 {/* Expand toggle — only shown when CUSTOM is the active context mode,
                     since that's the only mode with additional details (the context lever).

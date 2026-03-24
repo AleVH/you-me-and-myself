@@ -420,6 +420,7 @@ class DatabaseHelper(private val dbFile: File) {
                     id                  TEXT PRIMARY KEY,
                     code_element_id     TEXT NOT NULL REFERENCES code_elements(id),
                     project_id          TEXT NOT NULL REFERENCES projects(id),
+                    exchange_id         TEXT NOT NULL REFERENCES chat_exchanges(id),
                     content_hash_at_gen TEXT NOT NULL,
                     is_stale            INTEGER NOT NULL DEFAULT 0,
                     provider_id         TEXT NOT NULL,
@@ -433,6 +434,7 @@ class DatabaseHelper(private val dbFile: File) {
             """.trimIndent())
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_project ON summaries(project_id)")
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_element ON summaries(code_element_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_exchange ON summaries(exchange_id)")
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_stale ON summaries(is_stale)")
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_sum_hash ON summaries(content_hash_at_gen)")
 

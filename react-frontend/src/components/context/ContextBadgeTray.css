@@ -1,0 +1,151 @@
+/* ContextBadgeTray — badge display below the prompt input */
+
+.ymm-badge-tray {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    padding: 3px 8px;
+    min-height: 20px;
+    border-top: 1px solid var(--ymm-border, #333);
+    background: var(--ymm-bg-secondary, #1e1e1e);
+    font-size: 9px;
+    align-items: center;
+}
+
+/* ── Progress bar ───────────────────────────────── */
+
+.ymm-badge-tray__progress {
+    width: 100%;
+    height: 2px;
+    background: var(--ymm-border, #333);
+    border-radius: 1px;
+    overflow: hidden;
+}
+
+.ymm-badge-tray__progress-bar {
+    height: 100%;
+    width: 30%;
+    background: var(--ymm-accent, #569cd6);
+    border-radius: 1px;
+    animation: ymm-progress-slide 1.5s ease-in-out infinite;
+}
+
+@keyframes ymm-progress-slide {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(333%); }
+}
+
+/* ── Badge (shared base) ────────────────────────── */
+
+.ymm-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: var(--ymm-bg-tertiary, #2d2d2d);
+    border: 1px solid var(--ymm-border, #3c3c3c);
+    color: var(--ymm-text-secondary, #b0b0b0);
+    white-space: nowrap;
+    cursor: pointer;
+    transition: opacity 0.15s, border-color 0.15s;
+    font-size: 9px;
+    line-height: 1.3;
+}
+
+.ymm-badge:hover {
+    opacity: 1;
+    border-color: var(--ymm-accent, #569cd6);
+    background: var(--ymm-bg-hover, #363636);
+}
+
+.ymm-badge__icon {
+    font-size: 8px;
+}
+
+.ymm-badge__name {
+    font-weight: 500;
+    color: var(--ymm-text-primary, #d4d4d4);
+    max-width: 100px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 9px;
+}
+
+.ymm-badge__kind {
+    font-size: 7px;
+    padding: 0 2px;
+    border-radius: 2px;
+    background: var(--ymm-bg-secondary, #1e1e1e);
+}
+
+.ymm-badge__tokens {
+    color: var(--ymm-text-muted, #808080);
+    font-size: 8px;
+}
+
+/* ── Freshness colours ──────────────────────────── */
+
+.ymm-badge--fresh {
+    border-color: #6a9955;
+}
+
+.ymm-badge--cached {
+    border-color: #569cd6;
+}
+
+.ymm-badge--rough {
+    border-color: #dcdcaa;
+}
+
+/* ── Stale warning ──────────────────────────────── */
+
+.ymm-badge--stale {
+    opacity: 0.7;
+    border-style: dashed;
+}
+
+/* ── Forced badge ───────────────────────────────── */
+
+.ymm-badge--forced {
+    border-color: #c586c0;
+}
+
+/* ── Ghost badge (before Send) ──────────────────── */
+
+.ymm-badge--ghost {
+    border-style: dotted;
+    opacity: 0.7;
+    border-color: #c586c0;
+}
+
+.ymm-badge--ghost:hover {
+    opacity: 1;
+}
+
+.ymm-badge__ghost-label {
+    font-size: 7px;
+    font-style: italic;
+    color: #c586c0;
+}
+
+/* ── Custom tooltip ─────────────────────────────── */
+
+.ymm-badge-tooltip {
+    position: fixed;
+    transform: translate(-50%, -100%) translateY(-6px);
+    background: var(--ymm-bg-tertiary, #2d2d2d);
+    border: 1px solid var(--ymm-border, #555);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 10px;
+    line-height: 1.4;
+    color: var(--ymm-text-primary, #d4d4d4);
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 9999;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    max-width: 350px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}

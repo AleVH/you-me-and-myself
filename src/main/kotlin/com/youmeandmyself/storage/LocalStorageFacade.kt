@@ -1575,6 +1575,306 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
         }
     }
 
+    // ==================== Element Summary Persistence ====================
+    //
+    // Element-level summaries (method, class) are persisted in the `code_elements`
+    // and `summaries` tables — NOT in `chat_exchanges`.
+    //
+    // Why separate tables:
+    // - `chat_exchanges` is for chat history. Summaries are code analysis artefacts.
+    // - `summaries` has `content_hash_at_gen` (NOT NULL) and `is_stale` columns, which
+    //   `chat_exchanges` does not. These are essential for hash validation.
+    // - `code_elements` maps element signatures to stable IDs with parent relationships,
+    //   enabling hierarchy queries (which methods belong to which class).
+    //
+    // The user pays tokens for every summary. Summaries MUST survive IDE restarts.
+    // In-memory-only caching is NOT acceptable.
+    //
+    // See: BUG FIX — Element Summary Hash Validation.md for the full rationale.
+
+    /**
+     * Data class for element summary query results from SQLite.
+     *
+     * Contains everything needed to restore an element summary into the in-memory cache
+     * with full hash validation support.
+     */
+    data class ElementSummaryRow(
+        val elementSignature: String,
+        val filePath: String,
+        val elementType: String,
+        val elementName: String,
+        val synopsis: String,
+        val contentHashAtGen: String,
+        val isStale: Boolean,
+        val providerId: String,
+        val modelId: String,
+        val generatedAt: String
+    )
+
+    /**
+     * Ensure a code element exists in the `code_elements` table.
+     *
+     * Uses INSERT OR REPLACE — if the element already exists (same ID), it's updated.
+     * The ID is deterministic: SHA-256 of (projectId + filePath + elementSignature).
+     * This means the same element always gets the same ID across sessions.
+     *
+     * @param projectId Current project ID
+     * @param filePath Absolute file path
+     * @param elementSignature PSI element signature (e.g., "MyClass#doThing(String)")
+     * @param elementType Element kind: "CLASS", "METHOD", "FUNCTION", "PROPERTY", etc.
+     * @param elementName Human-readable name (e.g., "doThing")
+     * @param parentSignature Parent element signature (null for top-level)
+     * @param contentHash Current semantic hash of the element
+     * @return The deterministic element ID
+     */
+    fun ensureCodeElement(
+        projectId: String,
+        filePath: String,
+        elementSignature: String,
+        elementType: String,
+        elementName: String,
+        parentSignature: String?,
+        contentHash: String
+    ): String {
+        val database = db ?: run {
+            Dev.warn(log, "storage.ensure_code_element.no_db", null, "signature" to elementSignature)
+            return ""
+        }
+
+        // Deterministic ID: same element always gets the same ID
+        val elementId = computeElementId(projectId, filePath, elementSignature)
+
+        // If the element has a parent, compute the parent's ID too
+        val parentId = if (parentSignature != null) {
+            computeElementId(projectId, filePath, parentSignature)
+        } else null
+
+        try {
+            database.execute(
+                """INSERT OR REPLACE INTO code_elements
+                   (id, project_id, file_path, element_type, element_name, parent_id, content_hash, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                elementId,
+                projectId,
+                filePath,
+                elementType,
+                elementName,
+                parentId,
+                contentHash,
+                Instant.now().toString()
+            )
+        } catch (e: Throwable) {
+            Dev.warn(log, "storage.ensure_code_element.failed", e,
+                "signature" to elementSignature,
+                "filePath" to filePath
+            )
+        }
+
+        return elementId
+    }
+
+    /**
+     * Save an element summary to the `summaries` table.
+     *
+     * This is the persistence path for element-level summaries (method, class).
+     * Called by [SummaryPipeline] after generating a summary via the AI provider.
+     *
+     * The summary is stored with its semantic hash at generation time (`contentHashAtGen`).
+     * This hash is compared against the current code hash on retrieval to detect staleness.
+     * The `content_hash_at_gen` column is NOT NULL — attempting to save without a hash
+     * will fail with a constraint violation (Safeguard #6).
+     *
+     * @param projectId Current project ID
+     * @param codeElementId The ID from [ensureCodeElement]
+     * @param contentHashAtGen Semantic hash of the element at the time of summarization
+     * @param synopsis The generated summary text
+     * @param providerId Which AI provider generated this
+     * @param modelId Which model was used
+     * @param tokensUsed How many tokens were consumed (null if unknown)
+     * @param rawFile Path to the JSONL raw file (for audit trail)
+     * @return The summary ID, or null on failure
+     */
+    fun saveElementSummary(
+        projectId: String,
+        codeElementId: String,
+        exchangeId: String,
+        contentHashAtGen: String,
+        providerId: String,
+        modelId: String,
+        tokensUsed: Int?,
+        rawFile: String
+    ): String? {
+        val database = db ?: run {
+            Dev.warn(log, "storage.save_element_summary.no_db", null,
+                "codeElementId" to codeElementId
+            )
+            return null
+        }
+
+        val summaryId = java.util.UUID.randomUUID().toString()
+
+        try {
+            database.execute(
+                """INSERT OR REPLACE INTO summaries
+                   (id, code_element_id, project_id, exchange_id, content_hash_at_gen, is_stale,
+                    provider_id, model_id, prompt_version, tokens_used, generated_at,
+                    raw_file, raw_available)
+                   VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, ?, ?, ?, 1)""",
+                summaryId,
+                codeElementId,
+                projectId,
+                exchangeId,
+                contentHashAtGen,
+                providerId,
+                modelId,
+                tokensUsed,
+                Instant.now().toString(),
+                rawFile
+            )
+
+            Dev.info(log, "storage.save_element_summary.ok",
+                "summaryId" to summaryId,
+                "codeElementId" to codeElementId,
+                "exchangeId" to exchangeId,
+                "hashAtGen" to contentHashAtGen.take(16)
+            )
+
+            return summaryId
+        } catch (e: Throwable) {
+            Dev.warn(log, "storage.save_element_summary.failed", e,
+                "codeElementId" to codeElementId,
+                "projectId" to projectId
+            )
+            return null
+        }
+    }
+
+    /**
+     * Load all element summaries for a project from the `summaries` + `code_elements` tables.
+     *
+     * Used by the warm-up path to restore element summaries into the in-memory cache
+     * on IDE startup. Returns the full data including the content hash, so the cache
+     * can validate freshness on first access.
+     *
+     * @param projectId Current project ID
+     * @return List of element summary rows with full metadata
+     */
+    fun loadElementSummaries(projectId: String): List<ElementSummaryRow> {
+        val database = db ?: return emptyList()
+
+        return try {
+            // Join summaries → code_elements for metadata + hash,
+            // and join chat_exchanges via exchange_id for the synopsis text.
+            //
+            // The synopsis text lives in chat_exchanges.assistant_text because
+            // SummarizationService persists the AI response there. The summaries
+            // table holds the hash and staleness metadata.
+            //
+            // The link is via summaries.exchange_id → chat_exchanges.id (clean FK).
+            // No LIKE queries, no fragile text matching.
+            database.query(
+                """
+                SELECT ce.file_path, ce.element_type, ce.element_name,
+                       s.content_hash_at_gen, s.is_stale, s.provider_id, s.model_id,
+                       s.generated_at,
+                       ex.assistant_text AS synopsis_text
+                FROM summaries s
+                JOIN code_elements ce ON ce.id = s.code_element_id
+                JOIN chat_exchanges ex ON ex.id = s.exchange_id
+                WHERE s.project_id = ?
+                  AND s.is_stale = 0
+                ORDER BY s.generated_at DESC
+                """.trimIndent(),
+                projectId
+            ) { rs ->
+                val synopsis = rs.getString("synopsis_text") ?: ""
+                val elementName = rs.getString("element_name") ?: ""
+
+                ElementSummaryRow(
+                    elementSignature = elementName,
+                    filePath = rs.getString("file_path") ?: "",
+                    elementType = rs.getString("element_type") ?: "",
+                    elementName = elementName,
+                    synopsis = synopsis,
+                    contentHashAtGen = rs.getString("content_hash_at_gen") ?: "",
+                    isStale = (rs.getInt("is_stale") == 1),
+                    providerId = rs.getString("provider_id") ?: "unknown",
+                    modelId = rs.getString("model_id") ?: "unknown",
+                    generatedAt = rs.getString("generated_at") ?: ""
+                )
+            }.filter { it.synopsis.isNotBlank() }
+        } catch (e: Exception) {
+            Dev.warn(log, "storage.load_element_summaries.failed", e,
+                "projectId" to projectId
+            )
+            emptyList()
+        }
+    }
+
+    /**
+     * Mark element summaries as stale in the `summaries` table.
+     *
+     * Called by [VfsSummaryWatcher] when a file changes and the watcher detects
+     * that specific elements have different semantic hashes. The watcher invalidates
+     * the in-memory cache AND marks the SQLite entries as stale, ensuring consistency
+     * between memory and disk.
+     *
+     * @param projectId Current project ID
+     * @param filePath Absolute file path whose elements changed
+     * @param elementSignatures List of element signatures to mark as stale
+     */
+    fun markElementSummariesStale(
+        projectId: String,
+        filePath: String,
+        elementSignatures: List<String>
+    ) {
+        if (elementSignatures.isEmpty()) return
+
+        val database = db ?: run {
+            Dev.warn(log, "storage.mark_stale.no_db", null,
+                "filePath" to filePath,
+                "count" to elementSignatures.size
+            )
+            return
+        }
+
+        try {
+            // Find code_element IDs for the given signatures and mark their summaries stale
+            for (signature in elementSignatures) {
+                val elementId = computeElementId(projectId, filePath, signature)
+                database.execute(
+                    "UPDATE summaries SET is_stale = 1 WHERE code_element_id = ? AND project_id = ?",
+                    elementId,
+                    projectId
+                )
+            }
+
+            Dev.info(log, "storage.mark_stale.ok",
+                "filePath" to filePath,
+                "count" to elementSignatures.size
+            )
+        } catch (e: Throwable) {
+            Dev.warn(log, "storage.mark_stale.failed", e,
+                "filePath" to filePath,
+                "count" to elementSignatures.size
+            )
+        }
+    }
+
+    /**
+     * Compute a deterministic ID for a code element.
+     *
+     * Uses SHA-256 of (projectId + filePath + elementSignature) to ensure
+     * the same element always gets the same ID across sessions. This is
+     * critical for the foreign key relationship between `code_elements`
+     * and `summaries`.
+     */
+    private fun computeElementId(projectId: String, filePath: String, elementSignature: String): String {
+        val input = "$projectId|$filePath|$elementSignature"
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        return digest.digest(input.toByteArray()).joinToString("") { "%02x".format(it) }
+    }
+
     // ==================== Assistant Text ====================
 
     /**

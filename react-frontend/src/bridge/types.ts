@@ -186,6 +186,22 @@ export const CommandType = {
      * @see BridgeDispatcher.handleRequestContextSettings — Kotlin handler
      */
     REQUEST_CONTEXT_SETTINGS: "REQUEST_CONTEXT_SETTINGS",
+
+    // ── Force Context ────────────────────────────────────────────
+    /**
+     * Lightweight query: check if a forced element would already be
+     * included in automatic context. Used to decide ghost badge display.
+     * Backend responds with RESOLVE_FORCE_CONTEXT_RESULT event.
+     *
+     * @see BridgeMessage.ResolveForceContext — Kotlin command class
+     * @see BridgeDispatcher.handleResolveForceContext — Kotlin handler
+     */
+    RESOLVE_FORCE_CONTEXT: "RESOLVE_FORCE_CONTEXT",
+    /**
+     * Navigate to a source file/element in the IDE editor.
+     * Sent when the user clicks a badge in the badge tray.
+     */
+    NAVIGATE_TO_SOURCE: "NAVIGATE_TO_SOURCE",
 } as const;
 
 export type CommandType = (typeof CommandType)[keyof typeof CommandType];
@@ -234,6 +250,18 @@ export interface SendMessageCommand {
      * Null = default to global setting (backward compatibility).
      */
     summaryEnabled: boolean | null;
+
+    /**
+     * Force Context scope. Set by the Force Context button in the control strip.
+     *
+     * null = no force. "method" = force current method. "class" = force current class.
+     *
+     * Force Context COMPLEMENTS automatic context — does NOT override it.
+     * If the forced element is already part of automatic context, nothing extra happens.
+     *
+     * Phase C.1 — Stub: Field exists for contract. Backend ignores it until Phase C.1.
+     */
+    forceContextScope: "method" | "class" | null;
 }
 
 /** User confirms heuristic was correct. Mirrors BridgeMessage.ConfirmCorrection. */
@@ -436,6 +464,30 @@ export interface RequestContextSettingsCommand {
 }
 
 /**
+ * Check if a forced context scope would already be included in automatic context.
+ * Backend responds with RESOLVE_FORCE_CONTEXT_RESULT event.
+ * @see BridgeMessage.ResolveForceContext
+ */
+export interface ResolveForceContextCommand {
+    type: typeof CommandType.RESOLVE_FORCE_CONTEXT;
+    /** "method" or "class" — what the user wants to force */
+    scope: "method" | "class";
+}
+
+/**
+ * Navigate to a source file/element in the IDE editor.
+ * Sent when the user clicks a badge in the badge tray.
+ * @see BridgeMessage.NavigateToSource
+ */
+export interface NavigateToSourceCommand {
+    type: typeof CommandType.NAVIGATE_TO_SOURCE;
+    /** Absolute path to the file. Null = focus current editor. */
+    filePath: string | null;
+    /** Element signature to position cursor at. Null = file-level. */
+    elementSignature: string | null;
+}
+
+/**
  * Union of all command types.
  *
  * The transport layer serializes this to JSON before sending.
@@ -461,7 +513,9 @@ export type BridgeCommand =
     | OpenConversationCommand
     | DevCommandCommand
     | FrontendLogCommand
-    | RequestContextSettingsCommand;
+    | RequestContextSettingsCommand
+    | ResolveForceContextCommand
+    | NavigateToSourceCommand;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  EVENT TYPES (Backend → Frontend)
@@ -539,6 +593,14 @@ export const EventType = {
      * @see BridgeMessage.ContextSettingsEvent — Kotlin event class
      */
     CONTEXT_SETTINGS: "CONTEXT_SETTINGS",
+
+    // ── Force Context ────────────────────────────────────────────
+    /**
+     * Response to RESOLVE_FORCE_CONTEXT command.
+     * Tells the frontend whether a ghost badge is needed.
+     * @see BridgeMessage.ResolveForceContextResult
+     */
+    RESOLVE_FORCE_CONTEXT_RESULT: "RESOLVE_FORCE_CONTEXT_RESULT",
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
@@ -572,6 +634,48 @@ export interface ChatResultEvent {
     contextSummary: string | null;
     contextTimeMs: number | null;
     tokenUsage: TokenUsageDto | null;
+
+    /**
+     * Structured context metadata for badge tray and sidebar.
+     *
+     * Each entry represents one piece of context (method, class, file)
+     * attached to the request. Frontend renders these as badges.
+     *
+     * Phase D.2 — Stub: Currently always []. Populated in Phase A.3.
+     *
+     * @see ContextFileDetail
+     */
+    contextFiles: ContextFileDetail[];
+}
+
+/**
+ * Metadata about a single piece of context attached to a request.
+ *
+ * Mirrors BridgeMessage.ContextFileDetailDto on the Kotlin side.
+ * Each instance becomes a badge in the badge tray / sidebar.
+ *
+ * @property path - Absolute file path
+ * @property name - Display name (file name, method name, class name)
+ * @property scope - Granularity: "method" | "class" | "file" | "module" | "config"
+ * @property lang - Programming language (e.g., "kotlin", "java")
+ * @property kind - "RAW" (full code) or "SUMMARY" (compressed)
+ * @property freshness - "fresh" (just generated) | "cached" (from store) | "rough" (stale)
+ * @property tokens - Estimated token count
+ * @property isStale - Whether the summary is outdated
+ * @property forced - Whether the user explicitly forced this via Force Context
+ * @property elementSignature - PSI element signature (null for file-level)
+ */
+export interface ContextFileDetail {
+    path: string;
+    name: string;
+    scope: "method" | "class" | "file" | "module" | "config";
+    lang: string;
+    kind: "RAW" | "SUMMARY";
+    freshness: "fresh" | "cached" | "rough";
+    tokens: number;
+    isStale: boolean;
+    forced: boolean;
+    elementSignature: string | null;
 }
 
 /** Show the thinking indicator. Mirrors BridgeMessage.ShowThinkingEvent. */
@@ -932,6 +1036,23 @@ export interface ContextSettingsEvent {
 }
 
 /**
+ * Response to RESOLVE_FORCE_CONTEXT command.
+ * Tells the frontend whether a ghost badge is needed for the forced element.
+ * @see BridgeMessage.ResolveForceContextResult
+ */
+export interface ResolveForceContextResultEvent {
+    type: typeof EventType.RESOLVE_FORCE_CONTEXT_RESULT;
+    /** true = element is already part of automatic context, no ghost badge needed */
+    alreadyIncluded: boolean;
+    /** Display name of the element at cursor (null if no element) */
+    elementName: string | null;
+    /** "method" or "class" (null if no element) */
+    elementScope: string | null;
+    /** Estimated token count (null if unknown) */
+    estimatedTokens: number | null;
+}
+
+/**
  * Union of all event types.
  *
  * The transport layer deserializes incoming JSON into one of these.
@@ -953,4 +1074,5 @@ export type BridgeEvent =
     | BookmarkResultEvent
     | OpenConversationResultEvent
     | DevOutputEvent
-    | ContextSettingsEvent;
+    | ContextSettingsEvent
+    | ResolveForceContextResultEvent;

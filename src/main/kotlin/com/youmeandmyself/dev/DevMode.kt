@@ -59,7 +59,11 @@ object DevMode {
         "/dev-git-test" to "Test git branch detection step by step",
         "/dev-context-test" to "Test full IDE context capture (file, tabs, language, module, branch)",
         "/dev-structure-inspect" to "Inspect current file with PSI detection (classes, methods, hashes, context, cache state)",
-        "/dev-structure-inspect ClassName" to "Inspect a specific class and its methods"
+        "/dev-structure-inspect ClassName" to "Inspect a specific class and its methods",
+        "/dev-summary-health" to "Health check for element summary system (cache vs SQLite consistency)",
+        "/dev-context-single" to "Dry-run: resolve current file + element at cursor via PSI, check cache",
+        "/dev-context-radius" to "Dry-run: show what neighbours would be gathered (stub — needs traversal radius)",
+        "/dev-context-chain" to "Dry-run: full context assembly pipeline preview (stub — needs dry-run flag)"
     )
 
     /**

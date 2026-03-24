@@ -24,6 +24,7 @@ import com.youmeandmyself.summary.structure.CodeStructureProvider
 import com.youmeandmyself.summary.structure.CodeStructureProviderFactory
 import com.youmeandmyself.summary.structure.DetectionScope
 import com.youmeandmyself.summary.structure.ElementLevel
+import com.youmeandmyself.ai.providers.ProviderRegistry
 import com.youmeandmyself.storage.model.ExchangePurpose
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -126,6 +127,11 @@ class SummaryPipeline(private val project: Project) : Disposable {
         CodeStructureProviderFactory.getInstance(project)
     }
 
+    /** Lazy reference to storage facade — for persisting element summaries to SQLite. */
+    private val storage: com.youmeandmyself.storage.LocalStorageFacade by lazy {
+        com.youmeandmyself.storage.LocalStorageFacade.getInstance(project)
+    }
+
     init {
         // Listen for config changes — if kill switch turns off, cancel all queued work
         configService.addConfigChangeListener(ConfigChangeListener { old, new ->
@@ -220,6 +226,205 @@ class SummaryPipeline(private val project: Project) : Disposable {
             path, languageId, currentContentHash,
             trigger = SummaryTrigger.USER_REQUEST
         )
+    }
+
+    // ==================== Demand-Driven Synchronous Generation ====================
+    //
+    // These methods are called by ContextAssembler when it needs a summary for
+    // the CURRENT request. Unlike requestSummary() which enqueues, these generate
+    // synchronously and return the summary text.
+    //
+    // Why synchronous: the user asked a question NOW. If we fire-and-forget, the
+    // summary is only available for the NEXT request — wasting tokens on the current
+    // one. See: Summarization — Agreed Direction.md.
+    //
+    // These methods respect all config gates (kill switch, budget, mode). If the
+    // config doesn't allow generation, they return null (caller uses raw content).
+    //
+    // IMPORTANT: These call the AI provider. They cost tokens. They are gated by
+    // the same config as the async pipeline. Do not call without checking config first.
+
+    /**
+     * Generate a method summary synchronously and return the synopsis text.
+     *
+     * Called by ContextAssembler when a user asks about a method that has no
+     * valid cached summary. Generates the summary, caches it (in-memory + SQLite),
+     * and returns it for immediate attachment to the current request.
+     *
+     * Returns null if:
+     * - Config doesn't allow generation (kill switch, budget, mode)
+     * - No AI provider configured
+     * - PSI unavailable (dumb mode)
+     * - Generation fails (AI error, timeout)
+     *
+     * @param filePath Absolute file path containing the method
+     * @param element The method element to summarize (from PSI detection)
+     * @param parentClassName The name of the containing class (for context)
+     * @return The summary synopsis text, or null if generation is not possible
+     */
+    suspend fun generateMethodSummarySync(
+        filePath: String,
+        element: CodeElement,
+        parentClassName: String
+    ): String? {
+        // Gate: check config allows generation
+        val config = configService.getConfig()
+        if (!config.enabled || config.mode == SummaryMode.OFF) {
+            Dev.info(log, "pipeline.sync.method.denied",
+                "reason" to "config not active",
+                "enabled" to config.enabled,
+                "mode" to config.mode.name
+            )
+            return null
+        }
+        if (!config.hasBudget) {
+            Dev.info(log, "pipeline.sync.method.denied",
+                "reason" to "budget exhausted"
+            )
+            return null
+        }
+
+        // Gate: need an AI provider
+        val provider = ProviderRegistry.selectedSummaryProvider(project)
+        if (provider == null) {
+            Dev.warn(log, "pipeline.sync.method.no_provider", null)
+            return null
+        }
+
+        // Gate: need PSI
+        val structureProvider = structureFactory.get()
+        if (structureProvider == null) {
+            Dev.info(log, "pipeline.sync.method.no_psi",
+                "reason" to "dumb mode or PSI unavailable"
+            )
+            return null
+        }
+
+        // Gate: need VirtualFile
+        val virtualFile = LocalFileSystem.getInstance().findFileByPath(filePath)
+        if (virtualFile == null) {
+            Dev.warn(log, "pipeline.sync.method.no_file", null, "path" to filePath)
+            return null
+        }
+
+        val languageId = virtualFile.fileType.name.lowercase()
+
+        Dev.info(log, "pipeline.sync.method.start",
+            "file" to filePath,
+            "method" to element.name,
+            "parent" to parentClassName
+        )
+
+        return try {
+            generateMethodSummaryIfNeeded(
+                filePath = filePath,
+                file = virtualFile,
+                className = parentClassName,
+                methodElement = element,
+                languageId = languageId,
+                structureProvider = structureProvider,
+                aiProvider = provider
+            )
+        } catch (e: Throwable) {
+            Dev.warn(log, "pipeline.sync.method.failed", e,
+                "method" to element.name,
+                "file" to filePath
+            )
+            null
+        }
+    }
+
+    /**
+     * Generate a class summary synchronously via bottom-up cascade.
+     *
+     * Called by ContextAssembler when a user asks about a class that has no
+     * valid cached summary. This triggers the full cascade:
+     * 1. Detect all methods in the class (via PSI)
+     * 2. For each method: validate existing summary → generate if missing/stale
+     * 3. Build class summary from all method summaries
+     * 4. Cache everything (in-memory + SQLite)
+     * 5. Return the class synopsis text
+     *
+     * This is the "demand-driven cascade" described in the Agreed Direction.
+     * Only generates what's missing — reuses valid cached method summaries.
+     *
+     * Returns null if:
+     * - Config doesn't allow generation
+     * - No AI provider configured
+     * - PSI unavailable
+     * - Generation fails
+     *
+     * @param filePath Absolute file path containing the class
+     * @param element The class element to summarize (from PSI detection)
+     * @return The class summary synopsis text, or null if generation is not possible
+     */
+    suspend fun generateClassSummarySync(
+        filePath: String,
+        element: CodeElement
+    ): String? {
+        // Gate: check config allows generation
+        val config = configService.getConfig()
+        if (!config.enabled || config.mode == SummaryMode.OFF) {
+            Dev.info(log, "pipeline.sync.class.denied",
+                "reason" to "config not active",
+                "enabled" to config.enabled,
+                "mode" to config.mode.name
+            )
+            return null
+        }
+        if (!config.hasBudget) {
+            Dev.info(log, "pipeline.sync.class.denied",
+                "reason" to "budget exhausted"
+            )
+            return null
+        }
+
+        // Gate: need an AI provider
+        val provider = ProviderRegistry.selectedSummaryProvider(project)
+        if (provider == null) {
+            Dev.warn(log, "pipeline.sync.class.no_provider", null)
+            return null
+        }
+
+        // Gate: need PSI
+        val structureProvider = structureFactory.get()
+        if (structureProvider == null) {
+            Dev.info(log, "pipeline.sync.class.no_psi",
+                "reason" to "dumb mode or PSI unavailable"
+            )
+            return null
+        }
+
+        // Gate: need VirtualFile
+        val virtualFile = LocalFileSystem.getInstance().findFileByPath(filePath)
+        if (virtualFile == null) {
+            Dev.warn(log, "pipeline.sync.class.no_file", null, "path" to filePath)
+            return null
+        }
+
+        val languageId = virtualFile.fileType.name.lowercase()
+
+        Dev.info(log, "pipeline.sync.class.start",
+            "file" to filePath,
+            "class" to element.name
+        )
+
+        return try {
+            generateClassSummaryIfNeeded(
+                filePath = filePath,
+                file = virtualFile,
+                classElement = element,
+                languageId = languageId,
+                structureProvider = structureProvider,
+                aiProvider = provider
+            )
+        } catch (e: Throwable) {
+            Dev.warn(log, "pipeline.sync.class.failed", e,
+                "class" to element.name,
+                "file" to filePath
+            )
+            null
+        }
     }
 
     /**
@@ -467,7 +672,7 @@ class SummaryPipeline(private val project: Project) : Disposable {
         // --- We hold the claim — proceed with generation ---
         try {
             // Get the summary provider
-            val provider = com.youmeandmyself.ai.providers.ProviderRegistry.selectedSummaryProvider(project)
+            val provider = ProviderRegistry.selectedSummaryProvider(project)
             if (provider == null) {
                 Dev.warn(log, "pipeline.no_provider", null, "path" to path)
                 cache.failClaim(path)
@@ -860,7 +1065,7 @@ class SummaryPipeline(private val project: Project) : Disposable {
             val cleanSummary = SummaryExtractor.extractSummaryOnly(result.summaryText)
             val contract = SummaryExtractor.extractContract(result.summaryText)
 
-            // Cache the class summary at element level
+            // Cache the class summary at element level (in-memory)
             val classHash = structureProvider.computeElementHash(file, classElement)
             cache.completeElementClaim(
                 path = filePath,
@@ -869,6 +1074,41 @@ class SummaryPipeline(private val project: Project) : Disposable {
                 synopsis = cleanSummary,
                 contentHash = classHash
             )
+
+            // Persist to SQLite (summaries + code_elements tables).
+            // The user paid tokens for this summary — it MUST survive IDE restarts.
+            // See: BUG FIX — Element Summary Hash Validation.md
+            try {
+                val projectId = storage.resolveProjectId()
+                val elementId = storage.ensureCodeElement(
+                    projectId = projectId,
+                    filePath = filePath,
+                    elementSignature = classElement.signature,
+                    elementType = classElement.kind.name,
+                    elementName = classElement.name,
+                    parentSignature = classElement.parentName,
+                    contentHash = classHash
+                )
+                if (elementId.isNotBlank()) {
+                    storage.saveElementSummary(
+                        projectId = projectId,
+                        codeElementId = elementId,
+                        exchangeId = result.exchangeId,
+                        contentHashAtGen = classHash,
+                        providerId = result.exchangeId,
+                        modelId = languageId ?: "unknown",
+                        tokensUsed = result.tokenUsage?.totalTokens,
+                        rawFile = ""  // JSONL path managed by SummarizationService
+                    )
+                }
+            } catch (e: Throwable) {
+                // Persistence failure is logged but does NOT block the pipeline.
+                // The in-memory cache has the summary — SQLite is for cross-session survival.
+                Dev.warn(log, "pipeline.hierarchical.class_persist_failed", e,
+                    "class" to classElement.name,
+                    "signature" to classElement.signature
+                )
+            }
 
             Dev.info(log, "pipeline.hierarchical.class_summary_generated",
                 "class" to classElement.name,
@@ -952,7 +1192,7 @@ class SummaryPipeline(private val project: Project) : Disposable {
             val cleanSummary = SummaryExtractor.extractSummaryOnly(result.summaryText)
             val contract = SummaryExtractor.extractContract(result.summaryText)
 
-            // Cache the method summary at element level
+            // Cache the method summary at element level (in-memory)
             val methodHash = structureProvider.computeElementHash(file, methodElement)
             cache.completeElementClaim(
                 path = filePath,
@@ -961,6 +1201,41 @@ class SummaryPipeline(private val project: Project) : Disposable {
                 synopsis = cleanSummary,
                 contentHash = methodHash
             )
+
+            // Persist to SQLite (summaries + code_elements tables).
+            // The user paid tokens for this summary — it MUST survive IDE restarts.
+            // See: BUG FIX — Element Summary Hash Validation.md
+            try {
+                val projectId = storage.resolveProjectId()
+                val elementId = storage.ensureCodeElement(
+                    projectId = projectId,
+                    filePath = filePath,
+                    elementSignature = methodElement.signature,
+                    elementType = methodElement.kind.name,
+                    elementName = methodElement.name,
+                    parentSignature = className,
+                    contentHash = methodHash
+                )
+                if (elementId.isNotBlank()) {
+                    storage.saveElementSummary(
+                        projectId = projectId,
+                        codeElementId = elementId,
+                        exchangeId = result.exchangeId,
+                        contentHashAtGen = methodHash,
+                        providerId = result.exchangeId,
+                        modelId = languageId ?: "unknown",
+                        tokensUsed = result.tokenUsage?.totalTokens,
+                        rawFile = ""  // JSONL path managed by SummarizationService
+                    )
+                }
+            } catch (e: Throwable) {
+                // Persistence failure is logged but does NOT block the pipeline.
+                // The in-memory cache has the summary — SQLite is for cross-session survival.
+                Dev.warn(log, "pipeline.hierarchical.method_persist_failed", e,
+                    "method" to methodElement.name,
+                    "signature" to methodElement.signature
+                )
+            }
 
             Dev.info(log, "pipeline.hierarchical.method_summary_generated",
                 "method" to methodElement.name,
