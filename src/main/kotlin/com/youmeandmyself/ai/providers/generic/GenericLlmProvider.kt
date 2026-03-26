@@ -31,6 +31,8 @@ package com.youmeandmyself.ai.providers.generic
  * - buildMessageArray() and buildContentArray() handle the injection.
  */
 
+import com.youmeandmyself.ai.chat.context.formatContextBlock
+import com.youmeandmyself.ai.chat.orchestrator.RequestBlocks
 import com.youmeandmyself.ai.net.HttpClientFactory
 import com.youmeandmyself.ai.providers.AiProvider
 import com.youmeandmyself.ai.providers.ProviderResponse
@@ -134,6 +136,77 @@ class GenericLlmProvider(
             ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(prompt, settings, history, systemPrompt)
             ApiProtocol.GEMINI        -> requestGemini(prompt, settings, history, systemPrompt)
             ApiProtocol.CUSTOM        -> requestCustom(prompt, settings, history, systemPrompt)
+        }
+    }
+
+    /**
+     * Send a structured chat request using the RequestBlocks model.
+     *
+     * ## Phase 1 — Structured Request
+     *
+     * Accepts the four independent blocks as a [RequestBlocks] data class,
+     * serializes the context block into text, concatenates it with the user
+     * message, and delegates to the protocol-specific request methods.
+     *
+     * The API output is identical to the legacy [chat] method — the context
+     * block serialization produces the same text format that ContextAssembler
+     * previously baked into the effectivePrompt.
+     *
+     * ## Serialization order
+     *
+     * 1. profile → system message (via existing buildMessageArray/buildContentArray)
+     * 2. compactedHistory → summary turn before verbatim history (Phase 4, null for now)
+     * 3. verbatimHistory → user/assistant message pairs
+     * 4. context + userMessage → final user message (context prepended)
+     */
+    override suspend fun chat(requestBlocks: RequestBlocks): ProviderResponse {
+        // Serialize context block into prompt text.
+        // This produces the same format as ContextAssembler's filesSection() + contextNote.
+        val contextString = formatContextBlock(requestBlocks.context)
+
+        // Concatenate context + user message — same output as the old effectivePrompt.
+        // Context goes first so the AI sees it before the user's question.
+        val finalUserMessage = if (contextString.isNotBlank()) {
+            "$contextString\n\n${requestBlocks.userMessage}"
+        } else {
+            requestBlocks.userMessage
+        }
+
+        val settings = chatSettings ?: RequestSettings.chatDefaults()
+
+        // Phase 4: Prepend compacted history as a SYSTEM turn before verbatim turns.
+        // This ensures all three request methods (OpenAI, Gemini, Custom) include
+        // the compacted summary without changing their signatures.
+        val effectiveHistory = if (requestBlocks.compactedHistory != null) {
+            val summaryTurn = ConversationTurn(
+                role = TurnRole.SYSTEM,
+                content = "[Earlier conversation summary]\n${requestBlocks.compactedHistory}"
+            )
+            listOf(summaryTurn) + requestBlocks.verbatimHistory
+        } else {
+            requestBlocks.verbatimHistory
+        }
+
+        Dev.info(log, "requestblocks.chat",
+            "hasProfile" to (requestBlocks.profile != null),
+            "hasCompactedHistory" to (requestBlocks.compactedHistory != null),
+            "historyTurns" to effectiveHistory.size,
+            "contextEntries" to requestBlocks.context.allEntries.size,
+            "contextTokens" to requestBlocks.context.totalTokenEstimate,
+            "userMessageLength" to requestBlocks.userMessage.length,
+            "finalPromptLength" to finalUserMessage.length
+        )
+
+        return when (protocol) {
+            ApiProtocol.OPENAI_COMPAT -> requestOpenAiCompat(
+                finalUserMessage, settings, effectiveHistory, requestBlocks.profile
+            )
+            ApiProtocol.GEMINI -> requestGemini(
+                finalUserMessage, settings, effectiveHistory, requestBlocks.profile
+            )
+            ApiProtocol.CUSTOM -> requestCustom(
+                finalUserMessage, settings, effectiveHistory, requestBlocks.profile
+            )
         }
     }
 

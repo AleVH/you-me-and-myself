@@ -92,7 +92,27 @@ data class ChatResult(
      *
      * Null for error results or when timing wasn't captured.
      */
-    val responseTimeMs: Long? = null
+    val responseTimeMs: Long? = null,
+
+    // ── Per-block token estimates (Phase 1 — RequestBlocks) ──────────
+    //
+    // Estimated token counts for each section of the structured request.
+    // Computed in ChatOrchestrator using the content.length / 4 heuristic.
+    // These are ESTIMATES — the provider-reported promptTokens is the truth.
+    // Used by MetricsService to persist per-block breakdown and by the
+    // frontend stacked bar (Phase 4 UI).
+
+    /** Estimated tokens for the system prompt (assistant profile). Null if no profile. */
+    val profileTokens: Int? = null,
+
+    /** Estimated tokens for conversation history (compacted + verbatim). */
+    val historyTokens: Int? = null,
+
+    /** Estimated tokens for the context block (summaries + raw + other). */
+    val contextTokens: Int? = null,
+
+    /** Estimated tokens for the user's message. */
+    val messageTokens: Int? = null
 ) {
     companion object {
 

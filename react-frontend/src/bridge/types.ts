@@ -202,6 +202,18 @@ export const CommandType = {
      * Sent when the user clicks a badge in the badge tray.
      */
     NAVIGATE_TO_SOURCE: "NAVIGATE_TO_SOURCE",
+
+    // ── Phase 2: Context Staging Area ────────────────────────────
+    /** Remove a context entry from the staging area (badge dismiss). */
+    REMOVE_CONTEXT_ENTRY: "REMOVE_CONTEXT_ENTRY",
+    /** Request background context gathering for a tab. */
+    START_CONTEXT_GATHERING: "START_CONTEXT_GATHERING",
+
+    // ── Phase 3: Context Staleness ───────────────────────────
+    /** Dismiss a staleness flag on a sidebar entry. */
+    DISMISS_STALENESS: "DISMISS_STALENESS",
+    /** Re-gather a stale file into the staging area. */
+    REFRESH_CONTEXT_ENTRY: "REFRESH_CONTEXT_ENTRY",
 } as const;
 
 export type CommandType = (typeof CommandType)[keyof typeof CommandType];
@@ -262,6 +274,13 @@ export interface SendMessageCommand {
      * Phase C.1 — Stub: Field exists for contract. Backend ignores it until Phase C.1.
      */
     forceContextScope: "method" | "class" | null;
+
+    /**
+     * Tab ID for staging area integration (Phase 2).
+     * When set, the backend checks the staging area for pre-gathered context
+     * before running synchronous assembly. Null = legacy behavior.
+     */
+    tabId?: string | null;
 }
 
 /** User confirms heuristic was correct. Mirrors BridgeMessage.ConfirmCorrection. */
@@ -433,6 +452,7 @@ export interface OpenConversationCommand {
 export interface DevCommandCommand {
     type: typeof CommandType.DEV_COMMAND;
     text: string;
+    tabId?: string;
 }
 
 /**
@@ -487,6 +507,57 @@ export interface NavigateToSourceCommand {
     elementSignature: string | null;
 }
 
+// ── Phase 2: Context Staging Area Commands ──────────────────────────
+
+/**
+ * Remove a context entry (badge) from the staging area.
+ * Mirrors BridgeMessage.RemoveContextEntry.
+ *
+ * Sent when the user clicks the X button on a badge in the tray.
+ * Pro tier only — Basic tier users see no X button.
+ */
+export interface RemoveContextEntryCommand {
+    type: typeof CommandType.REMOVE_CONTEXT_ENTRY;
+    /** The tab whose staging area to modify. */
+    tabId: string;
+    /** The unique ID of the context entry to remove. */
+    entryId: string;
+}
+
+/**
+ * Request background context gathering for a tab.
+ * Mirrors BridgeMessage.StartContextGathering.
+ *
+ * Sent when the user's input changes and context should be gathered
+ * in the background. Phase 2 B5 — currently a backend stub.
+ */
+export interface StartContextGatheringCommand {
+    type: typeof CommandType.START_CONTEXT_GATHERING;
+    tabId: string;
+    userInput: string;
+    bypassMode: string | null;
+    selectiveLevel: number | null;
+    summaryEnabled: boolean | null;
+    forceContextScope: string | null;
+}
+
+// ── Phase 3: Context Staleness Commands ─────────────────────────────
+
+/** Dismiss staleness flag on a sidebar entry. Mirrors BridgeMessage.DismissStaleness. */
+export interface DismissStalenessCommand {
+    type: typeof CommandType.DISMISS_STALENESS;
+    conversationId: string;
+    entryId: string;
+}
+
+/** Re-gather a stale file. Mirrors BridgeMessage.RefreshContextEntry. */
+export interface RefreshContextEntryCommand {
+    type: typeof CommandType.REFRESH_CONTEXT_ENTRY;
+    tabId: string;
+    filePath: string;
+    originalEntryId: string;
+}
+
 /**
  * Union of all command types.
  *
@@ -515,7 +586,11 @@ export type BridgeCommand =
     | FrontendLogCommand
     | RequestContextSettingsCommand
     | ResolveForceContextCommand
-    | NavigateToSourceCommand;
+    | NavigateToSourceCommand
+    | RemoveContextEntryCommand
+    | StartContextGatheringCommand
+    | DismissStalenessCommand
+    | RefreshContextEntryCommand;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  EVENT TYPES (Backend → Frontend)
@@ -601,6 +676,29 @@ export const EventType = {
      * @see BridgeMessage.ResolveForceContextResult
      */
     RESOLVE_FORCE_CONTEXT_RESULT: "RESOLVE_FORCE_CONTEXT_RESULT",
+
+    // ── Context Progress & Badge Update ──────────────────────────
+    // Used by /dev-mock-badges and will be adopted by the real pipeline.
+
+    /**
+     * Context gathering progress update.
+     * Drives the thin progress bar below the badge tray (red→green gradient).
+     * @see BridgeMessage.ContextProgressEvent
+     */
+    CONTEXT_PROGRESS: "CONTEXT_PROGRESS",
+
+    /**
+     * Incremental badge list update during context gathering.
+     * Full state replacement — frontend replaces its badge list entirely.
+     * @see BridgeMessage.ContextBadgeUpdateEvent
+     */
+    CONTEXT_BADGE_UPDATE: "CONTEXT_BADGE_UPDATE",
+
+    // ── Phase 3: Context Sidebar + Staleness ──────────────────
+    /** Sent context manifest for sidebar display. */
+    SENT_CONTEXT_UPDATE: "SENT_CONTEXT_UPDATE",
+    /** File changed after being sent — sidebar entry is stale. */
+    CONTEXT_STALENESS_UPDATE: "CONTEXT_STALENESS_UPDATE",
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];
@@ -666,6 +764,8 @@ export interface ChatResultEvent {
  * @property elementSignature - PSI element signature (null for file-level)
  */
 export interface ContextFileDetail {
+    /** Unique entry ID for staging area operations. Null for legacy/mock badges. */
+    id: string | null;
     path: string;
     name: string;
     scope: "method" | "class" | "file" | "module" | "config";
@@ -738,6 +838,23 @@ export interface UpdateMetricsEvent {
      * Null for legacy events that don't carry purpose.
      */
     purpose: string | null;
+
+    // ── Per-block token estimates (Phase 1 — RequestBlocks) ──────
+    // Estimated token counts for each section of the structured request.
+    // These are estimates (content.length / 4), not provider-reported.
+    // Data always collected; stacked bar UI is Phase 4.
+
+    /** Estimated tokens for the system prompt. Null if no profile. */
+    profileTokens: number | null;
+
+    /** Estimated tokens for conversation history. Null if no history. */
+    historyTokens: number | null;
+
+    /** Estimated tokens for the context block. Null if no context. */
+    contextTokens: number | null;
+
+    /** Estimated tokens for the user's message. */
+    messageTokens: number | null;
 }
 
 /**
@@ -1052,6 +1169,77 @@ export interface ResolveForceContextResultEvent {
     estimatedTokens: number | null;
 }
 
+// ── Context Progress & Badge Update ──────────────────────────────────
+
+/**
+ * Context gathering progress update. Mirrors BridgeMessage.ContextProgressEvent.
+ *
+ * Drives the thin progress bar below the badge tray. The bar fills from 0→100
+ * with a red→amber→yellow→green colour gradient based on percent.
+ * Stage is informational (shown in tooltip).
+ *
+ * Emitted by both the mock simulator (/dev-mock-badges) and the future
+ * real context assembly pipeline.
+ */
+export interface ContextProgressEvent {
+    type: typeof EventType.CONTEXT_PROGRESS;
+    /** Tab that initiated the context gathering — events are ignored on other tabs */
+    tabId?: string;
+    /** Human-readable stage: "detecting", "summarizing", "complete" */
+    stage: string;
+    /** Progress 0–100. */
+    percent: number;
+    /** Optional status text (e.g., "Running LanguageDetector…") */
+    message?: string;
+}
+
+/**
+ * Incremental badge list update. Mirrors BridgeMessage.ContextBadgeUpdateEvent.
+ *
+ * Each event carries the FULL badge list as of that moment — the frontend
+ * replaces its state entirely (no append logic). When complete is true,
+ * the progress bar hides and no further updates follow.
+ *
+ * Ghost badge transition: if a badge has the same elementSignature as the
+ * current ghost badge, the ghost is replaced in-place.
+ */
+export interface ContextBadgeUpdateEvent {
+    type: typeof EventType.CONTEXT_BADGE_UPDATE;
+    /** Tab that initiated the context gathering — events are ignored on other tabs */
+    tabId?: string;
+    /** Complete list of context files detected/summarised so far */
+    badges: ContextFileDetail[];
+    /** True when the pipeline (or mock) is finished */
+    complete: boolean;
+}
+
+// ── Phase 3: Context Sidebar + Staleness Events ─────────────────────
+
+/**
+ * Sent context manifest — emitted after each Send.
+ * Mirrors BridgeMessage.SentContextUpdateEvent.
+ *
+ * The sidebar consumes this to display what context was sent per turn.
+ */
+export interface SentContextUpdateEvent {
+    type: typeof EventType.SENT_CONTEXT_UPDATE;
+    conversationId: string;
+    turnIndex: number;
+    entries: ContextFileDetail[];
+}
+
+/**
+ * Staleness notification — a file changed after being sent as context.
+ * Mirrors BridgeMessage.ContextStalenessUpdateEvent.
+ *
+ * The sidebar marks matching entries as stale.
+ */
+export interface ContextStalenessUpdateEvent {
+    type: typeof EventType.CONTEXT_STALENESS_UPDATE;
+    filePath: string;
+    conversationId: string | null;
+}
+
 /**
  * Union of all event types.
  *
@@ -1075,4 +1263,8 @@ export type BridgeEvent =
     | OpenConversationResultEvent
     | DevOutputEvent
     | ContextSettingsEvent
-    | ResolveForceContextResultEvent;
+    | ResolveForceContextResultEvent
+    | ContextProgressEvent
+    | ContextBadgeUpdateEvent
+    | SentContextUpdateEvent
+    | ContextStalenessUpdateEvent;

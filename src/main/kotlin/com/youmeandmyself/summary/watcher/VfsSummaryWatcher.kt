@@ -74,6 +74,11 @@ class VfsSummaryWatcher(
         com.youmeandmyself.storage.LocalStorageFacade.getInstance(project)
     }
 
+    /** Lazy reference to context staging service — for staleness propagation (Phase 3). */
+    private val contextStagingService: com.youmeandmyself.ai.chat.context.ContextStagingService by lazy {
+        com.youmeandmyself.ai.chat.context.ContextStagingService.getInstance(project)
+    }
+
     private val connection: MessageBusConnection = project.messageBus.connect()
 
     init {
@@ -135,6 +140,19 @@ class VfsSummaryWatcher(
         // The file-level hash change is still recorded above, so staleness is
         // detected on next access via the validation rule.
         performElementLevelInvalidation(vf, languageId)
+
+        // Phase 3: Notify context staging service about the file change.
+        // If this file is in any tab's staging area, those entries get marked stale.
+        // The staging service returns which entries were affected — the caller
+        // (BridgeDispatcher or a listener) can emit CONTEXT_STALENESS_UPDATE events.
+        try {
+            contextStagingService.markEntriesStale(vf.path)
+        } catch (e: Exception) {
+            // Non-fatal — staleness notification should never block VFS processing
+            Dev.warn(log, "vfs.staleness_notify_failed", e,
+                "path" to vf.path
+            )
+        }
     }
 
     private fun onMovedOrRenamed(vf: VirtualFile) {

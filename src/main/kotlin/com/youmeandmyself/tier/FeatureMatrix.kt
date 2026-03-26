@@ -46,7 +46,8 @@ object FeatureMatrix {
         Feature.PROFILE_UNLIMITED,
         Feature.SUMMARY_MODULE_LEVEL,
         Feature.SUMMARY_PROJECT_LEVEL,
-        Feature.CONTEXT_BRANCHING
+        Feature.CONTEXT_BRANCHING,
+        Feature.CONTEXT_BADGE_REMOVAL
     )
 
     // ── Company Basic: team features on top of Individual Basic ──────────

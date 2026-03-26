@@ -110,6 +110,11 @@
         <!-- Chat: conversation lifecycle (create, load, switch, close) -->
         <projectService serviceImplementation="com.youmeandmyself.ai.chat.conversation.ConversationManager"/>
 
+        <!-- ── ContextStagingService — project-level service ────────────────── -->
+        <!-- Per-tab staging area for context entries. Holds entries that will be
+             included in the next message. Snapshotted at send time, cleared after. -->
+        <projectService serviceImplementation="com.youmeandmyself.ai.chat.context.ContextStagingService"/>
+
         <!-- ── MetricsService — project-level service ──────────────────────── -->
         <!-- One instance per project. Receives token data from BridgeDispatcher,
              writes MetricsRecord to SQLite, builds UpdateMetricsEvent. -->

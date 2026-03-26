@@ -94,7 +94,12 @@ class MetricsService(private val project: Project) {
         modelId: String?,
         purpose: String,
         responseTimeMs: Long? = null,
-        tabId: String? = null
+        tabId: String? = null,
+        // Phase 1 — per-block token estimates from RequestBlocks
+        profileTokens: Int? = null,
+        historyTokens: Int? = null,
+        contextTokens: Int? = null,
+        messageTokens: Int? = null
     ): BridgeMessage.UpdateMetricsEvent? {
 
         // If there's no token data at all, there's nothing to record or display.
@@ -141,7 +146,12 @@ class MetricsService(private val project: Project) {
                 responseTimeMs = responseTimeMs,
                 // Company tier fields — null at Individual launch
                 userId = null,
-                projectId = null
+                projectId = null,
+                // Phase 1 — per-block token estimates
+                profileTokens = profileTokens,
+                historyTokens = historyTokens,
+                contextTokens = contextTokens,
+                messageTokens = messageTokens
             )
 
             // ── Persist to SQLite ────────────────────────────────────
@@ -177,7 +187,12 @@ class MetricsService(private val project: Project) {
                 totalTokens = tokenUsage.effectiveTotal,
                 contextWindowSize = contextWindowSize,
                 responseTimeMs = responseTimeMs,
-                purpose = purpose
+                purpose = purpose,
+                // Phase 1 — per-block token estimates
+                profileTokens = profileTokens,
+                historyTokens = historyTokens,
+                contextTokens = contextTokens,
+                messageTokens = messageTokens
             )
 
         } catch (e: Exception) {

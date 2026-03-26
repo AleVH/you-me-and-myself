@@ -118,7 +118,14 @@ object BridgeMessage {
          *
          * @see ContextAssembler.assemble — will read this field in Phase C.1
          */
-        val forceContextScope: String? = null
+        val forceContextScope: String? = null,
+        /**
+         * Tab ID for staging area integration (Phase 2).
+         *
+         * When non-null, the orchestrator checks the staging area for pre-gathered
+         * context before running synchronous assembly. Null = legacy behavior.
+         */
+        val tabId: String? = null
     ) : Command()
 
     @Serializable
@@ -380,7 +387,96 @@ object BridgeMessage {
     @SerialName("DEV_COMMAND")
     data class DevCommand(
         override val type: String = "DEV_COMMAND",
-        val text: String
+        val text: String,
+        val tabId: String? = null
+    ) : Command()
+
+    // ── Phase 2: Context Staging Area Commands ──────────────────
+
+    /**
+     * Remove a context entry from the staging area (badge dismiss).
+     *
+     * Sent when the user clicks the X button on a badge in the tray.
+     * The backend removes the entry from [ContextStagingService] and
+     * emits a CONTEXT_BADGE_UPDATE event with the updated badge list.
+     *
+     * Tier-gated: only Pro tier users can remove individual entries.
+     * Basic tier users see no X button — this command is never sent.
+     *
+     * @property tabId The tab whose staging area to modify
+     * @property entryId The unique ID of the context entry to remove
+     */
+    @Serializable
+    @SerialName("REMOVE_CONTEXT_ENTRY")
+    data class RemoveContextEntry(
+        override val type: String = "REMOVE_CONTEXT_ENTRY",
+        val tabId: String,
+        val entryId: String
+    ) : Command()
+
+    /**
+     * Request context gathering to start for a tab.
+     *
+     * Sent when the user's input changes and context should be gathered
+     * in the background. The backend starts gathering via [ContextStagingService]
+     * and emits CONTEXT_PROGRESS + CONTEXT_BADGE_UPDATE events as entries arrive.
+     *
+     * @property tabId The tab to gather context for
+     * @property userInput The current user input text (for heuristic analysis)
+     * @property bypassMode Context bypass mode from the dial
+     * @property selectiveLevel Lever level when bypassMode is SELECTIVE
+     * @property summaryEnabled Per-tab summary toggle
+     * @property forceContextScope Force context selection
+     */
+    @Serializable
+    @SerialName("START_CONTEXT_GATHERING")
+    data class StartContextGathering(
+        override val type: String = "START_CONTEXT_GATHERING",
+        val tabId: String,
+        val userInput: String,
+        val bypassMode: String? = null,
+        val selectiveLevel: Int? = null,
+        val summaryEnabled: Boolean? = null,
+        val forceContextScope: String? = null
+    ) : Command()
+
+    // ── Phase 3: Context Sidebar + Staleness Commands ─────────
+
+    /**
+     * Dismiss a staleness flag on a sidebar entry.
+     *
+     * The user decides the stale context is irrelevant for this conversation.
+     * The sidebar clears the stale visual indicator for this entry.
+     *
+     * @property conversationId The conversation containing the entry
+     * @property entryId The context entry to dismiss staleness on
+     */
+    @Serializable
+    @SerialName("DISMISS_STALENESS")
+    data class DismissStaleness(
+        override val type: String = "DISMISS_STALENESS",
+        val conversationId: String,
+        val entryId: String
+    ) : Command()
+
+    /**
+     * Refresh a stale context entry.
+     *
+     * Re-gathers the specific file and adds the updated entry to the staging
+     * area with metadata indicating it replaces a previously-sent version.
+     * The AI will know this is an update, not a new context entry.
+     *
+     * @property tabId The active tab (for staging area)
+     * @property filePath The file to re-gather
+     * @property originalEntryId The entry this refresh replaces
+     */
+    @Serializable
+    @SerialName("REFRESH_CONTEXT_ENTRY")
+    data class RefreshContextEntry(
+        override val type: String = "REFRESH_CONTEXT_ENTRY",
+        val tabId: String,
+        val filePath: String,
+        val originalEntryId: String
     ) : Command()
 
     // ── Block 5C: Frontend Logging ──────────────────────────────
@@ -478,6 +574,8 @@ object BridgeMessage {
      */
     @Serializable
     data class ContextFileDetailDto(
+        /** Unique entry ID for staging area operations. Null for legacy/mock badges. */
+        val id: String? = null,
         val path: String,
         val name: String,
         val scope: String,
@@ -516,6 +614,86 @@ object BridgeMessage {
         val elementName: String? = null,
         val elementScope: String? = null,
         val estimatedTokens: Int? = null
+    ) : Event()
+
+    // ── Context Progress & Badge Update ─────────────────────────────
+    // Used by the mock badge simulator (/dev-mock-badges) and will be
+    // adopted by the real context assembly pipeline (Phase B.1+).
+
+    /**
+     * Context gathering progress update.
+     *
+     * Drives the thin progress bar below the badge tray.
+     * The bar fills from 0 to 100 with a red→amber→yellow→green colour gradient
+     * controlled purely by [percent]. Stage is informational only (shown in tooltip).
+     *
+     * @param stage Human-readable stage label: "detecting", "summarizing", "complete"
+     * @param percent Progress 0–100. Bar is hidden when null/absent.
+     * @param message Optional status text (e.g., "Running LanguageDetector…")
+     */
+    @Serializable
+    data class ContextProgressEvent(
+        override val type: String = "CONTEXT_PROGRESS",
+        val tabId: String? = null,
+        val stage: String,
+        val percent: Int,
+        val message: String? = null
+    ) : Event()
+
+    /**
+     * Incremental badge list update during context gathering.
+     *
+     * Each event carries the **full** badge list as of that moment — the frontend
+     * replaces its state entirely (no append logic needed). When [complete] is true
+     * the progress bar is hidden and no further updates follow.
+     *
+     * Ghost badge transition: if a badge in [badges] has the same elementSignature
+     * as the current ghost badge, the frontend replaces the ghost in-place.
+     *
+     * @param badges Complete list of context files detected/summarised so far
+     * @param complete True when the pipeline (or mock) is finished
+     */
+    @Serializable
+    data class ContextBadgeUpdateEvent(
+        override val type: String = "CONTEXT_BADGE_UPDATE",
+        val tabId: String? = null,
+        val badges: List<ContextFileDetailDto>,
+        val complete: Boolean = false
+    ) : Event()
+
+    // ── Phase 3: Context Sidebar + Staleness Events ────────────────
+
+    /**
+     * Sent context update — emitted after each Send with the manifest data.
+     *
+     * The sidebar consumes this to add newly sent context entries.
+     * Each event carries the full manifest for one turn.
+     *
+     * @property conversationId Which conversation this belongs to
+     * @property turnIndex The turn number within the conversation
+     * @property entries The context entries that were sent in this turn
+     */
+    @Serializable
+    data class SentContextUpdateEvent(
+        override val type: String = "SENT_CONTEXT_UPDATE",
+        val conversationId: String,
+        val turnIndex: Int,
+        val entries: List<ContextFileDetailDto>
+    ) : Event()
+
+    /**
+     * Staleness notification — emitted when a file changes after being sent.
+     *
+     * The sidebar marks the corresponding entry as stale.
+     *
+     * @property filePath The file that changed
+     * @property conversationId Which conversation's sent context is affected (null = check all)
+     */
+    @Serializable
+    data class ContextStalenessUpdateEvent(
+        override val type: String = "CONTEXT_STALENESS_UPDATE",
+        val filePath: String,
+        val conversationId: String? = null
     ) : Event()
 
     @Serializable
@@ -588,7 +766,26 @@ object BridgeMessage {
          * Enables the frontend to filter or label metrics by purpose.
          * Null for legacy callers that don't pass purpose.
          */
-        val purpose: String? = null
+        val purpose: String? = null,
+
+        // ── Per-block token estimates (Phase 1 — RequestBlocks) ──────
+        //
+        // Estimated token counts for each section of the structured request.
+        // These are estimates (content.length / 4), not provider-reported.
+        // The stacked bar UI (Phase 4) will use these to show the proportion
+        // of each block. Data always collected; display is tier-gated.
+
+        /** Estimated tokens for the system prompt. Null if no profile. */
+        val profileTokens: Int? = null,
+
+        /** Estimated tokens for conversation history. Null if no history. */
+        val historyTokens: Int? = null,
+
+        /** Estimated tokens for the context block. Null if no context. */
+        val contextTokens: Int? = null,
+
+        /** Estimated tokens for the user's message. */
+        val messageTokens: Int? = null
     ) : Event()
 
     @Serializable
@@ -889,6 +1086,12 @@ object BridgeMessage {
                 "RESOLVE_FORCE_CONTEXT" -> json.decodeFromString<ResolveForceContext>(jsonString)
                 // Badge click: navigate to source in IDE editor
                 "NAVIGATE_TO_SOURCE" -> json.decodeFromString<NavigateToSource>(jsonString)
+                // Phase 2: Context staging area
+                "REMOVE_CONTEXT_ENTRY" -> json.decodeFromString<RemoveContextEntry>(jsonString)
+                "START_CONTEXT_GATHERING" -> json.decodeFromString<StartContextGathering>(jsonString)
+                // Phase 3: Context sidebar + staleness
+                "DISMISS_STALENESS" -> json.decodeFromString<DismissStaleness>(jsonString)
+                "REFRESH_CONTEXT_ENTRY" -> json.decodeFromString<RefreshContextEntry>(jsonString)
                 else -> {
                     Dev.warn(log, "bridge.parse.unknown_command", null,
                         "type" to (typeField ?: "null")
@@ -927,6 +1130,12 @@ object BridgeMessage {
             is ContextSettingsEvent -> json.encodeToString(ContextSettingsEvent.serializer(), event)
             // Force context ghost badge resolution
             is ResolveForceContextResult -> json.encodeToString(ResolveForceContextResult.serializer(), event)
+            // Context progress & badge update (mock + future real pipeline)
+            is ContextProgressEvent -> json.encodeToString(ContextProgressEvent.serializer(), event)
+            is ContextBadgeUpdateEvent -> json.encodeToString(ContextBadgeUpdateEvent.serializer(), event)
+            // Phase 3: Context sidebar + staleness events
+            is SentContextUpdateEvent -> json.encodeToString(SentContextUpdateEvent.serializer(), event)
+            is ContextStalenessUpdateEvent -> json.encodeToString(ContextStalenessUpdateEvent.serializer(), event)
         }
     }
 }

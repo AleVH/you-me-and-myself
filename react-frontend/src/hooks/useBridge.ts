@@ -366,6 +366,30 @@ export interface BridgeState {
     ghostBadge: { elementName: string; elementScope: string; estimatedTokens: number } | null;
     /** Navigate to a source file/element in the IDE editor. */
     navigateToSource: (filePath: string | null, elementSignature: string | null) => void;
+
+    // ── Context Progress & Live Badges ──────────────────────────────
+    /** Progress bar state. Null = no active gathering (bar hidden). */
+    contextProgress: { stage: string; percent: number; message?: string } | null;
+    /** Live badge list from CONTEXT_BADGE_UPDATE events. Empty when idle. */
+    contextBadges: import("../bridge/types").ContextFileDetail[];
+
+    // ── Context Staging Area (Phase 2) ──────────────────────────────
+    /**
+     * Remove a context entry from the staging area (badge dismiss).
+     * Sends REMOVE_CONTEXT_ENTRY command to the backend.
+     * Tier-gated on the backend — Basic tier removals are silently rejected.
+     */
+    removeContextEntry: (entryId: string) => void;
+
+    // ── Phase 3: Context Sidebar ─────────────────────────────────────
+    /** All sent context entries for the current conversation (sidebar display). */
+    sentContext: import("../bridge/types").ContextFileDetail[];
+    /** Dismiss a staleness flag on a sidebar entry. */
+    dismissStaleness: (entryId: string) => void;
+    /** Refresh a stale context entry — re-gather the file. */
+    refreshContextEntry: (entry: import("../bridge/types").ContextFileDetail) => void;
+    /** Trigger background context gathering (debounced, called from InputBar). */
+    triggerContextGathering: (inputText: string) => void;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -503,6 +527,8 @@ export function useBridge(): BridgeState {
      */
     const activeTabIdRef = useRef(activeTabId);
     activeTabIdRef.current = activeTabId;
+    const tabMapRef = useRef(tabMap);
+    tabMapRef.current = tabMap;
 
     // Ref for maxTabs — event handlers inside useEffect close over this
     // so they always see the latest value from TAB_STATE.
@@ -1084,6 +1110,72 @@ export function useBridge(): BridgeState {
             }),
         );
 
+        // CONTEXT_PROGRESS → update progress bar state (tab-scoped)
+        unsubscribers.push(
+            onEvent(EventType.CONTEXT_PROGRESS, (event: BridgeEvent) => {
+                const e = event as import("../bridge/types").ContextProgressEvent;
+                // Ignore events from other tabs
+                if (e.tabId && e.tabId !== activeTabIdRef.current) return;
+                if (e.stage === "complete") {
+                    setContextProgress(null);
+                } else {
+                    setContextProgress({
+                        stage: e.stage,
+                        percent: e.percent,
+                        message: e.message,
+                    });
+                }
+            }),
+        );
+
+        // CONTEXT_BADGE_UPDATE → replace badge list, handle ghost badge transition (tab-scoped)
+        //
+        // Ghost badge adoption: when a badge with forced=true arrives and a ghost
+        // badge exists, the forced badge adopts the ghost's name and scope so the
+        // UI shows a seamless transition. This is needed because the mock uses
+        // hardcoded names that don't match the real cursor element. In the real
+        // pipeline, names would match naturally (same PSI resolution), but adopting
+        // the ghost's identity makes the mock look correct too.
+        unsubscribers.push(
+            onEvent(EventType.CONTEXT_BADGE_UPDATE, (event: BridgeEvent) => {
+                const e = event as import("../bridge/types").ContextBadgeUpdateEvent;
+                // Ignore events from other tabs
+                if (e.tabId && e.tabId !== activeTabIdRef.current) return;
+                const currentGhost = ghostBadgeRef.current;
+                const badges = currentGhost
+                    ? e.badges.map((b) =>
+                        b.forced
+                            ? { ...b, name: currentGhost.elementName, scope: currentGhost.elementScope as import("../bridge/types").ContextFileDetail["scope"] }
+                            : b
+                    )
+                    : e.badges;
+                setContextBadges(badges);
+                if (e.complete) {
+                    setContextProgress(null);
+                }
+            }),
+        );
+
+        // SENT_CONTEXT_UPDATE → append to sidebar's sent context list (Phase 3)
+        unsubscribers.push(
+            onEvent(EventType.SENT_CONTEXT_UPDATE, (event: BridgeEvent) => {
+                const e = event as import("../bridge/types").SentContextUpdateEvent;
+                setSentContext((prev) => [...prev, ...e.entries]);
+            }),
+        );
+
+        // CONTEXT_STALENESS_UPDATE → mark matching entries as stale (Phase 3)
+        unsubscribers.push(
+            onEvent(EventType.CONTEXT_STALENESS_UPDATE, (event: BridgeEvent) => {
+                const e = event as import("../bridge/types").ContextStalenessUpdateEvent;
+                setSentContext((prev) =>
+                    prev.map((entry) =>
+                        entry.path === e.filePath ? { ...entry, isStale: true } : entry
+                    )
+                );
+            }),
+        );
+
         // DEV_OUTPUT → active tab (same as SYSTEM_MESSAGE)
         unsubscribers.push(
             onEvent(EventType.DEV_OUTPUT, (event: BridgeEvent) => {
@@ -1146,6 +1238,7 @@ export function useBridge(): BridgeState {
                 sendCommand({
                     type: CommandType.DEV_COMMAND,
                     text,
+                    tabId: activeTabIdRef.current,
                 });
                 return;
             }
@@ -1212,6 +1305,7 @@ export function useBridge(): BridgeState {
                 selectiveLevel: tabSelectiveLevel,
                 summaryEnabled: tabSummaryEnabled,
                 forceContextScope: tabForceContextScope,
+                tabId: targetId, // Phase 2: staging area integration
             });
             persistTabState();
         },
@@ -1261,6 +1355,7 @@ export function useBridge(): BridgeState {
         setTabOrder((prev) => [...prev, newTab.id]);
         setActiveTabId(newTab.id);
         setIsScrolledUp(false);
+        setSentContext([]);  // Phase 3: new conversation = no sent context
 
         sendCommand({ type: CommandType.NEW_CONVERSATION });
         persistTabState();
@@ -1272,6 +1367,13 @@ export function useBridge(): BridgeState {
 
             setActiveTabId(tabId);
             setIsScrolledUp(false);
+
+            // Clear live context state — badges and progress belong to the
+            // previous tab's active simulation or gathering. Without this,
+            // mock badge events (or real pipeline events) from one tab
+            // would bleed into another tab's badge tray.
+            setContextBadges([]);
+            setContextProgress(null);
 
             setTabMap((prev) => {
                 const tab = prev.get(tabId);
@@ -1491,6 +1593,20 @@ export function useBridge(): BridgeState {
             ...tab,
             bypassMode: mode,
         }));
+
+        // Context OFF means no context at all — clear any badges, progress,
+        // ghost badge, and force scope. The user is explicitly saying "I don't
+        // want context for this tab", so any existing context state must go.
+        if (mode === "OFF") {
+            setContextBadges([]);
+            setContextProgress(null);
+            setGhostBadge(null);
+            updateTab(activeTabIdRef.current, (tab) => ({
+                ...tab,
+                forceContextScope: null,
+            }));
+        }
+
         persistTabState();
     }, [updateTab, persistTabState]);
 
@@ -1520,6 +1636,33 @@ export function useBridge(): BridgeState {
         elementScope: string;
         estimatedTokens: number;
     } | null>(null);
+
+    /** Ref mirror of ghostBadge — allows event handlers to read the latest value
+     *  without needing ghostBadge in the useEffect dependency array. */
+    const ghostBadgeRef = useRef(ghostBadge);
+    ghostBadgeRef.current = ghostBadge;
+
+    // ── Context Progress & Live Badges ──────────────────────────────
+    // Driven by CONTEXT_PROGRESS and CONTEXT_BADGE_UPDATE events.
+    // Used by both the mock badge simulator (/dev-mock-badges) and
+    // the future real context assembly pipeline.
+
+    /**
+     * Context gathering progress. Null = no active gathering (bar hidden).
+     * percent: 0–100, stage: "detecting" | "summarizing" | "complete".
+     */
+    const [contextProgress, setContextProgress] = useState<{
+        stage: string;
+        percent: number;
+        message?: string;
+    } | null>(null);
+
+    /**
+     * Live badge list from CONTEXT_BADGE_UPDATE events.
+     * Full state replacement on each event. Empty when no gathering active.
+     * These take priority over ChatMessage-based badges when non-empty.
+     */
+    const [contextBadges, setContextBadges] = useState<import("../bridge/types").ContextFileDetail[]>([]);
 
     /**
      * Set the force context scope for the active tab.
@@ -1555,6 +1698,81 @@ export function useBridge(): BridgeState {
             elementSignature,
         });
     }, [sendCommand]);
+
+    // ── Remove context entry (Phase 2) ────────────────────────────
+    // Sends REMOVE_CONTEXT_ENTRY to the backend. The backend tier-gates
+    // the action — Basic tier removals are silently rejected.
+    const removeContextEntry = useCallback((entryId: string) => {
+        sendCommand({
+            type: CommandType.REMOVE_CONTEXT_ENTRY,
+            tabId: activeTabId,
+            entryId,
+        });
+    }, [sendCommand, activeTabId]);
+
+    // ── Phase 3: Sent context sidebar state ─────────────────────
+    const [sentContext, setSentContext] = useState<import("../bridge/types").ContextFileDetail[]>([]);
+
+    /** Dismiss a staleness flag on a sidebar entry. */
+    const dismissStaleness = useCallback((entryId: string) => {
+        // Update local state — remove stale flag
+        setSentContext((prev) =>
+            prev.map((e) =>
+                e.id === entryId ? { ...e, isStale: false } : e
+            )
+        );
+        // Notify backend
+        sendCommand({
+            type: CommandType.DISMISS_STALENESS,
+            conversationId: "", // The backend uses entryId to find the conversation
+            entryId,
+        });
+    }, [sendCommand]);
+
+    // ── Phase 3 C6: Debounced context gathering trigger ───────
+    // Sends START_CONTEXT_GATHERING after the user stops typing for 800ms.
+    // This triggers background context detection while the user composes.
+    const gatherTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const triggerContextGathering = useCallback((inputText: string) => {
+        // Clear any pending timer
+        if (gatherTimerRef.current) {
+            clearTimeout(gatherTimerRef.current);
+            gatherTimerRef.current = null;
+        }
+
+        // Don't trigger for empty or very short input
+        if (inputText.trim().length < 3) return;
+
+        // Debounce: wait 800ms after last keystroke
+        const currentInput = inputText;
+        gatherTimerRef.current = setTimeout(() => {
+            // Read current tab state for context settings
+            const tabId = activeTabIdRef.current;
+            const tab = tabMapRef.current.get(tabId);
+
+            sendCommand({
+                type: CommandType.START_CONTEXT_GATHERING,
+                tabId,
+                userInput: currentInput,
+                bypassMode: tab?.bypassMode ?? null,
+                selectiveLevel: tab?.selectiveLevel ?? null,
+                summaryEnabled: tab?.summaryEnabled ?? null,
+                forceContextScope: tab?.forceContextScope ?? null,
+            });
+            gatherTimerRef.current = null;
+        }, 800);
+    }, [sendCommand]);
+
+    /** Refresh a stale context entry — re-gather the file. */
+    const refreshContextEntry = useCallback((entry: import("../bridge/types").ContextFileDetail) => {
+        sendCommand({
+            type: CommandType.REFRESH_CONTEXT_ENTRY,
+            tabId: activeTabId,
+            filePath: entry.path,
+            originalEntryId: entry.id ?? "",
+        });
+    }, [sendCommand, activeTabId]);
 
     return {
         messages: activeMessages,
@@ -1600,5 +1818,12 @@ export function useBridge(): BridgeState {
         setForceContextScope,
         ghostBadge,
         navigateToSource,
+        contextProgress,
+        contextBadges,
+        removeContextEntry,
+        sentContext,
+        dismissStaleness,
+        refreshContextEntry,
+        triggerContextGathering,
     };
 }

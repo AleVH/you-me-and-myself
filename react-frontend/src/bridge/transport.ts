@@ -287,6 +287,10 @@ function handleMockCommand(command: BridgeCommand): void {
                     contextWindowSize: 128000,
                     responseTimeMs: 1250,
                     purpose: "CHAT",
+                    profileTokens: 45,
+                    historyTokens: 60,
+                    contextTokens: 30,
+                    messageTokens: 15,
                 },
                 850,
             );

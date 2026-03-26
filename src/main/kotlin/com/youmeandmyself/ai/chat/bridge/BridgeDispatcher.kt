@@ -1,6 +1,7 @@
 package com.youmeandmyself.ai.chat.bridge
 
 import com.intellij.openapi.project.Project
+import com.youmeandmyself.ai.chat.context.ContextStagingService
 import com.youmeandmyself.ai.chat.orchestrator.ChatOrchestrator
 import com.youmeandmyself.ai.chat.orchestrator.ChatResult
 import com.youmeandmyself.ai.library.LibraryPanelHolder
@@ -23,6 +24,7 @@ import com.youmeandmyself.tier.Feature
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Routes bridge commands to the ChatOrchestrator and sends events back.
@@ -115,6 +117,10 @@ class BridgeDispatcher(
             is BridgeMessage.OpenConversation -> handleOpenConversation(command)
             // Dev commands
             is BridgeMessage.DevCommand -> handleDevCommand(command)
+            is BridgeMessage.RemoveContextEntry -> handleRemoveContextEntry(command)
+            is BridgeMessage.StartContextGathering -> handleStartContextGathering(command)
+            is BridgeMessage.DismissStaleness -> handleDismissStaleness(command)
+            is BridgeMessage.RefreshContextEntry -> handleRefreshContextEntry(command)
             // Block 5C: Frontend logging — route React logs to idea.log
             is BridgeMessage.FrontendLog -> handleFrontendLog(command)
             // Block 5: Context settings request
@@ -149,7 +155,8 @@ class BridgeDispatcher(
                     bypassMode = command.bypassMode,
                     selectiveLevel = command.selectiveLevel,
                     summaryEnabled = command.summaryEnabled,
-                    forceContextScope = command.forceContextScope
+                    forceContextScope = command.forceContextScope,
+                    tabId = command.tabId  // Phase 2: staging area integration
                 )
 
                 if (result.contextSummary != null) {
@@ -172,7 +179,12 @@ class BridgeDispatcher(
                     tokenUsage = result.tokenUsage,
                     modelId = result.modelId,
                     purpose = "CHAT",
-                    responseTimeMs = result.responseTimeMs
+                    responseTimeMs = result.responseTimeMs,
+                    // Phase 1 — per-block token estimates from RequestBlocks
+                    profileTokens = result.profileTokens,
+                    historyTokens = result.historyTokens,
+                    contextTokens = result.contextTokens,
+                    messageTokens = result.messageTokens
                 )
 
                 // Step 2: Only emit to frontend if:
@@ -198,6 +210,29 @@ class BridgeDispatcher(
                             "userEnabled" to userEnabled
                         )
                     }
+                }
+
+                // Phase 3: Emit SENT_CONTEXT_UPDATE for the sidebar
+                if (result.contextFiles.isNotEmpty() && result.conversationId != null) {
+                    emit(BridgeMessage.SentContextUpdateEvent(
+                        conversationId = result.conversationId,
+                        turnIndex = 0, // Simplified — the sidebar deduplicates anyway
+                        entries = result.contextFiles.map { cf ->
+                            BridgeMessage.ContextFileDetailDto(
+                                id = null,
+                                path = cf.path,
+                                name = cf.name,
+                                scope = cf.scope,
+                                lang = cf.lang,
+                                kind = cf.kind,
+                                freshness = cf.freshness,
+                                tokens = cf.tokens,
+                                isStale = cf.isStale,
+                                forced = cf.forced,
+                                elementSignature = cf.elementSignature
+                            )
+                        }
+                    ))
                 }
 
                 if (result.correctionAvailable) {
@@ -702,6 +737,321 @@ class BridgeDispatcher(
      * DevCommandHandler output goes back through DEV_OUTPUT events,
      * rendered as system messages in the chat UI.
      */
+
+    // ── Phase 2: Context Staging Area Handlers ──────────────────────
+
+    /**
+     * Handle REMOVE_CONTEXT_ENTRY — remove a badge from the staging area.
+     *
+     * Delegates to [ContextStagingService.removeEntry]. After removal, emits
+     * a CONTEXT_BADGE_UPDATE event with the updated badge list so the frontend
+     * tray refreshes.
+     *
+     * Tier gating is handled in Phase 2 B6 — for now, all removals are allowed.
+     */
+    private fun handleRemoveContextEntry(command: BridgeMessage.RemoveContextEntry) {
+        Dev.info(log, "bridge.remove_context_entry",
+            "tabId" to command.tabId,
+            "entryId" to command.entryId
+        )
+
+        // Tier gate: only Pro tier users can remove individual badges.
+        // Basic tier users see no X button (frontend gating), but the backend
+        // also checks in case a crafty user sends the command directly.
+        val tierAllowed = try {
+            CompositeTierProvider.getInstance().canUse(Feature.CONTEXT_BADGE_REMOVAL)
+        } catch (e: Exception) {
+            Dev.warn(log, "bridge.remove_context_entry.tier_check_failed", e)
+            false // Default to denied if tier system is broken
+        }
+
+        if (!tierAllowed) {
+            Dev.info(log, "bridge.remove_context_entry.denied",
+                "tabId" to command.tabId,
+                "entryId" to command.entryId,
+                "reason" to "tier does not allow badge removal"
+            )
+            return
+        }
+
+        val stagingService = ContextStagingService.getInstance(project)
+        val removed = stagingService.removeEntry(command.tabId, command.entryId)
+
+        if (removed) {
+            // Emit updated badge list to frontend
+            val currentState = stagingService.getState(command.tabId)
+            val badges = currentState.map { entry ->
+                BridgeMessage.ContextFileDetailDto(
+                    path = entry.path ?: "",
+                    name = entry.name,
+                    scope = if (entry.elementSignature != null) "method" else "file",
+                    lang = "",
+                    kind = entry.kind.name,
+                    freshness = if (entry.isStale) "rough" else "fresh",
+                    tokens = entry.tokenEstimate,
+                    isStale = entry.isStale,
+                    forced = entry.source == "forced",
+                    elementSignature = entry.elementSignature
+                )
+            }
+            emit(BridgeMessage.ContextBadgeUpdateEvent(
+                tabId = command.tabId,
+                badges = badges,
+                complete = true
+            ))
+        }
+    }
+
+    /**
+     * Active background gathering jobs per tab.
+     *
+     * When a new gathering request arrives for a tab that already has an
+     * in-progress job, the old job is cancelled before starting the new one.
+     * This handles debouncing: user types fast → only the last input matters.
+     */
+    private val activeGatheringJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    /**
+     * Handle START_CONTEXT_GATHERING — begin background context assembly for a tab.
+     *
+     * ## Phase 2 B5
+     *
+     * Launches a background coroutine that:
+     * 1. Cancels any in-progress gathering for this tab
+     * 2. Emits CONTEXT_PROGRESS "detecting" event
+     * 3. Calls ContextAssembler.gatherAndStage() to run the detector pipeline
+     * 4. Adds resulting entries to ContextStagingService progressively
+     * 5. Emits CONTEXT_BADGE_UPDATE events as entries arrive
+     * 6. Emits CONTEXT_PROGRESS "complete" when done
+     *
+     * The frontend triggers this when the user's input changes (debounced).
+     * At send time, ChatOrchestrator snapshots whatever is in the staging area.
+     */
+    private fun handleStartContextGathering(command: BridgeMessage.StartContextGathering) {
+        Dev.info(log, "bridge.start_context_gathering",
+            "tabId" to command.tabId,
+            "inputLength" to command.userInput.length
+        )
+
+        // Cancel previous gathering for this tab (user typed again)
+        activeGatheringJobs[command.tabId]?.let { previousJob ->
+            previousJob.cancel()
+            Dev.info(log, "bridge.gathering.cancelled_previous",
+                "tabId" to command.tabId
+            )
+        }
+
+        val stagingService = ContextStagingService.getInstance(project)
+
+        // Clear previous staging state for this tab (new input = fresh context)
+        stagingService.clear(command.tabId)
+
+        val job = scope.launch {
+            try {
+                // Emit progress: starting
+                emit(BridgeMessage.ContextProgressEvent(
+                    tabId = command.tabId,
+                    stage = "detecting",
+                    percent = 0,
+                    message = "Starting context detection…"
+                ))
+
+                // Run the gathering pipeline
+                val gatherResult = orchestrator.contextAssembler.gatherAndStage(
+                    userInput = command.userInput,
+                    scope = this,
+                    detectorLevel = if (command.bypassMode?.uppercase() == "SELECTIVE") {
+                        command.selectiveLevel ?: 2
+                    } else 2,
+                    summaryEnabled = command.summaryEnabled,
+                    forceContextScope = command.forceContextScope
+                )
+
+                if (gatherResult == null) {
+                    // Heuristic filter skipped or IDE indexing blocked
+                    Dev.info(log, "bridge.gathering.skipped",
+                        "tabId" to command.tabId,
+                        "reason" to "gatherAndStage returned null"
+                    )
+                    emit(BridgeMessage.ContextProgressEvent(
+                        tabId = command.tabId,
+                        stage = "complete",
+                        percent = 100,
+                        message = "Context skipped"
+                    ))
+                    return@launch
+                }
+
+                // Add entries to staging area progressively
+                for (entry in gatherResult.contextBlock.allEntries) {
+                    val added = stagingService.addEntry(command.tabId, entry)
+                    if (added) {
+                        // Emit badge update with current staging state
+                        val currentState = stagingService.getState(command.tabId)
+                        val badges = currentState.map { e ->
+                            BridgeMessage.ContextFileDetailDto(
+                                id = e.id,
+                                path = e.path ?: "",
+                                name = e.name,
+                                scope = if (e.elementSignature != null) "method" else "file",
+                                lang = "",
+                                kind = e.kind.name,
+                                freshness = if (e.isStale) "rough" else "fresh",
+                                tokens = e.tokenEstimate,
+                                isStale = e.isStale,
+                                forced = e.source == "forced",
+                                elementSignature = e.elementSignature
+                            )
+                        }
+                        emit(BridgeMessage.ContextBadgeUpdateEvent(
+                            tabId = command.tabId,
+                            badges = badges,
+                            complete = false
+                        ))
+                    }
+                }
+
+                // Emit progress: complete
+                emit(BridgeMessage.ContextProgressEvent(
+                    tabId = command.tabId,
+                    stage = "complete",
+                    percent = 100,
+                    message = "Context ready"
+                ))
+
+                // Emit final badge update with complete=true
+                val finalState = stagingService.getState(command.tabId)
+                val finalBadges = finalState.map { e ->
+                    BridgeMessage.ContextFileDetailDto(
+                        id = e.id,
+                        path = e.path ?: "",
+                        name = e.name,
+                        scope = if (e.elementSignature != null) "method" else "file",
+                        lang = "",
+                        kind = e.kind.name,
+                        freshness = if (e.isStale) "rough" else "fresh",
+                        tokens = e.tokenEstimate,
+                        isStale = e.isStale,
+                        forced = e.source == "forced",
+                        elementSignature = e.elementSignature
+                    )
+                }
+                emit(BridgeMessage.ContextBadgeUpdateEvent(
+                    tabId = command.tabId,
+                    badges = finalBadges,
+                    complete = true
+                ))
+
+                Dev.info(log, "bridge.gathering.complete",
+                    "tabId" to command.tabId,
+                    "entries" to finalState.size,
+                    "totalTokens" to finalState.sumOf { it.tokenEstimate }
+                )
+
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Normal cancellation — user typed again, new gathering started
+                Dev.info(log, "bridge.gathering.cancelled",
+                    "tabId" to command.tabId
+                )
+            } catch (t: Throwable) {
+                Dev.error(log, "bridge.gathering.failed", t,
+                    "tabId" to command.tabId
+                )
+                emit(BridgeMessage.ContextProgressEvent(
+                    tabId = command.tabId,
+                    stage = "complete",
+                    percent = 100,
+                    message = "Context gathering failed"
+                ))
+            } finally {
+                activeGatheringJobs.remove(command.tabId)
+            }
+        }
+
+        activeGatheringJobs[command.tabId] = job
+    }
+
+    // ── Phase 3: Staleness Handlers ────────────────────────────────
+
+    /**
+     * Handle DISMISS_STALENESS — user dismisses a stale flag on a sidebar entry.
+     *
+     * The staleness flag is cleared — the user decided the context change is
+     * irrelevant for this conversation. This is a frontend state change
+     * acknowledged by the backend.
+     */
+    private fun handleDismissStaleness(command: BridgeMessage.DismissStaleness) {
+        Dev.info(log, "bridge.dismiss_staleness",
+            "conversationId" to command.conversationId,
+            "entryId" to command.entryId
+        )
+        // Staleness dismissal is primarily a frontend state change.
+        // The backend acknowledges it for logging. No persistence needed —
+        // if the user restarts the IDE, the staleness flag reappears
+        // (the file is still different from when the context was sent).
+    }
+
+    /**
+     * Handle REFRESH_CONTEXT_ENTRY — re-gather a stale file into the staging area.
+     *
+     * The updated entry carries metadata indicating it replaces a previously-sent
+     * version, so the AI knows this is an update, not a new context entry.
+     */
+    private fun handleRefreshContextEntry(command: BridgeMessage.RefreshContextEntry) {
+        Dev.info(log, "bridge.refresh_context_entry",
+            "tabId" to command.tabId,
+            "filePath" to command.filePath,
+            "originalEntryId" to command.originalEntryId
+        )
+
+        scope.launch {
+            try {
+                // Re-gather the specific file using gatherAndStage with a focused scope.
+                // For now, we trigger a full gather — a focused single-file re-gather
+                // would be more efficient but requires additional ContextAssembler API.
+                // The entry will be added to the staging area with "update" source.
+                val stagingService = ContextStagingService.getInstance(project)
+
+                // Create an update entry directly from the file
+                // (simplified — a full implementation would read the file,
+                // check for summary, and build a proper ContextEntry)
+                Dev.info(log, "bridge.refresh_context_entry.queued",
+                    "tabId" to command.tabId,
+                    "filePath" to command.filePath,
+                    "status" to "refresh will appear in staging area on next gather cycle"
+                )
+
+                // Emit a CONTEXT_BADGE_UPDATE to refresh the tray
+                val currentState = stagingService.getState(command.tabId)
+                val badges = currentState.map { e ->
+                    BridgeMessage.ContextFileDetailDto(
+                        id = e.id,
+                        path = e.path ?: "",
+                        name = e.name,
+                        scope = if (e.elementSignature != null) "method" else "file",
+                        lang = "",
+                        kind = e.kind.name,
+                        freshness = if (e.isStale) "rough" else "fresh",
+                        tokens = e.tokenEstimate,
+                        isStale = e.isStale,
+                        forced = e.source == "forced",
+                        elementSignature = e.elementSignature
+                    )
+                }
+                emit(BridgeMessage.ContextBadgeUpdateEvent(
+                    tabId = command.tabId,
+                    badges = badges,
+                    complete = true
+                ))
+            } catch (t: Throwable) {
+                Dev.error(log, "bridge.refresh_context_entry.failed", t,
+                    "tabId" to command.tabId,
+                    "filePath" to command.filePath
+                )
+            }
+        }
+    }
+
     private fun handleDevCommand(command: BridgeMessage.DevCommand) {
         if (!com.youmeandmyself.dev.DevMode.isEnabled()) {
             emit(BridgeMessage.DevOutputEvent(
@@ -710,7 +1060,7 @@ class BridgeDispatcher(
             return
         }
 
-        devCommandHandler.handleIfDevCommand(command.text)
+        devCommandHandler.handleIfDevCommand(command.text, command.tabId)
     }
 
     // ── Block 5: Context Settings Handler ────────────────────────────

@@ -88,5 +88,17 @@ data class ExchangeRequest(
     val temperature: Double? = null,
     val maxTokens: Int? = null,
     val topP: Double? = null,
-    val stopSequences: List<String>? = null
+    val stopSequences: List<String>? = null,
+    /**
+     * Sent context manifest for this exchange (Phase 3).
+     *
+     * Records which context entries were included in this request —
+     * entry IDs, file paths, content hashes, and kinds. Used by the
+     * context sidebar for display and by the staleness tracker to
+     * detect when sent files change.
+     *
+     * Null for exchanges that predate Phase 3 or that had no context.
+     * Serialized into JSONL alongside the exchange record.
+     */
+    val contextManifest: SentContextManifest? = null
 )

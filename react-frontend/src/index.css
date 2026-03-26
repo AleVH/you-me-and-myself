@@ -58,6 +58,21 @@ body {
     background: #1e1e1e;
 }
 
+/* ── Phase 3: Body row (main content + sidebar) ── */
+.ymm-chat-body {
+    display: flex;
+    flex: 1;
+    min-height: 0; /* Allow flex children to shrink below content size */
+    overflow: hidden;
+}
+
+.ymm-chat-main {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0; /* Prevent flex blowout from long content */
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
    PROVIDER BAR (Global provider selector — top of window)
    ═══════════════════════════════════════════════════════════════════════ */

@@ -23,9 +23,14 @@ interface InputBarProps {
     onSend: (text: string) => void;
     /** Whether input is disabled (e.g., while AI is thinking). */
     disabled: boolean;
+    /**
+     * Called when the user types (debounced externally).
+     * Used to trigger background context gathering while the user composes.
+     */
+    onInputChange?: (text: string) => void;
 }
 
-function InputBar({ onSend, disabled }: InputBarProps) {
+function InputBar({ onSend, disabled, onInputChange }: InputBarProps) {
     const [text, setText] = useState("");
     const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -72,7 +77,10 @@ function InputBar({ onSend, disabled }: InputBarProps) {
           ref={textareaRef}
           className="ymm-input-bar__textarea"
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+              setText(e.target.value);
+              onInputChange?.(e.target.value);
+          }}
           onKeyDown={handleKeyDown}
           placeholder={disabled ? "Waiting for response..." : "Type a message..."}
           disabled={disabled}

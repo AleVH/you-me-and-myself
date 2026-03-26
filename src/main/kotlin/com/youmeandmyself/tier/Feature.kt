@@ -79,6 +79,18 @@ enum class Feature(
      */
     CONTEXT_SELECTIVE_BYPASS("Per-component context bypass (Pro)", FeatureVisibility.PRO_AND_ABOVE, implemented = false),
 
+    /**
+     * Individual context badge removal from the staging area.
+     *
+     * Pro-tier users can remove individual context entries before sending
+     * (X button on badges in the tray). Basic-tier users cannot — once
+     * context is attached, it stays for the conversation.
+     *
+     * @see ContextStagingService.removeEntry — backend removal
+     * @see ContextBadgeTray — frontend X button rendering
+     */
+    CONTEXT_BADGE_REMOVAL("Individual context badge removal (Pro)", FeatureVisibility.PRO_AND_ABOVE),
+
     // ── Context & Branching ──────────────────────────────────────────────
     /** Smart conversation branching (Lite/Thread/Deep modes). */
     CONTEXT_BRANCHING("Conversation branching", FeatureVisibility.PRO_AND_ABOVE, implemented = false),

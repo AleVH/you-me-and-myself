@@ -12,27 +12,39 @@
     align-items: center;
 }
 
-/* ── Progress bar ───────────────────────────────── */
+/* ── Progress bar (shared track) ──────────────────── */
 
 .ymm-badge-tray__progress {
     width: 100%;
-    height: 2px;
+    height: 4px;
     background: var(--ymm-border, #333);
-    border-radius: 1px;
+    border-radius: 2px;
     overflow: hidden;
 }
 
+/* Indeterminate — sliding bar when no CONTEXT_PROGRESS events */
 .ymm-badge-tray__progress-bar {
     height: 100%;
     width: 30%;
     background: var(--ymm-accent, #569cd6);
-    border-radius: 1px;
+    border-radius: 2px;
     animation: ymm-progress-slide 1.5s ease-in-out infinite;
 }
 
 @keyframes ymm-progress-slide {
     0% { transform: translateX(-100%); }
     100% { transform: translateX(333%); }
+}
+
+/* Determinate — fills left-to-right, colour set inline via progressColour() */
+.ymm-badge-tray__progress--determinate {
+    cursor: default;
+}
+
+.ymm-badge-tray__progress-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.3s ease-out, background-color 0.3s ease-out;
 }
 
 /* ── Badge (shared base) ────────────────────────── */
@@ -127,6 +139,25 @@
     font-size: 7px;
     font-style: italic;
     color: #c586c0;
+}
+
+/* ── Dismiss button (Phase 2 — badge removal) ───── */
+
+.ymm-badge__dismiss {
+    all: unset;
+    cursor: pointer;
+    font-size: 10px;
+    line-height: 1;
+    color: var(--ymm-text-muted, #808080);
+    padding: 0 1px;
+    margin-left: 1px;
+    border-radius: 2px;
+    transition: color 0.15s, background 0.15s;
+}
+
+.ymm-badge__dismiss:hover {
+    color: var(--ymm-text-primary, #d4d4d4);
+    background: rgba(255, 255, 255, 0.1);
 }
 
 /* ── Custom tooltip ─────────────────────────────── */

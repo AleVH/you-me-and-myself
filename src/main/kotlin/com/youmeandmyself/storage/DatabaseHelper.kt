@@ -657,6 +657,10 @@ class DatabaseHelper(private val dbFile: File) {
                     response_time_ms    INTEGER,
                     user_id             TEXT,
                     project_id          TEXT,
+                    profile_tokens      INTEGER,
+                    history_tokens      INTEGER,
+                    context_tokens      INTEGER,
+                    message_tokens      INTEGER,
                     FOREIGN KEY (exchange_id) REFERENCES chat_exchanges(id)
                 )
             """.trimIndent())
@@ -702,6 +706,36 @@ class DatabaseHelper(private val dbFile: File) {
                     raw_available       INTEGER NOT NULL DEFAULT 1
                 )
             """.trimIndent())
+
+                // ── Table 16: sent_context ──
+                // Records what context entries were sent in each conversation turn.
+                //
+                // Phase 3 — Context Sidebar + Staleness.
+                // The sidebar reads this to show all context across the conversation.
+                // The staleness tracker reads this to check if a changed file was
+                // previously sent (and should be flagged stale in the sidebar).
+                //
+                // Each row is one context entry sent in one turn. A turn with 5 context
+                // entries produces 5 rows. Fast queries:
+                // - "all context for conversation X" → idx_sent_ctx_conversation
+                // - "was file Y sent in conversation X?" → idx_sent_ctx_path
+                stmt.execute("""
+                CREATE TABLE IF NOT EXISTS sent_context (
+                    id                TEXT PRIMARY KEY,
+                    exchange_id       TEXT NOT NULL REFERENCES chat_exchanges(id),
+                    conversation_id   TEXT NOT NULL,
+                    turn_index        INTEGER NOT NULL,
+                    entry_id          TEXT NOT NULL,
+                    path              TEXT,
+                    content_hash      TEXT,
+                    kind              TEXT NOT NULL,
+                    sent_at           INTEGER NOT NULL
+                )
+            """.trimIndent())
+
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sent_ctx_conversation ON sent_context(conversation_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sent_ctx_exchange ON sent_context(exchange_id)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_sent_ctx_path ON sent_context(conversation_id, path)")
 
                 // Insert default config values if they don't exist yet.
                 // Using INSERT OR IGNORE so this is safe on every startup.

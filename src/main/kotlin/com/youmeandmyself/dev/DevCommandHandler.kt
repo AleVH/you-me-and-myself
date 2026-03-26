@@ -67,6 +67,8 @@ import com.youmeandmyself.storage.model.IdeContextCapture
  * - /dev-structure-inspect: Inspect current file with PSI (classes, methods, hashes, context, cache)
  * - /dev-structure-inspect ClassName: Inspect a specific class and its methods
  * - /dev-summary-health: Health check for element summary system (cache vs SQLite consistency)
+ * - /dev-mock-badges [scenario]: Mock badge simulation for visual testing of badge tray UI
+ *   Scenarios: default, force, force-only, many. No AI calls, no DB writes.
  */
 class DevCommandHandler(
     private val project: Project,
@@ -108,7 +110,7 @@ class DevCommandHandler(
      * @param input The user's input text
      * @return true if it was a dev command (handled), false otherwise (continue normal flow)
      */
-    fun handleIfDevCommand(input: String): Boolean {
+    fun handleIfDevCommand(input: String, tabId: String? = null): Boolean {
         if (!input.lowercase().startsWith("/dev")) {
             return false
         }
@@ -140,6 +142,9 @@ class DevCommandHandler(
             command == "/dev-context-single" -> runContextDry("single")
             command == "/dev-context-radius" -> runContextDry("radius")
             command == "/dev-context-chain" -> runContextDry("chain")
+            // Mock badge simulation — visual testing of the badge tray UI
+            command == "/dev-mock-badges" -> runMockBadges("default", tabId)
+            command.startsWith("/dev-mock-badges ") -> runMockBadges(command.removePrefix("/dev-mock-badges ").trim(), tabId)
             else -> {
                 output("Unknown dev command: $input\nType /dev-help to see available commands.")
             }
@@ -1052,5 +1057,56 @@ class DevCommandHandler(
         output("   Force context: would guarantee this element is attached")
         output("   Heuristic + smart mode: would also gather neighbouring files (see /dev-context-radius)")
         output("   Full chain: would run all detectors + enrichment (see /dev-context-chain)")
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  MOCK BADGE SIMULATION
+    //
+    //  Visual testing of the badge tray, progress bar, and ghost badge
+    //  transition. No AI calls, no DB writes, no cache pollution.
+    //
+    //  Scenarios:
+    //    /dev-mock-badges           — default (4 files, 2 summarised)
+    //    /dev-mock-badges force     — ghost badge → real badge transition
+    //    /dev-mock-badges force-only — context OFF, forced element only
+    //    /dev-mock-badges many      — 12 files, tests tray overflow
+    //
+    //  Only ONE simulation can run at a time. Re-running cancels the
+    //  previous one (if still in progress) and starts fresh.
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Run a mock badge simulation scenario.
+     *
+     * Delegates to [MockBadgeSimulator] which schedules timed bridge events
+     * that exercise the full badge tray UI. The events use the same types
+     * ([BridgeMessage.ContextProgressEvent], [BridgeMessage.ContextBadgeUpdateEvent])
+     * that the real context pipeline will use in the future.
+     *
+     * @param scenario One of: "default", "force", "force-only", "many"
+     */
+    private fun runMockBadges(scenario: String, tabId: String? = null) {
+        val validScenarios = listOf("default", "force", "force-only", "many")
+        if (scenario.lowercase() !in validScenarios) {
+            output("Unknown mock-badges scenario: \"$scenario\"")
+            output("Valid scenarios: ${validScenarios.joinToString(", ")}")
+            output("Usage: /dev-mock-badges [scenario]")
+            return
+        }
+
+        output("🎬 Mock Badge Simulation — scenario: $scenario")
+        output("   Events will appear in the badge tray below the input bar.")
+        output("   No AI calls, no DB writes, no cache changes.")
+
+        // sendEvent is required — if null, the mock has nowhere to send events.
+        val transport = sendEvent
+        if (transport == null) {
+            output("⚠️ Bridge transport not connected — cannot send events to frontend.")
+            output("   This command requires the React chat panel to be open.")
+            return
+        }
+
+        val simulator = MockBadgeSimulator(project, transport)
+        simulator.run(scenario, tabId)
     }
 }

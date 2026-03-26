@@ -525,6 +525,40 @@ class ConversationManager(private val project: Project) {
         }
     }
 
+    /**
+     * Build history with compaction support (Phase 4).
+     *
+     * Returns the verbatim recent turns AND an optional compacted summary
+     * for older turns. The orchestrator puts verbatim turns in
+     * `RequestBlocks.verbatimHistory` and the summary in `compactedHistory`.
+     *
+     * @param conversationId The conversation to build history for
+     * @param verbatimWindow How many recent exchanges to keep verbatim
+     * @return Pair of (compactedSummary, verbatimTurns)
+     */
+    fun buildHistoryWithCompaction(
+        conversationId: String?,
+        verbatimWindow: Int = 5
+    ): Pair<String?, List<ConversationTurn>> {
+        if (conversationId == null || !isStorageReady()) return null to emptyList()
+
+        // Get verbatim turns (existing logic)
+        val verbatimTurns = buildHistory(conversationId, verbatimWindow)
+
+        // Check for existing compacted summary
+        val compactionService = HistoryCompactionService.getInstance(project)
+        val compactedSummary = compactionService.getCompactedSummary(conversationId)
+
+        Dev.info(log, "conversation.build_history_with_compaction",
+            "conversationId" to conversationId,
+            "verbatimTurns" to verbatimTurns.size,
+            "hasCompactedSummary" to (compactedSummary != null),
+            "compactedLength" to (compactedSummary?.length ?: 0)
+        )
+
+        return compactedSummary to verbatimTurns
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────
 
     private fun mapConversation(rs: java.sql.ResultSet): Conversation {

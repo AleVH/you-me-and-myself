@@ -14,6 +14,9 @@ import com.youmeandmyself.context.orchestrator.ContextOrchestrator
 import com.youmeandmyself.context.orchestrator.ContextRequest
 import com.youmeandmyself.context.orchestrator.DetectorRegistry
 import com.youmeandmyself.context.orchestrator.OrchestratorMetrics
+import java.security.MessageDigest
+import java.time.Instant
+import java.util.UUID
 import com.youmeandmyself.context.orchestrator.detectors.FrameworkDetector
 import com.youmeandmyself.context.orchestrator.detectors.LanguageDetector
 import com.youmeandmyself.context.orchestrator.detectors.ProjectStructureDetector
@@ -270,11 +273,24 @@ class ContextAssembler(
                 elementSignature = null
             ))
 
+            // Build context block for RequestBlocks (Phase 1)
+            val bypassContextBlock = buildBypassContextBlock(
+                contentBlock = contentBlock,
+                filePath = editorFile.path,
+                fileName = editorFile.name,
+                kind = if (attachmentKind == "existing summary")
+                    com.youmeandmyself.ai.chat.context.ContextKind.SUMMARY
+                else
+                    com.youmeandmyself.ai.chat.context.ContextKind.RAW,
+                isStale = summary?.isStale ?: false
+            )
+
             return AssembledPrompt(
                 effectivePrompt = effectivePrompt,
                 contextSummary = "[Context: bypass=FULL, $attachmentKind attached]",
                 contextTimeMs = null,
-                contextFiles = bypassBadge
+                contextFiles = bypassBadge,
+                contextBlock = bypassContextBlock
             )
         }
 
@@ -341,173 +357,104 @@ class ContextAssembler(
                     elementSignature = null
                 ))
 
+                // Build context block for RequestBlocks (Phase 1)
+                val selectiveMinContextBlock = buildBypassContextBlock(
+                    contentBlock = contentBlock,
+                    filePath = editorFile.path,
+                    fileName = editorFile.name,
+                    kind = if (attachmentKind == "existing summary")
+                        com.youmeandmyself.ai.chat.context.ContextKind.SUMMARY
+                    else
+                        com.youmeandmyself.ai.chat.context.ContextKind.RAW,
+                    isStale = summary?.isStale ?: false
+                )
+
                 return AssembledPrompt(
                     effectivePrompt = effectivePrompt,
                     contextSummary = "[Context: selective=Minimal, $attachmentKind attached]",
                     contextTimeMs = null,
-                    contextFiles = selectiveMinBadge
+                    contextFiles = selectiveMinBadge,
+                    contextBlock = selectiveMinContextBlock
                 )
             }
 
-            // Level 1 or 2: run the detection pipeline with a filtered detector list
-            // Optional heuristic pre-filter (same logic as normal path — see Step 1 comments above)
+            // Level 1 or 2: delegate to gatherAndStage() with the appropriate detector level.
+            // This eliminates the code duplication with the normal path — both use the
+            // same gathering + enrichment pipeline, just with different detector sets.
+            val selectiveGatherResult = gatherAndStage(
+                userInput = userInput,
+                scope = scope,
+                detectorLevel = level,
+                summaryEnabled = summaryEnabled,
+                forceContextScope = forceContextScope
+            )
+
+            if (selectiveGatherResult == null) {
+                // Heuristic filter skipped or IDE indexing blocked
+                return if (DumbService.isDumb(project)) {
+                    AssembledPrompt.indexingBlocked()
+                } else {
+                    AssembledPrompt(
+                        effectivePrompt = userInput,
+                        contextSummary = "[Context: skipped by heuristic filter (selective)]",
+                        contextTimeMs = null
+                    )
+                }
+            }
+
+            // Format the gathered context
             val editorFile = currentEditorFile()
-            val selectiveFilter = ContextHeuristicFilter()
-            val selectiveHeuristicEnabled = ContextSettingsState.getInstance(project).state.heuristicFilterEnabled
-            if (selectiveHeuristicEnabled && selectiveFilter.shouldSkipContext(userInput, editorFile)) {
-                Dev.info(log, "context.skipped_by_heuristic",
-                    "reason" to "heuristic_filter_active_selective",
-                    "input_preview" to userInput.take(50)
-                )
-                return AssembledPrompt(
-                    effectivePrompt = userInput,
-                    contextSummary = "[Context: skipped by heuristic filter (selective)]",
-                    contextTimeMs = null
-                )
-            }
-            if (DumbService.isDumb(project)) {
-                Dev.info(log, "context.skipped", "reason" to "ide_indexing_selective")
-                return AssembledPrompt.indexingBlocked()
-            }
-            // Resolve cursor context for element-level scoping (same as normal path)
-            val resolvedContext = EditorElementResolver.resolve(project)
-            Dev.info(log, "context.selective.resolved_editor",
-                "level" to level,
-                "elementAtCursor" to (resolvedContext?.elementAtCursor?.name ?: "none")
-            )
-
-            val (bundle, metrics) = gatherIdeContext(scope, buildDetectorsForLevel(level))
-            Dev.info(log, "context.gathered.selective",
-                "level" to level, "files" to bundle.files.size, "timeMs" to metrics.totalMillis
-            )
-            val enrichedBundle = enrichWithSummaries(bundle, resolvedContext)
-            val contextNote = formatContextNote(enrichedBundle)
-            val manifest = enrichedBundle.manifestLine()
-            val filesBlock = enrichedBundle.filesSection()
+            val contextNote = formatContextNote(selectiveGatherResult.enrichedBundle)
+            val manifest = selectiveGatherResult.enrichedBundle.manifestLine()
+            val filesBlock = selectiveGatherResult.enrichedBundle.filesSection()
             val fileBlock = buildCurrentFileBlock(userInput, editorFile)
             val effectivePrompt = buildString {
                 appendLine(contextNote); appendLine(manifest); appendLine(); appendLine(filesBlock)
                 if (fileBlock.isNotBlank()) { appendLine(); appendLine(fileBlock) }
                 appendLine(); append(userInput)
             }
-            // Build badge data from the enriched bundle
-            val selectiveBadges = buildContextFileDetails(
-                files = enrichedBundle.files,
-                resolvedContext = resolvedContext,
-                forceContextScope = forceContextScope
-            )
 
             return AssembledPrompt(
                 effectivePrompt = effectivePrompt,
-                contextSummary = "[Context: selective=level$level, ${enrichedBundle.manifestLine()}]",
-                contextTimeMs = metrics.totalMillis,
-                contextFiles = selectiveBadges
+                contextSummary = "[Context: selective=level$level, ${selectiveGatherResult.enrichedBundle.manifestLine()}]",
+                contextTimeMs = selectiveGatherResult.gatherTimeMs,
+                contextFiles = selectiveGatherResult.contextFiles,
+                contextBlock = selectiveGatherResult.contextBlock
             )
         }
 
-        // Step 1: Optional heuristic pre-filter
-        //
-        // When the heuristic filter is ENABLED in settings, this is the first gate.
-        // It checks the user's message for code-related markers. If none are found,
-        // context gathering is skipped entirely (token saving optimisation).
-        //
-        // When the heuristic filter is DISABLED (default for launch), this block
-        // is skipped entirely — context ALWAYS flows through. This eliminates the
-        // false negatives that caused the launch blocker (user asks about code in
-        // natural language → heuristic doesn't recognise it → context is dropped).
-        //
-        // To remove the heuristic entirely: delete this `if` block. Nothing else depends on it.
-        val editorFile = currentEditorFile()
-        val heuristicFilter = ContextHeuristicFilter()
-        val heuristicEnabled = ContextSettingsState.getInstance(project).state.heuristicFilterEnabled
-        if (heuristicEnabled && heuristicFilter.shouldSkipContext(userInput, editorFile)) {
-            Dev.info(log, "context.skipped_by_heuristic",
-                "reason" to "heuristic_filter_active",
-                "input_preview" to userInput.take(50)
-            )
+        // ── Normal path: delegate to gatherAndStage() ────────────────────
+        // The gathering + enrichment logic is extracted into gatherAndStage()
+        // so it can be called synchronously here (Phase 2 B2) or in a background
+        // coroutine (Phase 2 B5). The formatting step uses the result.
+        val gatherResult = gatherAndStage(
+            userInput = userInput,
+            scope = scope,
+            detectorLevel = 2,  // Full detector set for normal path
+            summaryEnabled = summaryEnabled,
+            forceContextScope = forceContextScope
+        )
+
+        // Handle early-exit cases returned by gatherAndStage
+        if (gatherResult == null) {
+            // null means gatherAndStage handled the early return internally.
+            // This shouldn't happen in the normal flow because early exits
+            // (heuristic skip, indexing blocked) are returned directly above
+            // in the bypass checks. But as a safety net:
             return AssembledPrompt(
                 effectivePrompt = userInput,
-                contextSummary = "[Context: skipped by heuristic filter]",
+                contextSummary = "[Context: gather returned null]",
                 contextTimeMs = null
             )
         }
 
-        // Step 1.5: Resolve editor element context (cursor position → code element)
-        //
-        // This gives us the method/class the user is currently looking at,
-        // enabling element-level context scoping instead of whole-file.
-        // If resolution fails (no editor, dumb mode, etc.), resolvedContext is null
-        // and we fall back to file-level context (no regression).
-        val resolvedContext = EditorElementResolver.resolve(project)
-
-        Dev.info(log, "context.resolved_editor",
-            "file" to (resolvedContext?.file?.name ?: "none"),
-            "elementAtCursor" to (resolvedContext?.elementAtCursor?.name ?: "none"),
-            "elementKind" to (resolvedContext?.elementAtCursor?.kind?.name ?: "none"),
-            "containingClass" to (resolvedContext?.containingClass?.name ?: "none"),
-            "forceContextScope" to (forceContextScope ?: "none")
-        )
-
-        // Step 2: Check if IDE is in "dumb mode" (indexing files)
-        // Context gathering requires IntelliJ's index, which isn't available during indexing
-        if (DumbService.isDumb(project)) {
-            Dev.info(log, "context.skipped", "reason" to "ide_indexing")
-            return AssembledPrompt.indexingBlocked()
-        }
-
-        // Step 3: Gather IDE context (language, frameworks, project structure, relevant files)
-        val (bundle, metrics) = gatherIdeContext(scope, buildDetectorsForLevel(2))
-
-        Dev.info(log, "context.gathered",
-            "files" to bundle.files.size,
-            "totalChars" to bundle.totalChars,
-            "timeMs" to metrics.totalMillis
-        )
-
-        // Step 4: Enrich files with summaries where beneficial.
-        //
-        // ═══════════════════════════════════════════════════════════════
-        // CONTEXT vs SUMMARY — TWO INDEPENDENT features. Never conflate.
-        //
-        // CONTEXT (controlled by bypassMode) = WHAT gets gathered.
-        //   Steps 1-3 above handled this. If bypassMode was FULL (= context
-        //   OFF), we already returned early. If we're here, context is ON.
-        //
-        // SUMMARY (controlled by summaryEnabled) = HOW COMPACT the files are.
-        //   This step COMPRESSES the gathered files into shorter representations.
-        //   It does NOT add anything — it just SHRINKS what's already there.
-        //   Without summary, the raw files go to the AI as full text.
-        //
-        // They are SEQUENTIAL: context decided WHAT is included (above),
-        // now summary decides HOW COMPACT it is (this step).
-        // ═══════════════════════════════════════════════════════════════
-        //
-        // This is the READ PATH — checks for existing summaries and uses them
-        // when they save tokens. Also fires generation suggestions for missing
-        // summaries if the user has opted into automatic summarization.
-        //
-        // SKIPPED when summaryEnabled == false (per-tab toggle). The user has
-        // explicitly disabled summaries for this tab. Context still flows (that's
-        // controlled by bypassMode), but raw files are used instead of summaries.
-        // summaryEnabled == null means "use global setting" — always enrich.
-        val enrichedBundle = if (summaryEnabled == false) {
-            Dev.info(log, "context.summary_skipped",
-                "reason" to "summaryEnabled=false (per-tab toggle)"
-            )
-            bundle  // No enrichment — use raw files as-is
-        } else {
-            enrichWithSummaries(bundle, resolvedContext)
-        }
-
-        // Step 5: Format the context into a structured prompt section
-        val contextNote = formatContextNote(enrichedBundle)
-        val manifest = enrichedBundle.manifestLine()
-        val filesBlock = enrichedBundle.filesSection()
-
-        // Step 6: If the user refers to "this file", include the full file content
+        // Format the gathered context into a prompt string
+        val editorFile = currentEditorFile()
+        val contextNote = formatContextNote(gatherResult.enrichedBundle)
+        val manifest = gatherResult.enrichedBundle.manifestLine()
+        val filesBlock = gatherResult.enrichedBundle.filesSection()
         val fileBlock = buildCurrentFileBlock(userInput, editorFile)
 
-        // Step 7: Assemble the final prompt with all context sections
         val effectivePrompt = buildString {
             appendLine(contextNote)
             appendLine(manifest)
@@ -523,24 +470,134 @@ class ContextAssembler(
 
         Dev.info(log, "context.assembled",
             "effectivePromptLength" to effectivePrompt.length,
-            "bundleFiles" to enrichedBundle.files.size,
-            "rawFiles" to enrichedBundle.files.count { it.kind == ContextKind.RAW },
-            "summaryFiles" to enrichedBundle.files.count { it.kind == ContextKind.SUMMARY }
+            "bundleFiles" to gatherResult.enrichedBundle.files.size,
+            "rawFiles" to gatherResult.enrichedBundle.files.count { it.kind == ContextKind.RAW },
+            "summaryFiles" to gatherResult.enrichedBundle.files.count { it.kind == ContextKind.SUMMARY }
         )
 
-        // Build structured context file details for badge tray.
-        // Each entry becomes a badge the user can hover/inspect in the frontend.
+        return AssembledPrompt(
+            effectivePrompt = effectivePrompt,
+            contextSummary = manifest,
+            contextTimeMs = gatherResult.gatherTimeMs,
+            contextFiles = gatherResult.contextFiles,
+            contextBlock = gatherResult.contextBlock
+        )
+    }
+
+    // ── Gather + Stage (Phase 2 B2) ─────────────────────────────────────
+
+    /**
+     * Gather IDE context and produce structured results.
+     *
+     * ## Phase 2 Split
+     *
+     * This method extracts the gathering + enrichment logic from [assemble]:
+     * - Heuristic pre-filter
+     * - Editor element resolution (PSI)
+     * - IDE indexing check
+     * - Detector-based context gathering
+     * - Summary enrichment
+     * - ContextBlock + ContextFileDetail construction
+     *
+     * The formatting step (building the prompt string) stays in [assemble].
+     *
+     * ## Current behavior (B2)
+     *
+     * Called synchronously by [assemble]. Returns a [GatherResult] with the
+     * enriched bundle and structured metadata.
+     *
+     * ## Future behavior (B5)
+     *
+     * Will be called in a background coroutine by [ContextStagingService].
+     * As entries are gathered, they will be added progressively to the staging
+     * area with CONTEXT_BADGE_UPDATE bridge events.
+     *
+     * @param userInput The user's message (for heuristic check)
+     * @param scope Coroutine scope for context gathering
+     * @param detectorLevel Which detectors to run (1 = partial, 2 = full)
+     * @param summaryEnabled Per-tab summary toggle
+     * @param forceContextScope Force context selection (null/"method"/"class")
+     * @return [GatherResult] with enriched bundle and metadata, or null if context
+     *         was skipped (heuristic filter) or blocked (IDE indexing)
+     */
+    suspend fun gatherAndStage(
+        userInput: String,
+        scope: CoroutineScope,
+        detectorLevel: Int = 2,
+        summaryEnabled: Boolean? = null,
+        forceContextScope: String? = null
+    ): GatherResult? {
+
+        // ── Heuristic pre-filter ────────────────────────────────────────
+        val editorFile = currentEditorFile()
+        val heuristicFilter = ContextHeuristicFilter()
+        val heuristicEnabled = ContextSettingsState.getInstance(project).state.heuristicFilterEnabled
+        if (heuristicEnabled && heuristicFilter.shouldSkipContext(userInput, editorFile)) {
+            Dev.info(log, "gather.skipped_by_heuristic",
+                "reason" to "heuristic_filter_active",
+                "input_preview" to userInput.take(50)
+            )
+            return null
+        }
+
+        // ── Editor element resolution ───────────────────────────────────
+        val resolvedContext = EditorElementResolver.resolve(project)
+
+        Dev.info(log, "gather.resolved_editor",
+            "file" to (resolvedContext?.file?.name ?: "none"),
+            "elementAtCursor" to (resolvedContext?.elementAtCursor?.name ?: "none"),
+            "elementKind" to (resolvedContext?.elementAtCursor?.kind?.name ?: "none"),
+            "containingClass" to (resolvedContext?.containingClass?.name ?: "none"),
+            "forceContextScope" to (forceContextScope ?: "none")
+        )
+
+        // ── IDE indexing check ──────────────────────────────────────────
+        if (DumbService.isDumb(project)) {
+            Dev.info(log, "gather.skipped", "reason" to "ide_indexing")
+            return null
+        }
+
+        // ── Gather IDE context ──────────────────────────────────────────
+        val (bundle, metrics) = gatherIdeContext(scope, buildDetectorsForLevel(detectorLevel))
+
+        Dev.info(log, "gather.complete",
+            "files" to bundle.files.size,
+            "totalChars" to bundle.totalChars,
+            "timeMs" to metrics.totalMillis,
+            "detectorLevel" to detectorLevel
+        )
+
+        // ── Enrich with summaries ───────────────────────────────────────
+        // CONTEXT vs SUMMARY — two independent features. Never conflate.
+        // Context (bypassMode) = WHAT gets gathered. Already handled above.
+        // Summary (summaryEnabled) = HOW COMPACT the files are.
+        val enrichedBundle = if (summaryEnabled == false) {
+            Dev.info(log, "gather.summary_skipped",
+                "reason" to "summaryEnabled=false (per-tab toggle)"
+            )
+            bundle
+        } else {
+            enrichWithSummaries(bundle, resolvedContext)
+        }
+
+        // ── Build structured outputs ────────────────────────────────────
         val contextFiles = buildContextFileDetails(
             files = enrichedBundle.files,
             resolvedContext = resolvedContext,
             forceContextScope = forceContextScope
         )
 
-        return AssembledPrompt(
-            effectivePrompt = effectivePrompt,
-            contextSummary = manifest,
-            contextTimeMs = metrics.totalMillis,
-            contextFiles = contextFiles
+        val contextBlock = buildContextBlock(
+            bundle = enrichedBundle,
+            resolvedContext = resolvedContext,
+            forceContextScope = forceContextScope
+        )
+
+        return GatherResult(
+            enrichedBundle = enrichedBundle,
+            contextFiles = contextFiles,
+            contextBlock = contextBlock,
+            gatherTimeMs = metrics.totalMillis
         )
     }
 
@@ -1188,6 +1245,182 @@ class ContextAssembler(
         }
     }
 
+    // ── ContextBlock Builder (Phase 1 — RequestBlocks) ────────────────────
+
+    /**
+     * Build a [ContextBlock] from an enriched [ContextBundle].
+     *
+     * Converts each [ContextFile] in the bundle into a [ContextEntry] and partitions
+     * them into summaries, raw, and other lists. Non-file context (framework info,
+     * project structure) is packaged into the "other" list.
+     *
+     * This method mirrors [buildContextFileDetails] — both consume the same data.
+     * [buildContextFileDetails] produces badge metadata for the frontend tray.
+     * This method produces the structured context block for [RequestBlocks].
+     *
+     * @param bundle The enriched context bundle (files may be RAW or SUMMARY)
+     * @param resolvedContext The cursor context (for element-level entries)
+     * @param forceContextScope The user's force context selection
+     * @return Structured context block for the RequestBlocks model
+     */
+    private fun buildContextBlock(
+        bundle: ContextBundle,
+        resolvedContext: ResolvedEditorContext? = null,
+        forceContextScope: String? = null
+    ): ContextBlock {
+        val currentFilePath = resolvedContext?.file?.path
+        val elementAtCursor = resolvedContext?.elementAtCursor
+        val now = Instant.now()
+
+        val summaries = mutableListOf<ContextEntry>()
+        val raw = mutableListOf<ContextEntry>()
+        val other = mutableListOf<ContextEntry>()
+
+        // Convert each file in the bundle to a ContextEntry
+        for (cf in bundle.files) {
+            val isCurrentFile = cf.path == currentFilePath && elementAtCursor != null
+            val forced = forceContextScope != null && isCurrentFile
+
+            // Build the content string for this entry — the actual text that goes into the prompt.
+            // For SUMMARY entries: synopsis (+ optional header sample).
+            // For RAW entries: the file content text.
+            val content = when (cf.kind) {
+                ContextKind.SUMMARY -> buildString {
+                    if (!cf.headerSample.isNullOrBlank()) {
+                        appendLine(cf.headerSample)
+                        appendLine()
+                    }
+                    if (!cf.modelSynopsis.isNullOrBlank()) {
+                        append(cf.modelSynopsis)
+                    }
+                }
+                ContextKind.RAW -> {
+                    // RAW file content is not stored directly on ContextFile — it's read
+                    // from disk during filesSection() formatting. For the ContextEntry, we
+                    // store a placeholder path reference. The actual content serialization
+                    // happens in formatContextBlock() at send time.
+                    //
+                    // Phase 2 will populate this with the real content when the staging area
+                    // manages entries with full content.
+                    "[RAW: ${cf.path}]"
+                }
+            }
+
+            val entryKind = when (cf.kind) {
+                ContextKind.SUMMARY -> com.youmeandmyself.ai.chat.context.ContextKind.SUMMARY
+                ContextKind.RAW -> com.youmeandmyself.ai.chat.context.ContextKind.RAW
+            }
+
+            val source = when {
+                forced -> "forced"
+                cf.source != null -> cf.source
+                cf.kind == ContextKind.SUMMARY -> "auto-summary"
+                else -> "auto"
+            }
+
+            val entry = ContextEntry(
+                id = UUID.randomUUID().toString(),
+                path = cf.path,
+                name = cf.path.substringAfterLast("/"),
+                content = content,
+                kind = entryKind,
+                contentHash = computeContentHash(content),
+                tokenEstimate = cf.charCount / 4,
+                source = source,
+                gatheredAt = now,
+                isStale = cf.isStale,
+                elementSignature = if (isCurrentFile && elementAtCursor != null) {
+                    elementAtCursor.signature
+                } else null
+            )
+
+            when (entryKind) {
+                com.youmeandmyself.ai.chat.context.ContextKind.SUMMARY -> summaries.add(entry)
+                com.youmeandmyself.ai.chat.context.ContextKind.RAW -> raw.add(entry)
+                com.youmeandmyself.ai.chat.context.ContextKind.OTHER -> other.add(entry)
+            }
+        }
+
+        // Package non-file context (framework info, project structure) into "other"
+        val contextNote = formatContextNote(bundle)
+        if (contextNote.isNotBlank()) {
+            other.add(ContextEntry(
+                id = UUID.randomUUID().toString(),
+                path = null,
+                name = "project-context",
+                content = contextNote,
+                kind = com.youmeandmyself.ai.chat.context.ContextKind.OTHER,
+                contentHash = computeContentHash(contextNote),
+                tokenEstimate = contextNote.length / 4,
+                source = "auto",
+                gatheredAt = now,
+                isStale = false
+            ))
+        }
+
+        return ContextBlock(summaries = summaries, raw = raw, other = other)
+    }
+
+    /**
+     * Build a single-entry [ContextBlock] for bypass paths (FULL bypass, SELECTIVE level 0).
+     *
+     * These paths produce a single content block for one file (the open editor file),
+     * either as an existing summary or raw content. This wraps that into a ContextBlock.
+     *
+     * @param contentBlock The formatted content string (summary or raw file)
+     * @param filePath The file path
+     * @param fileName The file name
+     * @param kind Whether this is a summary or raw content
+     * @param isStale Whether the content is stale
+     * @param forced Whether the user forced this context
+     * @return Single-entry ContextBlock
+     */
+    private fun buildBypassContextBlock(
+        contentBlock: String,
+        filePath: String,
+        fileName: String,
+        kind: com.youmeandmyself.ai.chat.context.ContextKind,
+        isStale: Boolean,
+        forced: Boolean = false
+    ): ContextBlock {
+        if (contentBlock.isBlank()) return ContextBlock.empty()
+
+        val entry = ContextEntry(
+            id = UUID.randomUUID().toString(),
+            path = filePath,
+            name = fileName,
+            content = contentBlock,
+            kind = kind,
+            contentHash = computeContentHash(contentBlock),
+            tokenEstimate = contentBlock.length / 4,
+            source = if (forced) "forced" else "auto",
+            gatheredAt = Instant.now(),
+            isStale = isStale
+        )
+
+        return when (kind) {
+            com.youmeandmyself.ai.chat.context.ContextKind.SUMMARY -> ContextBlock(summaries = listOf(entry), raw = emptyList(), other = emptyList())
+            com.youmeandmyself.ai.chat.context.ContextKind.RAW -> ContextBlock(summaries = emptyList(), raw = listOf(entry), other = emptyList())
+            com.youmeandmyself.ai.chat.context.ContextKind.OTHER -> ContextBlock(summaries = emptyList(), raw = emptyList(), other = listOf(entry))
+        }
+    }
+
+    /**
+     * Compute a SHA-256 hash of content for deduplication and staleness detection.
+     *
+     * @param content The text to hash
+     * @return Hex-encoded SHA-256 hash, or null if hashing fails
+     */
+    private fun computeContentHash(content: String): String? {
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val hashBytes = digest.digest(content.toByteArray(Charsets.UTF_8))
+            hashBytes.joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     // ── Badge Data Builder ────────────────────────────────────────────────
 
     /**
@@ -1347,7 +1580,26 @@ data class AssembledPrompt(
      *
      * @see ContextFileDetail
      */
-    val contextFiles: List<ContextFileDetail> = emptyList()
+    val contextFiles: List<ContextFileDetail> = emptyList(),
+
+    /**
+     * Structured context block for the RequestBlocks model.
+     *
+     * ## Phase 1
+     *
+     * Populated alongside [contextFiles] from the same gathered context data.
+     * Each [ContextEntry] carries the full content text that would be injected
+     * into the prompt, plus metadata for tracking, deduplication, and staleness.
+     *
+     * ## Data flow
+     *
+     * AssembledPrompt.contextBlock → ChatOrchestrator → RequestBlocks.context →
+     * GenericLlmProvider (serialized into the API message)
+     *
+     * @see ContextBlock
+     * @see com.youmeandmyself.ai.chat.orchestrator.RequestBlocks
+     */
+    val contextBlock: ContextBlock = ContextBlock.empty()
 ) {
     companion object {
         /**
@@ -1414,6 +1666,31 @@ data class ContextFileDetail(
     val isStale: Boolean,
     val forced: Boolean = false,
     val elementSignature: String? = null
+)
+
+/**
+ * Result of the gathering + enrichment phase.
+ *
+ * ## Phase 2 Split
+ *
+ * Returned by [ContextAssembler.gatherAndStage]. Contains the enriched
+ * context bundle and all structured outputs needed for prompt formatting
+ * and RequestBlocks construction.
+ *
+ * The caller (currently [ContextAssembler.assemble], later [ContextStagingService])
+ * uses this to build the prompt string and populate [RequestBlocks.context].
+ *
+ * @property enrichedBundle The context bundle after summary enrichment. Contains
+ *   file metadata, language, frameworks, project structure.
+ * @property contextFiles Badge metadata for the frontend tray.
+ * @property contextBlock Structured context for [RequestBlocks].
+ * @property gatherTimeMs How long the gathering took in milliseconds.
+ */
+data class GatherResult(
+    val enrichedBundle: ContextBundle,
+    val contextFiles: List<ContextFileDetail>,
+    val contextBlock: ContextBlock,
+    val gatherTimeMs: Long
 )
 
 // ── Extension Functions ─────────────────────────────────────────────────

@@ -333,8 +333,9 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                     exchange_id, conversation_id, provider_id, provider_label,
                     protocol, model, prompt_tokens, completion_tokens, total_tokens,
                     context_window_size, purpose, timestamp_ms, response_time_ms,
-                    user_id, project_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_id, project_id,
+                    profile_tokens, history_tokens, context_tokens, message_tokens
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """.trimIndent(),
                 record.exchangeId,
                 record.conversationId,
@@ -350,7 +351,11 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
                 record.timestampMs,
                 record.responseTimeMs,
                 record.userId,
-                record.projectId
+                record.projectId,
+                record.profileTokens,
+                record.historyTokens,
+                record.contextTokens,
+                record.messageTokens
             )
 
             Dev.info(log, "metrics.insert",
@@ -363,6 +368,235 @@ class LocalStorageFacade(private val project: Project) : StorageFacade {
             // Metrics can be backfilled from JSONL during rebuild.
             Dev.warn(log, "metrics.insert_failed", e,
                 "exchangeId" to record.exchangeId
+            )
+        }
+    }
+
+    // ── Sent Context Manifest (Phase 3) ────────────────────────────────
+
+    /**
+     * Persist a sent context manifest for a specific exchange.
+     *
+     * Inserts one row per entry in the manifest into the `sent_context` table.
+     * Called by ChatOrchestrator after sending a message that included context.
+     *
+     * Non-fatal: if this fails, the JSONL still has the manifest data
+     * (embedded in ExchangeRequest.contextManifest). SQLite is for fast queries.
+     *
+     * @param exchangeId The exchange this manifest belongs to
+     * @param conversationId The conversation this exchange belongs to
+     * @param manifest The sent context manifest to persist
+     */
+    fun insertSentContextManifest(
+        exchangeId: String,
+        conversationId: String,
+        manifest: com.youmeandmyself.storage.model.SentContextManifest
+    ) {
+        if (mode == StorageMode.OFF) return
+
+        try {
+            val database = requireDb()
+            for (entry in manifest.entries) {
+                database.execute(
+                    """
+                    INSERT OR REPLACE INTO sent_context (
+                        id, exchange_id, conversation_id, turn_index,
+                        entry_id, path, content_hash, kind, sent_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """.trimIndent(),
+                    java.util.UUID.randomUUID().toString(),
+                    exchangeId,
+                    conversationId,
+                    manifest.turnIndex,
+                    entry.entryId,
+                    entry.path,
+                    entry.contentHash,
+                    entry.kind,
+                    entry.sentAt
+                )
+            }
+
+            Dev.info(log, "sent_context.insert",
+                "exchangeId" to exchangeId,
+                "conversationId" to conversationId,
+                "turnIndex" to manifest.turnIndex,
+                "entries" to manifest.entries.size
+            )
+        } catch (e: Exception) {
+            Dev.warn(log, "sent_context.insert_failed", e,
+                "exchangeId" to exchangeId
+            )
+        }
+    }
+
+    /**
+     * Load all sent context entries for a conversation.
+     *
+     * Returns entries ordered by turn_index (ascending) for sidebar display.
+     * Used by the frontend when switching tabs or restoring sidebar state.
+     *
+     * @param conversationId The conversation to load sent context for
+     * @return List of sent context entries, or empty if none found
+     */
+    fun getSentContextForConversation(
+        conversationId: String
+    ): List<com.youmeandmyself.storage.model.SentContextEntry> {
+        if (mode == StorageMode.OFF) return emptyList()
+
+        return try {
+            val database = requireDb()
+            database.query(
+                """
+                SELECT entry_id, path, content_hash, kind, sent_at
+                FROM sent_context
+                WHERE conversation_id = ?
+                ORDER BY turn_index ASC, sent_at ASC
+                """.trimIndent(),
+                conversationId
+            ) { rs ->
+                com.youmeandmyself.storage.model.SentContextEntry(
+                    entryId = rs.getString("entry_id"),
+                    path = rs.getString("path"),
+                    contentHash = rs.getString("content_hash"),
+                    kind = rs.getString("kind"),
+                    sentAt = rs.getLong("sent_at")
+                )
+            }
+        } catch (e: Exception) {
+            Dev.warn(log, "sent_context.query_failed", e,
+                "conversationId" to conversationId
+            )
+            emptyList()
+        }
+    }
+
+    /**
+     * Check if a file path was sent in any previous turn of a conversation.
+     *
+     * Used by the staleness tracker to determine if a changed file needs
+     * to be flagged in the sidebar.
+     *
+     * @param conversationId The conversation to check
+     * @param filePath The file path to look for
+     * @return true if the file was sent in any turn of this conversation
+     */
+    fun wasFileSentInConversation(conversationId: String, filePath: String): Boolean {
+        if (mode == StorageMode.OFF) return false
+
+        return try {
+            val database = requireDb()
+            val results = database.query(
+                """
+                SELECT 1 FROM sent_context
+                WHERE conversation_id = ? AND path = ?
+                LIMIT 1
+                """.trimIndent(),
+                conversationId,
+                filePath
+            ) { 1 }  // Just need to know if any row exists
+
+            results.isNotEmpty()
+        } catch (e: Exception) {
+            Dev.warn(log, "sent_context.check_failed", e,
+                "conversationId" to conversationId,
+                "filePath" to filePath
+            )
+            false
+        }
+    }
+
+    // ── Chat Summary (Phase 4 — History Compaction) ────────────────
+
+    /**
+     * Load the most recent CHAT_SUMMARY for a conversation.
+     *
+     * Returns the assistant text of the latest CHAT_SUMMARY exchange
+     * linked to this conversation. Used by HistoryCompactionService to
+     * check if an existing compacted summary exists.
+     *
+     * @param conversationId The conversation to look up
+     * @return The summary text, or null if no summary exists
+     */
+    fun getLatestChatSummary(conversationId: String): String? {
+        if (mode == StorageMode.OFF) return null
+
+        return try {
+            val database = requireDb()
+            val results = database.query(
+                """
+                SELECT assistant_text FROM chat_exchanges
+                WHERE conversation_id = ? AND purpose = 'CHAT_SUMMARY'
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """.trimIndent(),
+                conversationId
+            ) { rs -> rs.getString("assistant_text") }
+
+            results.firstOrNull()
+        } catch (e: Exception) {
+            Dev.warn(log, "chat_summary.query_failed", e,
+                "conversationId" to conversationId
+            )
+            null
+        }
+    }
+
+    /**
+     * Save a CHAT_SUMMARY for a conversation.
+     *
+     * Creates a new exchange record with purpose=CHAT_SUMMARY in the
+     * summaries/ JSONL folder. The summary text is stored both in JSONL
+     * and indexed in SQLite (assistant_text column).
+     *
+     * @param conversationId The conversation this summary belongs to
+     * @param summaryText The compacted summary text
+     * @param turnsCompacted How many turns were summarized
+     */
+    fun saveChatSummary(conversationId: String, summaryText: String, turnsCompacted: Int, projectId: String) {
+        if (mode == StorageMode.OFF) return
+
+        try {
+            val exchangeId = java.util.UUID.randomUUID().toString()
+            val exchange = com.youmeandmyself.storage.model.AiExchange(
+                id = exchangeId,
+                timestamp = java.time.Instant.now(),
+                providerId = "system",
+                modelId = "compaction",
+                purpose = com.youmeandmyself.storage.model.ExchangePurpose.CHAT_SUMMARY,
+                request = com.youmeandmyself.storage.model.ExchangeRequest(
+                    input = "Compact $turnsCompacted conversation turns"
+                ),
+                rawResponse = com.youmeandmyself.storage.model.ExchangeRawResponse(
+                    json = """{"summary": true, "turnsCompacted": $turnsCompacted}"""
+                ),
+                conversationId = conversationId
+            )
+
+            // Save to JSONL + SQLite via the existing save pipeline
+            kotlinx.coroutines.runBlocking {
+                saveExchange(exchange, projectId)
+            }
+
+            // Also cache the assistant text for fast lookups
+            val database = requireDb()
+            database.execute(
+                """
+                UPDATE chat_exchanges SET assistant_text = ?
+                WHERE id = ?
+                """.trimIndent(),
+                summaryText,
+                exchangeId
+            )
+
+            Dev.info(log, "chat_summary.saved",
+                "exchangeId" to exchangeId,
+                "conversationId" to conversationId,
+                "turnsCompacted" to turnsCompacted,
+                "summaryLength" to summaryText.length
+            )
+        } catch (e: Exception) {
+            Dev.warn(log, "chat_summary.save_failed", e,
+                "conversationId" to conversationId
             )
         }
     }

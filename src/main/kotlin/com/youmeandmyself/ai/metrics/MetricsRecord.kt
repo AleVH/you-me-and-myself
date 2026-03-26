@@ -153,5 +153,27 @@ data class MetricsRecord(
      * Null at launch — populated when Company tier ships (Phase 6).
      * Individual tier has a single implicit project.
      */
-    val projectId: String? = null
+    val projectId: String? = null,
+
+    // ── Per-block token estimates (Phase 1 — RequestBlocks) ──────────
+    //
+    // Estimated token counts for each section of the structured request.
+    // These are ESTIMATES (content.length / 4 heuristic), not provider-reported.
+    // The provider-reported promptTokens/completionTokens/totalTokens above
+    // remain the authoritative totals.
+    //
+    // Purpose: per-block breakdown for the stacked fill bar (Phase 4 UI)
+    // and context cost visibility.
+
+    /** Estimated tokens for the system prompt (assistant profile). Null if no profile. */
+    val profileTokens: Int? = null,
+
+    /** Estimated tokens for conversation history (compacted + verbatim). */
+    val historyTokens: Int? = null,
+
+    /** Estimated tokens for the context block (summaries + raw + other). */
+    val contextTokens: Int? = null,
+
+    /** Estimated tokens for the user's message. */
+    val messageTokens: Int? = null
 )

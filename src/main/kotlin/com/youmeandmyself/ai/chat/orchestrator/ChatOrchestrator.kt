@@ -3,6 +3,8 @@ package com.youmeandmyself.ai.chat.orchestrator
 import com.intellij.openapi.project.Project
 import com.youmeandmyself.ai.chat.bridge.BridgeMessage
 import com.youmeandmyself.ai.chat.context.ContextAssembler
+import com.youmeandmyself.ai.chat.context.ContextBlock
+import com.youmeandmyself.ai.chat.context.ContextStagingService
 import com.youmeandmyself.ai.chat.conversation.ConversationManager
 import com.youmeandmyself.ai.providers.AiProvider
 import com.youmeandmyself.ai.providers.ProviderRegistry
@@ -22,6 +24,8 @@ import com.youmeandmyself.profile.AssistantProfileService
 import com.youmeandmyself.storage.model.IdeContext
 import com.youmeandmyself.storage.model.IdeContextCapture
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
+import com.youmeandmyself.ai.providers.generic.GenericLlmProvider
 import java.time.Instant
 
 /**
@@ -91,7 +95,7 @@ import java.time.Instant
  */
 class ChatOrchestrator(
     private val project: Project,
-    private val contextAssembler: ContextAssembler,
+    internal val contextAssembler: ContextAssembler,
     internal val correctionHelper: CorrectionFlowHelper,
     private val conversationManager: ConversationManager,
     private val storage: LocalStorageFacade
@@ -158,7 +162,20 @@ class ChatOrchestrator(
         bypassMode: String? = null,
         selectiveLevel: Int? = null,
         summaryEnabled: Boolean? = null,
-        forceContextScope: String? = null
+        forceContextScope: String? = null,
+        /**
+         * Tab ID for staging area integration (Phase 2).
+         *
+         * When non-null, the orchestrator checks the staging area for pre-gathered
+         * context before running synchronous assembly. If the staging area has entries
+         * for this tab (from background gathering), they are snapshotted and used.
+         * If the staging area is empty, falls back to synchronous assemble().
+         *
+         * After send: staging area is cleared and a SentContextManifest is created.
+         *
+         * Null = legacy behavior (synchronous assembly only, no staging area).
+         */
+        tabId: String? = null
     ): ChatResult {
         // ── Step 1: Resolve provider ──────────────────────────────────
         // Per-tab provider takes precedence over global selection.
@@ -194,13 +211,56 @@ class ChatOrchestrator(
             val ideContext = captureIdeContext()
 
             // ── Step 3: Assemble prompt ──────────────────────────────
-            // bypassMode is threaded from the frontend (in backend bypass perspective):
-            // null = full context gathering, "FULL" = skip all context,
-            // "SELECTIVE" = per-component control at the given selectiveLevel.
-            val assembled = contextAssembler.assemble(
-                userInput, scope, bypassMode, selectiveLevel, summaryEnabled,
-                forceContextScope = forceContextScope
-            )
+            //
+            // Phase 2: Check staging area first. If background gathering has
+            // populated the staging area for this tab, snapshot it and use that
+            // context. Otherwise fall back to synchronous assemble().
+            //
+            // The staging area is populated by handleStartContextGathering()
+            // in BridgeDispatcher, which runs gatherAndStage() in a background
+            // coroutine as the user types.
+            val stagingService = if (tabId != null) {
+                ContextStagingService.getInstance(project)
+            } else null
+
+            val assembled: com.youmeandmyself.ai.chat.context.AssembledPrompt
+            val usedStagingArea: Boolean
+
+            if (tabId != null && stagingService != null && stagingService.hasEntries(tabId)) {
+                // Staging area has pre-gathered context — snapshot it
+                val stagedContextBlock = stagingService.snapshot(tabId)
+
+                Dev.info(log, "orchestrator.using_staging_area",
+                    "tabId" to tabId,
+                    "entries" to stagedContextBlock.allEntries.size,
+                    "totalTokens" to stagedContextBlock.totalTokenEstimate
+                )
+
+                // Build a minimal AssembledPrompt from the staging area snapshot.
+                // The effectivePrompt is built by concatenating the formatted context
+                // block with the user input — same output as synchronous assemble().
+                val contextString = com.youmeandmyself.ai.chat.context.formatContextBlock(stagedContextBlock)
+                val effectivePrompt = if (contextString.isNotBlank()) {
+                    "$contextString\n\n$userInput"
+                } else {
+                    userInput
+                }
+
+                assembled = com.youmeandmyself.ai.chat.context.AssembledPrompt(
+                    effectivePrompt = effectivePrompt,
+                    contextSummary = "[Context: ${stagedContextBlock.allEntries.size} entries from staging area]",
+                    contextTimeMs = null, // Background gathering — time not measured in send path
+                    contextBlock = stagedContextBlock
+                )
+                usedStagingArea = true
+            } else {
+                // No staging area or no pre-gathered context — fall back to synchronous assembly
+                assembled = contextAssembler.assemble(
+                    userInput, scope, bypassMode, selectiveLevel, summaryEnabled,
+                    forceContextScope = forceContextScope
+                )
+                usedStagingArea = false
+            }
 
             // Check if context gathering was blocked by IDE indexing
             if (assembled.isBlockedByIndexing) {
@@ -213,7 +273,8 @@ class ChatOrchestrator(
             Dev.info(log, "orchestrator.prompt_assembled",
                 "effectivePromptLength" to assembled.effectivePrompt.length,
                 "hasContext" to (assembled.contextSummary != null),
-                "contextTimeMs" to assembled.contextTimeMs
+                "contextTimeMs" to assembled.contextTimeMs,
+                "usedStagingArea" to usedStagingArea
             )
 
             // ── Step 3B: Budget check ────────────────────────────────────
@@ -297,13 +358,16 @@ class ChatOrchestrator(
             // launch and covers the vast majority of interactive chat sessions.
             // ────────────────────────────────────────────────────────────────
             val verbatimWindow = 5  // Phase B: will be configurable per-conversation
-            val history = conversationManager.buildHistory(currentConversationId, verbatimWindow)
+            val (compactedHistory, history) = conversationManager.buildHistoryWithCompaction(
+                currentConversationId, verbatimWindow
+            )
 
             Dev.info(log, "orchestrator.history_built",
                 "conversationId" to (currentConversationId ?: "none"),
                 "historyTurns" to history.size,
                 "verbatimWindow" to verbatimWindow,
-                "compressionMode" to "verbatim_only"  // Phase B: will show "compressed" when summarization is active
+                "hasCompactedHistory" to (compactedHistory != null),
+                "compressionMode" to if (compactedHistory != null) "compacted" else "verbatim_only"
             )
 
             // ── Step 4: Call AI provider (HTTP only) ─────────────────
@@ -341,8 +405,71 @@ class ChatOrchestrator(
                 )
             }
 
+            // ── Phase 4: Proactive compaction check ──────────────────
+            // If the conversation is getting large (>80% of context window),
+            // trigger compaction asynchronously for the NEXT request. We don't
+            // block this request — the compacted summary will be available
+            // on the next send.
+            val convIdForCompaction = currentConversationId
+            if (convIdForCompaction != null && compactedHistory == null && provider is GenericLlmProvider) {
+                // Resolve context window: profile override → known model default → 128k fallback
+                val activeProfile = profileState.profiles.find { it.id == provider.id }
+                val contextWindowSize = activeProfile?.contextWindowSize
+                    ?: com.youmeandmyself.ai.metrics.DefaultContextWindows.lookup(activeProfile?.model)
+                    ?: 128_000
+
+                val estimatedCurrentTokens = (systemPrompt?.length ?: 0) / 4 +
+                    (assembled.contextSummary?.length ?: 0) / 4 +
+                    userInput.length / 4
+
+                val compactionService = com.youmeandmyself.ai.chat.conversation.HistoryCompactionService
+                    .getInstance(project)
+
+                if (compactionService.needsCompaction(
+                        convIdForCompaction, contextWindowSize, estimatedCurrentTokens
+                    )) {
+                    // Launch compaction asynchronously — it won't affect THIS request
+                    val compactionProvider = provider
+                    scope.launch {
+                        try {
+                            compactionService.compact(convIdForCompaction, compactionProvider)
+                            Dev.info(log, "orchestrator.proactive_compaction.triggered",
+                                "conversationId" to convIdForCompaction
+                            )
+                        } catch (t: Throwable) {
+                            Dev.warn(log, "orchestrator.proactive_compaction.failed", t,
+                                "conversationId" to convIdForCompaction
+                            )
+                        }
+                    }
+                }
+            }
+
+            // ── Step 4A: Build RequestBlocks (Phase 1) ────────────────
+            // Package the four independent blocks into a structured request.
+            // The provider serializes these into the API's message format.
+            // API output is identical — the restructuring is internal.
+            val requestBlocks = RequestBlocks(
+                profile = systemPrompt,
+                compactedHistory = compactedHistory,  // Phase 4 — populated by HistoryCompactionService
+                verbatimHistory = history,
+                context = assembled.contextBlock,
+                userMessage = userInput
+            )
+
+            // Compute per-block token estimates (content.length / 4 heuristic).
+            // These are estimates — provider-reported promptTokens is the truth.
+            val profileTokens = systemPrompt?.length?.let { it / 4 }
+            val historyTokens = if (history.isNotEmpty()) {
+                history.sumOf { it.content.length } / 4
+            } else null
+            val contextTokens = if (!assembled.contextBlock.isEmpty) {
+                assembled.contextBlock.totalTokenEstimate
+            } else null
+            val messageTokens = userInput.length / 4
+
             val callStartMs = System.currentTimeMillis()
-            val response = provider.chat(assembled.effectivePrompt, history, systemPrompt)
+            val response = provider.chat(requestBlocks)
             val responseTimeMs = System.currentTimeMillis() - callStartMs
 
             Dev.info(log, "orchestrator.provider_response",
@@ -369,6 +496,50 @@ class ChatOrchestrator(
             indexAssistantText(response)
             indexDerivedMetadata(response)
             indexIdeContext(response.exchangeId, ideContext)
+
+            // ── Step 7B: Post-send staging area cleanup (Phase 2) ────
+            // After send: clear the staging area and create SentContextManifest.
+            // The manifest records what context was sent in this turn for the
+            // sidebar (Phase 3) and staleness tracking.
+            val resolvedStagingService = stagingService
+            if (tabId != null && usedStagingArea && resolvedStagingService != null) {
+                try {
+                    // Create sent context manifest before clearing
+                    // Turn index: use the conversation's current turn count.
+                    // The conversation table tracks turn_count which is incremented
+                    // by onExchangeAdded() in Step 5 above.
+                    val currentConv = currentConversationId?.let {
+                        conversationManager.getConversation(it)
+                    }
+                    val manifest = com.youmeandmyself.storage.model.SentContextManifest(
+                        turnIndex = currentConv?.turnCount ?: 0,
+                        entries = assembled.contextBlock.allEntries.map { entry ->
+                            com.youmeandmyself.storage.model.SentContextEntry.from(entry)
+                        }
+                    )
+
+                    Dev.info(log, "orchestrator.staging.manifest_created",
+                        "tabId" to tabId,
+                        "turnIndex" to manifest.turnIndex,
+                        "entries" to manifest.entries.size
+                    )
+
+                    // Persist manifest to SQLite for fast sidebar queries
+                    val convId = currentConversationId
+                    val exchId = response.exchangeId
+                    if (convId != null) {
+                        storage.insertSentContextManifest(exchId, convId, manifest)
+                    }
+
+                    // Clear staging area — badges migrate to sidebar
+                    resolvedStagingService.clear(tabId)
+                } catch (e: Exception) {
+                    Dev.warn(log, "orchestrator.staging.cleanup_failed", e,
+                        "tabId" to tabId
+                    )
+                    // Non-fatal — the response was already sent
+                }
+            }
 
             // ── Step 8: Correction flow ──────────────────────────────
             // Clear any previous correction context (new message = new state)
@@ -401,7 +572,11 @@ class ChatOrchestrator(
                 contextSummary = assembled.contextSummary,
                 contextTimeMs = assembled.contextTimeMs,
                 contextFiles = assembled.contextFiles,
-                responseTimeMs = responseTimeMs
+                responseTimeMs = responseTimeMs,
+                profileTokens = profileTokens,
+                historyTokens = historyTokens,
+                contextTokens = contextTokens,
+                messageTokens = messageTokens
             )
 
         } catch (t: Throwable) {

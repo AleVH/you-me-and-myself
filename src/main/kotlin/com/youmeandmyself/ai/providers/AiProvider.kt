@@ -1,5 +1,6 @@
 package com.youmeandmyself.ai.providers
 
+import com.youmeandmyself.ai.chat.orchestrator.RequestBlocks
 import com.youmeandmyself.storage.model.ConversationTurn
 
 /**
@@ -103,6 +104,33 @@ interface AiProvider {
         history: List<ConversationTurn> = emptyList(),
         systemPrompt: String? = null
     ): ProviderResponse
+
+    /**
+     * Send a structured chat request using the RequestBlocks model.
+     *
+     * ## Phase 1 — Structured Request
+     *
+     * This method accepts the four independent blocks (profile, history,
+     * context, message) as a structured data class instead of a flat prompt
+     * string. The provider handles serialization into the API's message format.
+     *
+     * The blocks are serialized as:
+     * - [RequestBlocks.profile] → system message (first)
+     * - [RequestBlocks.compactedHistory] → summary turn (when non-null, Phase 4)
+     * - [RequestBlocks.verbatimHistory] → user/assistant message pairs
+     * - [RequestBlocks.context] + [RequestBlocks.userMessage] → final user message
+     *
+     * The API output is identical to the legacy [chat] method — the restructuring
+     * is internal. The concatenation of context + user message now happens at
+     * serialization time in the provider instead of in the assembler.
+     *
+     * @param requestBlocks The structured request with four independent blocks
+     * @return [ProviderResponse] with raw JSON, HTTP status, and parsed content
+     *
+     * @see RequestBlocks
+     * @see com.youmeandmyself.ai.chat.context.ContextBlock
+     */
+    suspend fun chat(requestBlocks: RequestBlocks): ProviderResponse
 
     /**
      * Send a summarization request to the AI provider.

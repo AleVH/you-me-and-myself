@@ -63,7 +63,11 @@ object DevMode {
         "/dev-summary-health" to "Health check for element summary system (cache vs SQLite consistency)",
         "/dev-context-single" to "Dry-run: resolve current file + element at cursor via PSI, check cache",
         "/dev-context-radius" to "Dry-run: show what neighbours would be gathered (stub — needs traversal radius)",
-        "/dev-context-chain" to "Dry-run: full context assembly pipeline preview (stub — needs dry-run flag)"
+        "/dev-context-chain" to "Dry-run: full context assembly pipeline preview (stub — needs dry-run flag)",
+        "/dev-mock-badges" to "Mock badge simulation: default scenario (4 files, 2 summarised, ~3s)",
+        "/dev-mock-badges force" to "Mock badge simulation: ghost badge transitions to real badge",
+        "/dev-mock-badges force-only" to "Mock badge simulation: context OFF, only forced element (~2s)",
+        "/dev-mock-badges many" to "Mock badge simulation: 12 files, tests tray overflow (~8s)"
     )
 
     /**
